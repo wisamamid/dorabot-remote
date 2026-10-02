@@ -1,0 +1,35 @@
+{
+  "name": "@dorabot-remote/bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Sidecar daemon that lets a paired phone talk to your local dorabot gateway. No changes to dorabot itself.",
+  "bin": {
+    "dorabot-remote": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node --enable-source-maps dist/cli.js start",
+    "dev": "tsc -p tsconfig.json --watch",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "@dorabot-remote/protocol": "0.1.0",
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

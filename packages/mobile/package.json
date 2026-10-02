@@ -1,0 +1,41 @@
+{
+  "name": "@dorabot-remote/mobile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host",
+    "typecheck": "tsc -b --noEmit false --emitDeclarationOnly false || tsc -p tsconfig.app.json --noEmit",
+    "sync": "npm run build && cap sync",
+    "ios": "npm run build && cap sync ios && cap open ios",
+    "android": "npm run build && cap sync android && cap open android"
+  },
+  "dependencies": {
+    "@capacitor/app": "^8.1.1",
+    "@capacitor/core": "^8.5.2",
+    "@capacitor/haptics": "^8.0.2",
+    "@capacitor/keyboard": "^8.0.5",
+    "@capacitor/preferences": "^8.0.1",
+    "@capacitor/status-bar": "^8.0.3",
+    "@dorabot-remote/protocol": "0.1.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "@capacitor/barcode-scanner": "^3.1.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.2",
+    "@tailwindcss/vite": "^4.1.14",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "tailwindcss": "^4.1.14",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.9",
+    "@capacitor/ios": "^8.5.2",
+    "@capacitor/android": "^8.5.2"
+  }
+}

@@ -1,0 +1,26 @@
+dorabot remote
+Copyright (c) 2026 Wisam Amid
+
+This product is a standalone companion to dorabot and ships no dorabot code as a
+dependency. It does, however, contain work derived from dorabot, which is
+likewise MIT licensed:
+
+    dorabot
+    https://github.com/suitedaces/dorabot
+    Copyright (c) suitedaces
+    MIT License
+
+Specifically, the conversation reconstruction logic in
+packages/protocol/src/stream.ts is a port of the stream handling in dorabot's
+desktop renderer (desktop/src/hooks/useGateway.ts), namely applyStreamEvent,
+appendToolOutputDelta, sessionMessagesToChatItems and cleanToolName.
+
+That logic is subtle in ways that are not obvious from reading it, and getting it
+wrong produces conversations that silently lose text or leave tool spinners
+running forever. It is reproduced faithfully rather than reinvented, with the
+non-obvious behaviours documented in comments at the top of the file.
+
+The wire protocol types in packages/protocol/src/gateway.ts describe dorabot's
+gateway as observed at version 0.3.2. They were derived from the case arms of its
+RPC switch rather than from its exported type unions, which are out of date
+relative to the implementation.

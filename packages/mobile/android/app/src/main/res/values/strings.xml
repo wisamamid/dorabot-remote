@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">dorabot</string>
+    <string name="title_activity_main">dorabot</string>
+    <string name="package_name">so.dora.remote</string>
+    <string name="custom_url_scheme">so.dora.remote</string>
+</resources>

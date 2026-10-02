@@ -1,0 +1,446 @@
+import { randomUUID } from 'node:crypto'
+import {
+  BRIDGE_METHODS,
+  SecureChannel,
+  PROTOCOL_VERSION,
+  deriveSessionKeys,
+  denialReason,
+  fromB64,
+  generateIdentity,
+  isMethodAllowed,
+  methodsForScopes,
+  toB64,
+} from '@dorabot-remote/protocol'
+import type {
+  AuthEnvelope,
+  DeviceSummary,
+  Envelope,
+  HostSummary,
+  KeyPair,
+  RpcEnvelope,
+  Scope,
+  Sodium,
+} from '@dorabot-remote/protocol'
+import type { WebSocket } from 'ws'
+import type { DeviceRecord } from './store.js'
+
+/** Replay is paced against this so a long catch-up cannot blow the socket buffer. */
+const SEND_HIGH_WATER_BYTES = 512 * 1024
+const REPLAY_CHUNK = 200
+
+export interface ConnectionHost {
+  sodium: Sodium
+  hostIdentity: KeyPair
+  hostSummary: HostSummary
+  getDevice(id: string): DeviceRecord | null
+  touchDevice(id: string): void
+  deviceSummary(device: DeviceRecord): DeviceSummary
+  currentSeq(): number
+  eventsSince(afterSeq: number, limit: number, sessionKeys?: string[]): Array<{
+    seq: number
+    event: string
+    sessionKey: string | null
+    data: string
+  }>
+  /** Snapshot of a session's current state, cached from the gateway. */
+  snapshotFor(sessionKey: string): unknown | null
+  knownSessionKeys(): string[]
+  gatewayConnected(): boolean
+  callGateway(method: string, params: Record<string, unknown>): Promise<unknown>
+  handleBridgeMethod(conn: DeviceConnection, method: string, params: Record<string, unknown>): Promise<unknown>
+  log(msg: string): void
+  onClosed(conn: DeviceConnection): void
+}
+
+/**
+ * One paired device's live connection.
+ *
+ * Responsibilities, in order of how much they matter:
+ *
+ *  1. Mutual authentication and encryption. Nothing readable crosses the wire.
+ *  2. Authorisation. The gateway has none; every forwarded method is checked
+ *     against this device's scopes here, and refused by default.
+ *  3. Shell ownership. The gateway broadcasts `shell.data` to every authenticated
+ *     client with a shellId but no sessionKey, meaning the raw byte stream of
+ *     every terminal on the machine, including ones opened on the Mac itself.
+ *     A connection only ever receives data for shells it spawned.
+ *  4. Paced replay from the bridge's durable log.
+ */
+export class DeviceConnection {
+  readonly id = randomUUID()
+  device: DeviceRecord | null = null
+  private channel: SecureChannel | null = null
+  private ephemeral: KeyPair | null = null
+  private authed = false
+  private closed = false
+  /** Session keys this device asked to follow. */
+  subscriptions = new Set<string>()
+  /** Shells this device spawned. The only ones it will ever see output from. */
+  ownedShells = new Set<string>()
+  /** Highest seq delivered per session, so a late subscribe can backfill exactly. */
+  private sentSeqByKey = new Map<string, number>()
+  /** The device's resume cursor at connect time. */
+  private authSeq = 0
+  private sendQueue: Promise<void> = Promise.resolve()
+  private handshakeTimer: NodeJS.Timeout | null = null
+
+  constructor(
+    private readonly ws: WebSocket,
+    private readonly host: ConnectionHost,
+    readonly remoteAddress: string,
+  ) {
+    this.handshakeTimer = setTimeout(() => {
+      if (!this.authed) this.fail('bad_handshake', 'handshake timed out')
+    }, 10_000)
+
+    ws.on('message', (raw: Buffer, isBinary: boolean) => {
+      void this.onMessage(raw, isBinary)
+    })
+    ws.on('close', () => this.cleanup())
+    ws.on('error', () => this.cleanup())
+  }
+
+  get scopes(): Scope[] {
+    return this.device?.scopes ?? []
+  }
+
+  private cleanup(): void {
+    if (this.closed) return
+    this.closed = true
+    if (this.handshakeTimer) clearTimeout(this.handshakeTimer)
+    this.host.onClosed(this)
+  }
+
+  private fail(code: string, message: string): void {
+    try {
+      this.ws.send(JSON.stringify({ t: 'err', code, message }))
+    } catch {
+      // Socket already gone.
+    }
+    this.ws.close()
+    this.cleanup()
+  }
+
+  // -------------------------------------------------------------------------
+  // Inbound
+  // -------------------------------------------------------------------------
+
+  private async onMessage(raw: Buffer, isBinary: boolean): Promise<void> {
+    if (this.closed) return
+    try {
+      if (!isBinary) {
+        await this.onHandshakeFrame(JSON.parse(raw.toString()) as Record<string, unknown>)
+        return
+      }
+      if (!this.channel?.established) {
+        this.fail('bad_handshake', 'encrypted frame before handshake finished')
+        return
+      }
+      const env = this.channel.open<Envelope>(new Uint8Array(raw))
+      await this.onEnvelope(env)
+    } catch (err) {
+      this.host.log(`device ${this.device?.name ?? this.remoteAddress}: ${(err as Error).message}`)
+      this.fail('bad_handshake', 'frame rejected')
+    }
+  }
+
+  private async onHandshakeFrame(frame: Record<string, unknown>): Promise<void> {
+    const s = this.host.sodium
+
+    if (frame.t === 'hello') {
+      if (frame.v !== PROTOCOL_VERSION) {
+        this.fail('bad_version', `this host speaks protocol v${PROTOCOL_VERSION}`)
+        return
+      }
+      const device = this.host.getDevice(String(frame.deviceId ?? ''))
+      if (!device) {
+        this.fail('unknown_device', 'this device is not paired with this host')
+        return
+      }
+      if (device.revoked) {
+        this.fail('revoked', 'access for this device was revoked')
+        return
+      }
+      this.device = device
+
+      this.ephemeral = generateIdentity(s)
+      const theirEphPk = fromB64(s, String(frame.ephPk))
+      const keys = deriveSessionKeys(s, 'host', {
+        myEphemeral: this.ephemeral,
+        theirEphemeralPk: theirEphPk,
+        myStatic: this.host.hostIdentity,
+        theirStaticPk: fromB64(s, device.publicKey),
+      })
+      this.channel = SecureChannel.create(s, keys)
+
+      this.ws.send(
+        JSON.stringify({
+          t: 'hello_ack',
+          v: PROTOCOL_VERSION,
+          ephPk: toB64(s, this.ephemeral.publicKey),
+          hostId: this.host.hostSummary.id,
+          hostName: this.host.hostSummary.name,
+        }),
+      )
+      this.ws.send(JSON.stringify({ t: 'hdr', hdr: toB64(s, this.channel.startSend()) }))
+      return
+    }
+
+    if (frame.t === 'hdr') {
+      if (!this.channel) {
+        this.fail('bad_handshake', 'header before hello')
+        return
+      }
+      // If the device used the wrong long-term key, the derived keys differ and
+      // the first payload simply fails to decrypt. That is the authentication.
+      this.channel.startReceive(fromB64(s, String(frame.hdr)))
+      return
+    }
+
+    this.fail('bad_handshake', `unexpected frame "${String(frame.t)}"`)
+  }
+
+  private async onEnvelope(env: Envelope): Promise<void> {
+    switch (env.t) {
+      case 'auth': {
+        if (this.authed) return
+        this.authed = true
+        if (this.handshakeTimer) clearTimeout(this.handshakeTimer)
+        this.handshakeTimer = null
+        const device = this.device!
+        this.host.touchDevice(device.id)
+        this.host.log(`device connected: ${device.name} (${this.remoteAddress})`)
+
+        this.send({
+          t: 'ready',
+          device: this.host.deviceSummary(device),
+          host: this.host.hostSummary,
+          allowed: methodsForScopes(device.scopes),
+          seq: this.host.currentSeq(),
+          gatewayConnected: this.host.gatewayConnected(),
+        })
+
+        this.authSeq = typeof env.lastSeq === 'number' ? env.lastSeq : this.host.currentSeq()
+        if (this.authSeq < this.host.currentSeq()) void this.replayFrom(this.authSeq)
+        return
+      }
+
+      case 'ping':
+        this.send({ t: 'pong', ts: env.ts })
+        return
+
+      case 'rpc':
+        await this.onRpc(env)
+        return
+
+      default:
+        return
+    }
+  }
+
+  private async onRpc(env: RpcEnvelope): Promise<void> {
+    const params = (env.params ?? {}) as Record<string, unknown>
+    const reply = (result: unknown): void => this.send({ t: 'rpc_res', id: env.id, result })
+    const fail = (message: string, code?: string): void =>
+      this.send({ t: 'rpc_res', id: env.id, error: { message, code } })
+
+    if (!this.authed || !this.device) {
+      fail('not authenticated', 'unauthenticated')
+      return
+    }
+
+    if (!isMethodAllowed(env.method, this.device.scopes)) {
+      this.host.log(`refused ${env.method} from ${this.device.name} (scopes: ${this.device.scopes.join(', ')})`)
+      fail(denialReason(env.method, this.device.scopes), 'forbidden')
+      return
+    }
+
+    try {
+      // Subscriptions are served by the bridge, not the gateway. The bridge holds
+      // one subscription upstream covering every session and keeps its own durable
+      // log, so a device resumes from the bridge's cursor rather than from the
+      // gateway's, which is pruned ten minutes after each run ends.
+      if (env.method === 'sessions.subscribe') {
+        const keys = Array.isArray(params.sessionKeys) ? (params.sessionKeys as string[]) : []
+        const fresh = keys.filter((k) => !this.subscriptions.has(k))
+        for (const k of keys) this.subscriptions.add(k)
+        reply({ subscribed: keys, seq: this.host.currentSeq() })
+
+        // Backfill anything that happened on these sessions before the device
+        // started following them. Without this, a session the phone itself just
+        // started appears empty: its first events landed before the subscribe.
+        for (const k of fresh) {
+          const from = this.sentSeqByKey.get(k) ?? this.authSeq
+          const rows = this.host.eventsSince(from, 1000, [k]).filter((r) => r.sessionKey === k)
+          for (const row of rows) {
+            this.send({ t: 'event', event: row.event, data: JSON.parse(row.data), seq: row.seq, sessionKey: k })
+            this.sentSeqByKey.set(k, row.seq)
+          }
+        }
+
+        for (const k of keys) {
+          const snap = this.host.snapshotFor(k)
+          if (snap) this.send({ t: 'event', event: 'session.snapshot', data: snap, sessionKey: k })
+        }
+        return
+      }
+
+      if (env.method === 'sessions.unsubscribe') {
+        const keys = Array.isArray(params.sessionKeys) ? (params.sessionKeys as string[]) : []
+        for (const k of keys) this.subscriptions.delete(k)
+        reply({ unsubscribed: keys })
+        return
+      }
+
+      if (BRIDGE_METHODS.has(env.method)) {
+        reply(await this.host.handleBridgeMethod(this, env.method, params))
+        return
+      }
+
+      // Shell calls are rewritten so a device can only ever address its own
+      // shells. shellId is namespaced per connection, and kill/write/resize are
+      // refused for ids this connection does not own; the gateway itself performs
+      // no such check.
+      if (env.method.startsWith('shell.')) {
+        const result = await this.handleShell(env.method, params)
+        reply(result)
+        return
+      }
+
+      reply(await this.host.callGateway(env.method, params))
+    } catch (err) {
+      fail((err as Error).message)
+    }
+  }
+
+  private async handleShell(method: string, params: Record<string, unknown>): Promise<unknown> {
+    const requested = typeof params.shellId === 'string' ? params.shellId : ''
+
+    if (method === 'shell.list') {
+      // Only this device's own shells, never the machine's.
+      return {
+        active: [...this.ownedShells].map((id) => ({ shellId: id.slice(this.shellPrefix.length), live: true })),
+        saved: [],
+      }
+    }
+
+    if (!requested) throw new Error('shellId required')
+    const scoped = requested.startsWith(this.shellPrefix) ? requested : `${this.shellPrefix}${requested}`
+
+    if (method === 'shell.spawn') {
+      const result = await this.host.callGateway('shell.spawn', { ...params, shellId: scoped })
+      this.ownedShells.add(scoped)
+      return result
+    }
+
+    if (!this.ownedShells.has(scoped)) {
+      throw new Error('this device does not own that shell')
+    }
+
+    const result = await this.host.callGateway(method, { ...params, shellId: scoped })
+    if (method === 'shell.kill') this.ownedShells.delete(scoped)
+    return result
+  }
+
+  // -------------------------------------------------------------------------
+  // Outbound
+  // -------------------------------------------------------------------------
+
+  /**
+   * Serialised through a promise chain so replay and live events can never
+   * interleave out of order, and so a slow socket applies back-pressure to the
+   * replay loop instead of to the kernel buffer.
+   */
+  private send(env: Envelope): void {
+    if (this.closed || !this.channel) return
+    this.sendQueue = this.sendQueue.then(async () => {
+      if (this.closed || !this.channel) return
+      try {
+        const frame = this.channel.seal(env)
+        this.ws.send(frame)
+        await this.waitForDrain()
+      } catch (err) {
+        this.host.log(`send failed for ${this.device?.name ?? 'device'}: ${(err as Error).message}`)
+        this.ws.close()
+        this.cleanup()
+      }
+    })
+  }
+
+  private async waitForDrain(): Promise<void> {
+    let waited = 0
+    while (!this.closed && this.ws.bufferedAmount > SEND_HIGH_WATER_BYTES && waited < 30_000) {
+      await new Promise((r) => setTimeout(r, 25))
+      waited += 25
+    }
+  }
+
+  /**
+   * Forward a live event, if this device is allowed to see it.
+   * Returns silently when it is not, which is the common case.
+   */
+  forward(event: string, data: unknown, seq: number | undefined, sessionKey: string | null): void {
+    if (!this.authed) return
+    if (sessionKey && !this.subscriptions.has(sessionKey)) return
+    if (sessionKey && typeof seq === 'number') {
+      if (seq <= (this.sentSeqByKey.get(sessionKey) ?? 0)) return
+      this.sentSeqByKey.set(sessionKey, seq)
+    }
+    this.send({ t: 'event', event, data, seq, sessionKey: sessionKey ?? undefined })
+  }
+
+  /** The internal, per-connection shell id prefix. */
+  private get shellPrefix(): string {
+    return `rem-${this.id}-`
+  }
+
+  /**
+   * Terminal output for a shell this connection owns.
+   *
+   * The gateway broadcasts shell.data to every authenticated client with no
+   * scoping at all, so the ownership check here is the only thing standing
+   * between a remote device and every terminal on the machine. The namespaced
+   * id is translated back to the one the device asked for, so the internal
+   * naming never leaks past the bridge.
+   */
+  forwardShellData(shellId: string, data: Record<string, unknown>): void {
+    if (!this.authed) return
+    if (!this.ownedShells.has(shellId)) return
+    if (!this.scopes.includes('terminal')) return
+    const clientId = shellId.startsWith(this.shellPrefix) ? shellId.slice(this.shellPrefix.length) : shellId
+    this.send({ t: 'event', event: 'shell.data', data: { ...data, shellId: clientId } })
+  }
+
+  /** Catch a reconnecting device up from the durable log, in paced chunks. */
+  private async replayFrom(afterSeq: number): Promise<void> {
+    let cursor = afterSeq
+    const keys = this.subscriptions.size > 0 ? [...this.subscriptions] : this.host.knownSessionKeys()
+    for (;;) {
+      if (this.closed) return
+      const rows = this.host.eventsSince(cursor, REPLAY_CHUNK, keys)
+      if (rows.length === 0) break
+      for (const row of rows) {
+        this.send({
+          t: 'event',
+          event: row.event,
+          data: JSON.parse(row.data),
+          seq: row.seq,
+          sessionKey: row.sessionKey ?? undefined,
+        })
+        if (row.sessionKey) this.sentSeqByKey.set(row.sessionKey, row.seq)
+        cursor = row.seq
+      }
+      await this.sendQueue
+      if (rows.length < REPLAY_CHUNK) break
+    }
+  }
+
+  close(reason = 'closed'): void {
+    try {
+      this.ws.close(1000, reason)
+    } catch {
+      // Already gone.
+    }
+    this.cleanup()
+  }
+}

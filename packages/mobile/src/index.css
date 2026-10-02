@@ -1,0 +1,156 @@
+@import 'tailwindcss';
+
+/*
+ * One dark palette, tuned for a phone screen held at arm's length in bad light.
+ *
+ * Two deliberate departures from dorabot's desktop UI: nothing is smaller than
+ * 13px (the desktop chat uses 9-11px, well under the iOS legibility floor), and
+ * every tappable target is at least 44px tall.
+ */
+@theme {
+  --color-ink-950: #090a0c;
+  --color-ink-900: #0b0c0e;
+  --color-ink-850: #121418;
+  --color-ink-800: #171a1f;
+  --color-ink-700: #1f242b;
+  --color-ink-600: #2a3038;
+  --color-ink-500: #3a424d;
+  --color-ink-400: #5b6573;
+  --color-ink-300: #8b939f;
+  --color-ink-200: #b9c0c9;
+  --color-ink-100: #e7e9ec;
+
+  --color-mint-500: #6ee7a8;
+  --color-mint-600: #3fc98a;
+  --color-mint-900: #0e2119;
+
+  --color-amber-glow: #f0b429;
+  --color-amber-dim: #2a2008;
+
+  --color-rose-glow: #f2706b;
+  --color-rose-dim: #2a1413;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+
+  --radius-card: 14px;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-ink-900);
+    color: var(--color-ink-100);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior-y: none;
+    /* The webview sits under the status bar and home indicator. */
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+  }
+
+  /* A long-press selection popover on every tap feels broken on a phone.
+     Text that is worth copying opts back in with .selectable. */
+  * {
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    user-select: none;
+  }
+
+  .selectable {
+    user-select: text;
+    -webkit-user-select: text;
+    -webkit-touch-callout: default;
+  }
+
+  button {
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+  }
+
+  input,
+  textarea {
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: none;
+    outline: none;
+    /* Anything under 16px makes iOS zoom the viewport on focus. */
+    font-size: 16px;
+  }
+
+  textarea {
+    resize: none;
+  }
+}
+
+@layer utilities {
+  .safe-bottom {
+    padding-bottom: max(env(safe-area-inset-bottom), 12px);
+  }
+
+  .tap {
+    min-height: 44px;
+  }
+
+  .scroll {
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* A gentle, non-distracting pulse for "the agent is working". */
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.breathe {
+  animation: breathe 1.6s ease-in-out infinite;
+}
+
+@keyframes slide-up {
+  from {
+    transform: translateY(14px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.slide-up {
+  animation: slide-up 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .breathe,
+  .slide-up {
+    animation: none;
+  }
+}

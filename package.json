@@ -1,0 +1,17 @@
+{
+  "name": "dorabot-remote",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Pair your phone with your own dorabot. Direct, end-to-end encrypted remote control over LAN or Tailscale.",
+  "license": "MIT",
+  "workspaces": ["packages/protocol", "packages/bridge", "packages/mobile"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "npm run build -w @dorabot-remote/protocol && npm run build -w @dorabot-remote/bridge && npm run build -w @dorabot-remote/mobile",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "bridge": "npm run -w @dorabot-remote/bridge start",
+    "dev:mobile": "npm run -w @dorabot-remote/mobile dev"
+  }
+}

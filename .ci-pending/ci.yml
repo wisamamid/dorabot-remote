@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Build
+        run: npm run build -w @dorabot-remote/protocol && npm run build -w @dorabot-remote/bridge
+      - name: Typecheck the app
+        run: npm run build -w @dorabot-remote/mobile
+      - name: Crypto tests
+        run: npx vitest run --root packages/protocol
+      - name: End-to-end tests
+        run: npx vitest run --root packages/bridge
+
+  ios:
+    # The app has to keep building for a real device, not just typechecking.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build -w @dorabot-remote/protocol
+      - run: npm run build -w @dorabot-remote/mobile
+      - name: Sync Capacitor
+        working-directory: packages/mobile
+        run: npx cap sync ios
+      - name: Build for simulator
+        working-directory: packages/mobile/ios/App
+        run: |
+          xcodebuild -scheme App -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO build
