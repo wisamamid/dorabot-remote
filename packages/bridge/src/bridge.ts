@@ -470,7 +470,7 @@ export class Bridge implements ConnectionHost {
       n: this.hostSummary.name,
       k: toB64(this.sodium, this.hostIdentity.publicKey),
       c: code,
-      a: candidateAddresses(this.settings.port, this.settings.extraAddresses).map((c) => c.address),
+      a: candidateAddresses(this.settings.port, this.settings.extraAddresses, this.settings.bind).map((c) => c.address),
       e: expiresAt,
     }
     return { payload, uri: encodePairingPayload(payload), code }
@@ -571,7 +571,7 @@ export class Bridge implements ConnectionHost {
         gatewayConnected: this.gatewayConnected(),
         devices: this.store.listDevices().map((d) => this.deviceSummary(d)),
         scopeRequests: this.store.listScopeRequests('pending'),
-        addresses: candidateAddresses(this.settings.port, this.settings.extraAddresses),
+        addresses: candidateAddresses(this.settings.port, this.settings.extraAddresses, this.settings.bind),
         connections: [...this.connections].map((c) => ({ device: c.device?.name ?? null, address: c.remoteAddress })),
         log: this.logLines.slice(-80),
       })

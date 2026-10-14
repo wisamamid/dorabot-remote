@@ -14,6 +14,9 @@ export interface DeviceRecord {
   createdAt: number
   lastSeenAt: number | null
   revoked: boolean
+  /** FCM/APNs token the phone registered over the E2E channel, if any. */
+  pushToken?: string | null
+  pushPlatform?: 'ios' | 'android' | null
 }
 
 export interface ScopeRequest {
@@ -101,6 +104,10 @@ export class Store {
         value TEXT NOT NULL
       );
     `)
+    // Added after the first release, so existing databases need the columns grafted on.
+    const cols = (this.db.prepare('PRAGMA table_info(devices)').all() as Array<{ name: string }>).map((c) => c.name)
+    if (!cols.includes('push_token')) this.db.exec('ALTER TABLE devices ADD COLUMN push_token TEXT')
+    if (!cols.includes('push_platform')) this.db.exec('ALTER TABLE devices ADD COLUMN push_platform TEXT')
   }
 
   close(): void {
@@ -204,6 +211,8 @@ export class Store {
       createdAt: row.created_at as number,
       lastSeenAt: (row.last_seen_at as number | null) ?? null,
       revoked: Boolean(row.revoked),
+      pushToken: (row.push_token as string | null) ?? null,
+      pushPlatform: (row.push_platform as 'ios' | 'android' | null) ?? null,
     }
   }
 
@@ -226,6 +235,12 @@ export class Store {
 
   setScopes(id: string, scopes: Scope[]): boolean {
     return this.db.prepare('UPDATE devices SET scopes = ? WHERE id = ?').run(JSON.stringify(scopes), id).changes > 0
+  }
+
+  setPushToken(id: string, token: string | null, platform: 'ios' | 'android' | null): boolean {
+    return (
+      this.db.prepare('UPDATE devices SET push_token = ?, push_platform = ? WHERE id = ?').run(token, platform, id).changes > 0
+    )
   }
 
   renameDevice(id: string, name: string): boolean {

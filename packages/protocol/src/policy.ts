@@ -54,8 +54,6 @@ const RULES: Record<Scope, Rule[]> = {
     'chat.dismissElicitation',
     'agent.run_background',
     'search.memory',
-    'search.files',
-    'search.ripgrep',
   ],
   approvals: [
     'tool.approve',
@@ -102,7 +100,10 @@ const RULES: Record<Scope, Rule[]> = {
   ],
   // Read-only by design. fs.write, fs.delete, fs.rename, fs.copy, fs.mkdir and
   // fs.reveal are deliberately absent: a phone browses, it does not edit in place.
-  files: ['fs.list', 'fs.read', 'fs.readBinary', 'fs.stat'],
+  // search.files / search.ripgrep live here, not in `chat`: they return file
+  // contents from anywhere under a path, which is file reading by another name.
+  files: ['fs.list', 'fs.read', 'fs.readBinary', 'fs.stat', 'search.files', 'search.ripgrep'],
+  // Read-only git. Nothing here changes the working tree, the index or a ref.
   git: [
     'git.detect',
     'git.status',
@@ -117,6 +118,11 @@ const RULES: Record<Scope, Rule[]> = {
     'git.prDiff',
     'git.prFileDiff',
     'git.branchCompare',
+  ],
+  // Everything that mutates the repo or talks to a remote. git.discardFile and
+  // git.worktreeRemove exist on the gateway and are deliberately NOT exposed: they
+  // destroy uncommitted work and a phone has no undo.
+  git_write: [
     'git.stageFile',
     'git.unstageFile',
     'git.stageAll',
@@ -125,6 +131,7 @@ const RULES: Record<Scope, Rule[]> = {
     'git.fetch',
     'git.pull',
     'git.push',
+    'git.checkout',
   ],
   terminal: ['shell.spawn', 'shell.write', 'shell.resize', 'shell.kill', 'shell.scrollback', 'shell.list'],
   admin: [
@@ -176,6 +183,8 @@ export const BRIDGE_METHODS = new Set([
   'remote.scopeRequests',
   'remote.health',
   'remote.events',
+  'bridge.registerPush',
+  'bridge.unregisterPush',
 ])
 
 function matches(rule: Rule, method: string): boolean {

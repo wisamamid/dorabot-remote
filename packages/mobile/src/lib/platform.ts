@@ -13,33 +13,83 @@ export const platformName = Capacitor.getPlatform()
 // ---------------------------------------------------------------------------
 // Persistence
 //
-// Native uses Capacitor Preferences, which on iOS is backed by UserDefaults.
-// The device private key lives here, so on a real build this should move to the
-// Keychain; see the note in README under "Before TestFlight".
+// Secrets (the device private key lives inside the pairing record) go to
+// hardware-backed storage on native: the iOS Keychain, readable after first
+// unlock and never synced or backed up off the device, so background push
+// handling can read it later; on Android an AES-GCM key held in the Android
+// Keystore. Everything else (cursors, UI state) stays in Capacitor Preferences.
+//
+// On the web / PWA there is no hardware-backed store, so everything stays in
+// localStorage. That is a development convenience, not a security boundary.
+//
+// Callers do not choose: keys matching SECRET_KEY below are routed to the secure
+// store automatically, so the public API is the same get/set/remove as before.
 // ---------------------------------------------------------------------------
+
+const SECRET_KEY = /\.(pairing|secret)\./
+
+let secureReady: Promise<(typeof import('@aparajita/capacitor-secure-storage'))['SecureStorage']> | null = null
+
+function secureStorage() {
+  secureReady ??= (async () => {
+    const { SecureStorage, KeychainAccess } = await import('@aparajita/capacitor-secure-storage')
+    await SecureStorage.setKeyPrefix('dorabot-remote_')
+    await SecureStorage.setSynchronize(false)
+    await SecureStorage.setDefaultKeychainAccess(KeychainAccess.afterFirstUnlockThisDeviceOnly)
+    return SecureStorage
+  })()
+  return secureReady
+}
+
+async function prefs() {
+  const { Preferences } = await import('@capacitor/preferences')
+  return Preferences
+}
 
 export const storage = {
   async get(key: string): Promise<string | null> {
     if (!isNative) return localStorage.getItem(key)
-    const { Preferences } = await import('@capacitor/preferences')
-    const { value } = await Preferences.get({ key })
-    return value ?? null
+    if (!SECRET_KEY.test(key)) return ((await prefs()).get({ key })).then((r) => r.value ?? null)
+
+    const secure = await secureStorage()
+    const stored = await secure.getItem(key)
+    if (stored !== null && stored !== undefined) return stored
+
+    // One-time migration from builds that kept secrets in Preferences
+    // (UserDefaults on iOS): copy into secure storage, then delete the old copy.
+    const p = await prefs()
+    const { value } = await p.get({ key })
+    if (value == null) return null
+    await secure.setItem(key, value)
+    await p.remove({ key })
+    return value
   },
   async set(key: string, value: string): Promise<void> {
     if (!isNative) {
       localStorage.setItem(key, value)
       return
     }
-    const { Preferences } = await import('@capacitor/preferences')
-    await Preferences.set({ key, value })
+    if (!SECRET_KEY.test(key)) {
+      await (await prefs()).set({ key, value })
+      return
+    }
+    await (await secureStorage()).setItem(key, value)
+    // Never leave a stale plaintext copy behind.
+    await (await prefs()).remove({ key })
   },
   async remove(key: string): Promise<void> {
     if (!isNative) {
       localStorage.removeItem(key)
       return
     }
-    const { Preferences } = await import('@capacitor/preferences')
-    await Preferences.remove({ key })
+    if (SECRET_KEY.test(key)) {
+      try {
+        await (await secureStorage()).removeItem(key)
+      } catch {
+        // Nothing stored under that key.
+      }
+    }
+    await (await prefs()).remove({ key })
   },
 }
 

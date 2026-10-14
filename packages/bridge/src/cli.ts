@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { SCOPES, type Scope, fingerprint, fromB64, generateIdentity, toB64 } from '@dorabot-remote/protocol'
 import QRCode from 'qrcode'
@@ -6,6 +8,7 @@ import { candidateAddresses } from './addresses.js'
 import { BRIDGE_VERSION, loadIdentity, loadSettings, resolvePaths, saveSettings } from './config.js'
 import { Bridge } from './bridge.js'
 import { Store } from './store.js'
+import * as launchd from './launchd.js'
 
 const USAGE = `dorabot-remote ${BRIDGE_VERSION}
 
@@ -19,6 +22,9 @@ const USAGE = `dorabot-remote ${BRIDGE_VERSION}
   remove <deviceId>           Delete a device entirely
   addresses                   Show the addresses a phone can reach this Mac on
   config                      Show or change settings
+  install                     Run the bridge at login as a launchd agent (macOS)
+  uninstall                   Stop and remove the launchd agent
+  status                      Show whether the launchd agent is running
 
 Options
   --port <n>          Port to listen on (default 7788)
@@ -101,6 +107,15 @@ async function main(): Promise<void> {
     case 'addresses':
       cmdAddresses()
       return
+    case 'install':
+      cmdInstall()
+      return
+    case 'uninstall':
+      process.stdout.write(launchd.uninstall() ? 'Removed the launchd agent.\n' : 'The launchd agent was not installed.\n')
+      return
+    case 'status':
+      cmdStatus()
+      return
     case 'config':
       process.stdout.write(`${JSON.stringify(settings, null, 2)}\n`)
       return
@@ -113,7 +128,7 @@ async function main(): Promise<void> {
     const bridge = new Bridge({ paths, settings, log: (m) => process.stdout.write(`${m}\n`) })
     await bridge.start()
 
-    const addrs = candidateAddresses(settings.port, settings.extraAddresses)
+    const addrs = candidateAddresses(settings.port, settings.extraAddresses, settings.bind)
     process.stdout.write(`\n  dorabot remote is running.\n\n`)
     process.stdout.write(`  Control page   http://127.0.0.1:${settings.port}/\n`)
     process.stdout.write(`  Host key       ${bridge.hostSummary.fingerprint}\n`)
@@ -153,7 +168,7 @@ async function main(): Promise<void> {
       n: settings.hostName,
       k: toB64(null, identity.publicKey),
       c: code,
-      a: candidateAddresses(settings.port, settings.extraAddresses).map((a) => a.address),
+      a: candidateAddresses(settings.port, settings.extraAddresses, settings.bind).map((a) => a.address),
       e: expiresAt,
     }
     const uri = `dorabot-remote://pair#${Buffer.from(JSON.stringify(payload)).toString('base64url')}`
@@ -232,8 +247,27 @@ async function main(): Promise<void> {
     store.close()
   }
 
+  function cmdInstall(): void {
+    const env: Record<string, string> = {}
+    for (const key of ['DORABOT_REMOTE_HOME', 'DORABOT_HOME']) {
+      const v = process.env[key]
+      if (v) env[key] = v
+    }
+    const file = launchd.install({ cliPath: fileURLToPath(import.meta.url), root: paths.root, env })
+    process.stdout.write(`Installed ${file}\nThe bridge now starts at login and restarts if it stops.\nLogs: ${join(paths.root, 'logs')}\n`)
+  }
+
+  function cmdStatus(): void {
+    const s = launchd.status()
+    if (!s.installed && !s.loaded) {
+      process.stdout.write('Not installed. Run "dorabot-remote install" to start the bridge at login.\n')
+      return
+    }
+    process.stdout.write(`${s.loaded ? (s.pid ? `Running (pid ${s.pid})` : 'Loaded, not running') : 'Installed but not loaded'}\n${s.plist}\n`)
+  }
+
   function cmdAddresses(): void {
-    for (const a of candidateAddresses(settings.port, settings.extraAddresses)) {
+    for (const a of candidateAddresses(settings.port, settings.extraAddresses, settings.bind)) {
       process.stdout.write(`${a.address.padEnd(28)} ${a.label}\n`)
     }
   }

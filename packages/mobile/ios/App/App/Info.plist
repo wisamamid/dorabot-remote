@@ -7,7 +7,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>dorabot</string>
+	<string>DoraBot Remote</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -24,7 +24,7 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>so.dora.remote</string>
+			<string>com.xische.dorabotremote</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>dorabot-remote</string>
@@ -37,7 +37,7 @@
 	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsArbitraryLoads</key>
+		<key>NSAllowsArbitraryLoadsInWebContent</key>
 		<true/>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
@@ -47,9 +47,13 @@
 		<string>_dorabot-remote._tcp</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>Scan the pairing code shown on your Mac.</string>
+	<string>Scan the pairing code shown on your Mac to link this phone.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Connect directly to the Mac running dorabot on your network.</string>
+	<string>DoraBot Remote connects directly to your Mac on your local network.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -15,14 +15,10 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: Build
-        run: npm run build -w @dorabot-remote/protocol && npm run build -w @dorabot-remote/bridge
-      - name: Typecheck the app
-        run: npm run build -w @dorabot-remote/mobile
-      - name: Crypto tests
-        run: npx vitest run --root packages/protocol
-      - name: End-to-end tests
-        run: npx vitest run --root packages/bridge
+      - name: Build every workspace
+        run: npm run build
+      - name: Test every workspace
+        run: npm test
 
   ios:
     # The app has to keep building for a real device, not just typechecking.

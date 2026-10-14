@@ -143,7 +143,7 @@ export function SessionList({
                         </div>
                       )
                     )}
-                    <div className="mt-1 flex items-center gap-2 text-[12px] text-ink-500">
+                    <div className="mt-1 flex items-center gap-2 text-[13px] text-ink-500">
                       <span className="font-mono">{session.channel ?? 'desktop'}</span>
                       <span>·</span>
                       <span>{session.messageCount} messages</span>

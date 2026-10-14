@@ -1,4 +1,4 @@
-package so.dora.remote;
+package com.xische.dorabotremote;
 
 import com.getcapacitor.BridgeActivity;
 

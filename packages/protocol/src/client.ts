@@ -18,7 +18,10 @@ import {
   toB64,
 } from './crypto.js'
 import { openSealedJson } from './crypto.js'
+import { RELAY_HEAD_START_MS, relayDeviceUrl, type RelayInfo } from './relay.js'
 import type { DeviceSummary, Envelope, HostSummary, PairingPayload, Scope } from './wire.js'
+
+export type Transport = 'lan' | 'relay'
 
 export type ConnectionState = 'idle' | 'connecting' | 'handshaking' | 'ready' | 'disconnected'
 
@@ -40,6 +43,10 @@ export interface RemoteClientOptions {
   hostPublicKey: Uint8Array
   /** "host:port" candidates, best first. They are raced. */
   addresses: string[]
+  /** Blind relay for reaching the host from anywhere. Joins the race after LAN gets a head start. */
+  relay?: RelayInfo | null
+  /** Fired when the winning transport changes, for a LAN/relay badge. */
+  onTransport?: (transport: Transport | null) => void
   createSocket: SocketFactory
   /** Highest bridge seq already applied, for gap-free resume. */
   lastSeq?: number
@@ -57,10 +64,13 @@ export interface PairResult {
   scopes: Scope[]
   identity: KeyPair
   hostPublicKey: Uint8Array
-  /** The address that answered. */
+  /** The address that answered (the relay url when paired through the relay). */
   address: string
   /** Every candidate from the QR, with the one that answered first. */
   addresses: string[]
+  /** Relay from the QR, to persist so the phone can reach the host off-LAN. */
+  relay?: RelayInfo
+  transport: Transport
 }
 
 const CONNECT_TIMEOUT_MS = 6000
@@ -131,79 +141,123 @@ export async function pairWithHost(args: {
     throw new Error('That pairing code has expired. Generate a new one on your Mac.')
   }
 
-  let lastError = 'no address responded'
-  for (const address of args.payload.a) {
-    try {
-      return await new Promise<PairResult>((resolve, reject) => {
-        const socket = args.createSocket(`ws://${address}/pair`)
-        const timer = setTimeout(() => {
+  const attemptPair = (url: string, address: string, transport: Transport): Promise<PairResult> =>
+    new Promise<PairResult>((resolve, reject) => {
+      const socket = args.createSocket(url)
+      const timer = setTimeout(() => {
+        socket.close()
+        reject(new Error('timed out'))
+      }, CONNECT_TIMEOUT_MS)
+
+      const finish = (err: Error | null, value?: PairResult): void => {
+        clearTimeout(timer)
+        try {
           socket.close()
-          reject(new Error('timed out'))
-        }, CONNECT_TIMEOUT_MS)
-
-        const finish = (err: Error | null, value?: PairResult): void => {
-          clearTimeout(timer)
-          try {
-            socket.close()
-          } catch {
-            // Already closing.
-          }
-          if (err) reject(err)
-          else resolve(value!)
+        } catch {
+          // Already closing.
         }
+        if (err) reject(err)
+        else resolve(value!)
+      }
 
-        bind(socket, {
-          open: () => {
-            const request: PairingRequest = {
-              v: PROTOCOL_VERSION,
-              code: args.payload.c,
-              devicePublicKey: toB64(null, identity.publicKey),
-              deviceName: args.deviceName,
-              platform: args.platform,
+      bind(socket, {
+        open: () => {
+          const request: PairingRequest = {
+            v: PROTOCOL_VERSION,
+            code: args.payload.c,
+            devicePublicKey: toB64(null, identity.publicKey),
+            deviceName: args.deviceName,
+            platform: args.platform,
+          }
+          socket.send(JSON.stringify({ t: 'pair', v: PROTOCOL_VERSION, sealed: sealJson(null, hostPublicKey, request) }))
+        },
+        message: (data) => {
+          try {
+            const frame = JSON.parse(toText(data)) as { t?: string; sealed?: string; message?: string }
+            if (frame.t === 'err') {
+              finish(new Error(frame.message ?? 'pairing refused'))
+              return
             }
-            socket.send(JSON.stringify({ t: 'pair', v: PROTOCOL_VERSION, sealed: sealJson(null, hostPublicKey, request) }))
-          },
-          message: (data) => {
-            try {
-              const frame = JSON.parse(toText(data)) as { t?: string; sealed?: string; message?: string }
-              if (frame.t === 'err') {
-                finish(new Error(frame.message ?? 'pairing refused'))
-                return
-              }
-              if (frame.t !== 'pair_ok' || !frame.sealed) {
-                finish(new Error('unexpected reply from host'))
-                return
-              }
-              const res = openSealedJson<PairingResponse>(null, identity, frame.sealed)
-              if (res.hostPublicKey !== args.payload.k) {
-                finish(new Error('host key mismatch: do not trust this connection'))
-                return
-              }
-              finish(null, {
-                deviceId: res.deviceId,
-                hostId: res.hostId,
-                hostName: res.hostName,
-                scopes: res.scopes as Scope[],
-                identity,
-                hostPublicKey,
-                address,
-                // Keep every candidate: the phone will move between WiFi and
-                // Tailscale and should re-race them rather than re-pair.
-                addresses: [address, ...args.payload.a.filter((a) => a !== address)],
-              })
-            } catch (err) {
-              finish(err as Error)
+            if (frame.t !== 'pair_ok' || !frame.sealed) {
+              finish(new Error('unexpected reply from host'))
+              return
             }
-          },
-          close: () => finish(new Error('host closed the connection')),
-          error: (err) => finish(err),
-        })
+            const res = openSealedJson<PairingResponse>(null, identity, frame.sealed)
+            if (res.hostPublicKey !== args.payload.k) {
+              finish(new Error('host key mismatch: do not trust this connection'))
+              return
+            }
+            finish(null, {
+              deviceId: res.deviceId,
+              hostId: res.hostId,
+              hostName: res.hostName,
+              scopes: res.scopes as Scope[],
+              identity,
+              hostPublicKey,
+              address,
+              // Keep every candidate: the phone will move between WiFi and
+              // Tailscale and should re-race them rather than re-pair.
+              addresses: [...(transport === 'lan' ? [address] : []), ...args.payload.a.filter((a) => a !== address)],
+              relay: args.payload.r,
+              transport,
+            })
+          } catch (err) {
+            finish(err as Error)
+          }
+        },
+        close: () => finish(new Error('host closed the connection')),
+        error: (err) => finish(err),
       })
-    } catch (err) {
-      lastError = (err as Error).message
+    })
+
+  // LAN candidates are tried in order, as before. The relay joins after a short
+  // head start (or at once if every LAN address has already failed), so pairing at
+  // home never leaves the LAN and pairing on cellular still works.
+  let lastError = 'no address responded'
+  // The code is single use, so once either path wins the other must stand down.
+  let decided = false
+  const lan = (async (): Promise<PairResult> => {
+    for (const address of args.payload.a) {
+      if (decided) break
+      try {
+        return await attemptPair(`ws://${address}/pair`, address, 'lan')
+      } catch (err) {
+        lastError = (err as Error).message
+      }
+    }
+    throw new Error(lastError)
+  })()
+
+  const relay = args.payload.r
+  if (!relay) {
+    try {
+      return await lan
+    } catch {
+      throw new Error(`Could not reach your Mac (${lastError}). Check it is awake and on the same network or Tailnet.`)
     }
   }
-  throw new Error(`Could not reach your Mac (${lastError}). Check it is awake and on the same network or Tailnet.`)
+
+  const viaRelay = (async (): Promise<PairResult> => {
+    await Promise.race([
+      new Promise((r) => setTimeout(r, args.payload.a.length === 0 ? 0 : RELAY_HEAD_START_MS)),
+      lan.then(
+        () => new Promise(() => {}),
+        () => undefined,
+      ),
+    ])
+    if (decided) throw new Error('stood down')
+    return attemptPair(relayDeviceUrl(relay), relay.u, 'relay')
+  })()
+
+  try {
+    const won = await Promise.any([lan, viaRelay])
+    decided = true
+    return won
+  } catch (err) {
+    const errors = (err as AggregateError).errors as Error[]
+    const msg = errors.map((e) => e.message).find((m) => m && m !== 'timed out' && m !== 'host closed the connection') ?? lastError
+    throw new Error(`Could not reach your Mac (${msg}). Check it is awake and online.`)
+  }
 }
 
 /**
@@ -221,6 +275,10 @@ export class RemoteClient {
   gatewayConnected = false
   /** The address that actually worked, so the next connect tries it first. */
   activeAddress: string | null = null
+  /** Which path the live connection took. Null while not connected. */
+  transport: Transport | null = null
+  /** Relay to race against LAN; refreshed from the host on every ready. */
+  relay: RelayInfo | null
   lastSeq: number
 
   private socket: SocketLike | null = null
@@ -236,6 +294,13 @@ export class RemoteClient {
 
   constructor(private readonly opts: RemoteClientOptions) {
     this.lastSeq = opts.lastSeq ?? 0
+    this.relay = opts.relay ?? null
+  }
+
+  private setTransport(t: Transport | null): void {
+    if (this.transport === t) return
+    this.transport = t
+    this.opts.onTransport?.(t)
   }
 
   private log(msg: string): void {
@@ -266,6 +331,7 @@ export class RemoteClient {
     }
     this.socket = null
     this.channel = null
+    this.setTransport(null)
     this.setState('disconnected')
   }
 
@@ -287,15 +353,21 @@ export class RemoteClient {
     if (this.stopped) return
     this.setState('connecting')
     const addresses = this.orderedAddresses()
-    if (addresses.length === 0) {
+    const relay = this.relay
+    if (addresses.length === 0 && !relay) {
       this.scheduleReconnect('no addresses configured')
       return
     }
 
     let settled = false
     const attempts: SocketLike[] = []
+    // The relay starts late so that LAN wins whenever it is reachable, which keeps
+    // traffic off the internet and latency low. If every LAN attempt has already
+    // failed there is nothing to wait for, so it starts at once.
+    let relayTimer: ReturnType<typeof setTimeout> | null = null
+    let startRelay: (() => void) | null = null
 
-    const win = (socket: SocketLike, address: string, channel: SecureChannel, host: HostSummary): void => {
+    const win = (socket: SocketLike, address: string, transport: Transport, channel: SecureChannel, host: HostSummary): void => {
       if (settled) {
         try {
           socket.close()
@@ -305,6 +377,9 @@ export class RemoteClient {
         return
       }
       settled = true
+      if (relayTimer) clearTimeout(relayTimer)
+      relayTimer = null
+      startRelay = null
       for (const other of attempts) {
         if (other !== socket) {
           try {
@@ -317,26 +392,30 @@ export class RemoteClient {
       this.socket = socket
       this.channel = channel
       this.host = host
-      this.activeAddress = address
+      if (transport === 'lan') this.activeAddress = address
+      this.setTransport(transport)
       this.attempt = 0
       this.sendEnvelope({ t: 'auth', lastSeq: this.lastSeq, clientVersion: this.opts.clientVersion })
     }
 
     const lose = (reason: string): void => {
       if (settled) return
-      if (attempts.every((s) => s.readyState === 3 /* CLOSED */)) {
-        settled = true
-        this.scheduleReconnect(reason)
+      if (!attempts.every((s) => s.readyState === 3 /* CLOSED */)) return
+      if (startRelay) {
+        startRelay()
+        return
       }
+      settled = true
+      this.scheduleReconnect(reason)
     }
 
-    for (const address of addresses) {
+    const race = (url: string, address: string, transport: Transport): void => {
       let socket: SocketLike
       try {
-        socket = this.opts.createSocket(`ws://${address}/connect`)
+        socket = this.opts.createSocket(url)
       } catch (err) {
         this.log(`cannot open ${address}: ${(err as Error).message}`)
-        continue
+        return
       }
       attempts.push(socket)
 
@@ -391,7 +470,7 @@ export class RemoteClient {
               if (frame.t === 'hdr' && channel) {
                 clearTimeout(timer)
                 channel.startReceive(fromB64(null, String(frame.hdr)))
-                win(socket, address, channel, {
+                win(socket, address, transport, channel, {
                   id: String(frame.hostId ?? ''),
                   name: String(frame.hostName ?? ''),
                   fingerprint: '',
@@ -419,6 +498,7 @@ export class RemoteClient {
             this.channel = null
             this.stopPing()
             this.failPending(new Error('connection closed'))
+            this.setTransport(null)
             this.setState('disconnected', reason)
             this.scheduleReconnect(reason || `closed ${code ?? ''}`)
             return
@@ -431,6 +511,22 @@ export class RemoteClient {
         },
       })
     }
+
+    for (const address of addresses) race(`ws://${address}/connect`, address, 'lan')
+
+    if (relay) {
+      const url = relayDeviceUrl(relay)
+      startRelay = () => {
+        if (relayTimer) clearTimeout(relayTimer)
+        relayTimer = null
+        startRelay = null
+        race(url, relay.u, 'relay')
+        // A relay socket that could not even be created leaves nothing to wait on.
+        lose('unreachable')
+      }
+      if (addresses.length === 0) startRelay()
+      else relayTimer = setTimeout(() => startRelay?.(), RELAY_HEAD_START_MS)
+    }
   }
 
   private onEnvelope(env: Envelope): void {
@@ -440,6 +536,9 @@ export class RemoteClient {
         this.host = env.host
         this.allowed = env.allowed
         this.gatewayConnected = env.gatewayConnected
+        // An already-paired phone learns the relay the first time it reaches the
+        // host over LAN, with no re-pairing.
+        if (env.host.relay) this.relay = env.host.relay
         this.setState('ready')
         this.startPing()
         this.opts.onReady?.(env)

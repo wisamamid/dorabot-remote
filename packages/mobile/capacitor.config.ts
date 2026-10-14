@@ -1,8 +1,8 @@
 import type { CapacitorConfig } from '@capacitor/cli'
 
 const config: CapacitorConfig = {
-  appId: 'so.dora.remote',
-  appName: 'dorabot',
+  appId: 'com.xische.dorabotremote',
+  appName: 'DoraBot Remote',
   webDir: 'dist',
   ios: {
     // The webview sits under the status bar so the app can paint its own

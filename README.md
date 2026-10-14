@@ -191,9 +191,14 @@ out of band by the QR. Adding TLS on top would authenticate nothing extra.
 **Revocation** is immediate: revoke on the control page or with
 `dorabot-remote revoke <deviceId>` and any live connection is dropped.
 
-**Known gap.** The device private key is currently in Capacitor Preferences
-(UserDefaults on iOS), not the Keychain. Tracked, and worth closing before this is
-installed anywhere you do not control.
+**Device secrets.** The device private key (inside the pairing record) is stored in
+the iOS Keychain (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`: readable by
+background push handling after first unlock, never synced to iCloud or restored onto
+another device) and, on Android, in AES-GCM encrypted storage under an Android
+Keystore key, via `@aparajita/capacitor-secure-storage`. Builds that kept the key in
+Preferences migrate it on first read and delete the old copy. The web/PWA build has
+no hardware-backed store and keeps it in `localStorage`; treat that as development
+only. Note iOS keeps Keychain items across an app reinstall.
 
 ## Offline and resume
 
@@ -216,7 +221,18 @@ dorabot-remote grant <id> <scope>    Add a permission
 dorabot-remote revoke <id>           Block a device, keep the record
 dorabot-remote remove <id>           Delete it entirely
 dorabot-remote addresses             Show reachable addresses
+dorabot-remote install               Start the bridge at login (launchd agent)
+dorabot-remote uninstall             Stop and remove the launchd agent
+dorabot-remote status                Show whether the agent is running
 ```
+
+### Running at login
+
+`dorabot-remote install` writes `~/Library/LaunchAgents/com.xische.dorabotremote.bridge.plist`
+(RunAtLoad, KeepAlive, 10s throttle, absolute path to the current `node` and
+`dist/cli.js start`) and loads it with `launchctl bootstrap gui/$UID`. Logs go to
+`~/.dorabot-remote/logs/`. It is idempotent; re-run it after moving the repo or
+changing Node versions. `uninstall` removes it.
 
 ## Building the app
 
@@ -225,6 +241,19 @@ npm run dev -w @dorabot-remote/mobile     # web, for development
 npm run ios -w @dorabot-remote/mobile     # open Xcode
 npm run android -w @dorabot-remote/mobile # open Android Studio
 ```
+
+Release builds (set `ASC_KEY_PATH`/`ASC_KEY_ID`/`ASC_ISSUER_ID`, an App Store Connect API key):
+
+```bash
+packages/mobile/scripts/ios-release.sh            # archive + export .ipa, no upload
+UPLOAD=1 packages/mobile/scripts/ios-release.sh   # also upload to TestFlight
+packages/mobile/scripts/android-release.sh        # signed AAB; needs ANDROID_KEYSTORE_* env
+```
+
+The app talks plain `ws://` (payload is end-to-end encrypted). On iOS that needs
+`NSAllowsLocalNetworking` (LAN IPs, `.local`) plus `NSAllowsArbitraryLoadsInWebContent`
+(Tailscale `100.x` addresses and MagicDNS names, which ATS otherwise blocks); native
+code stays under ATS.
 
 The web build is a usable PWA on its own if you would rather not install anything.
 
@@ -256,9 +285,8 @@ subscribe backfill.
 
 Works, and used daily against a real dorabot. Not yet on TestFlight.
 
-Before installing somewhere you do not control: move the device key to the
-Keychain, and read the permissions table above properly rather than granting
-everything.
+Before installing somewhere you do not control, read the permissions table above
+properly rather than granting everything.
 
 ## Licence
 
