@@ -61,6 +61,11 @@ const RULES: Record<Scope, Rule[]> = {
     'tool.approve',
     'tool.deny',
     'tool.pending',
+    // Push registration lives with approvals: it is how a phone is told one is waiting.
+    'remote.registerPush',
+    'remote.unregisterPush',
+    'remote.setPushPrefs',
+    'remote.pushPrefs',
     'security.get',
     'security.tools.get',
     'security.paths.get',
@@ -184,10 +189,14 @@ export const BRIDGE_METHODS = new Set([
   'remote.scopeRequests',
   'remote.health',
   'remote.events',
+  'remote.registerPush',
+  'remote.unregisterPush',
+  'remote.setPushPrefs',
+  'remote.pushPrefs',
 ])
 
 /** Bridge methods that also require a scope (they are not open to every device). */
-const BRIDGE_SCOPE_GATED = new Set(['remote.events'])
+const BRIDGE_SCOPE_GATED = new Set(['remote.events', 'remote.registerPush', 'remote.unregisterPush', 'remote.setPushPrefs', 'remote.pushPrefs'])
 
 function matches(rule: Rule, method: string): boolean {
   if (rule.endsWith('.*')) return method.startsWith(rule.slice(0, -1))

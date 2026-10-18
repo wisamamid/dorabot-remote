@@ -41,12 +41,18 @@ import {
 } from './config.js'
 import { DeviceConnection, type ConnectionHost } from './connection.js'
 import type { DeviceSocket } from './device-socket.js'
+import { PushNotifier, PUSH_TOKEN_RE } from './push.js'
 import { RelayClient, type RelayState } from './relay-client.js'
 import { CONTROL_PAGE } from './control-page.js'
 import { GatewayClient } from './gateway-client.js'
 import { applyEventToSnapshots } from './snapshot-state.js'
 import { Store, type DeviceRecord } from './store.js'
 
+/** Push treats a device as connected only if it sent a frame this recently. */
+export const LIVE_WINDOW_MS = 45_000
+/** Connections silent this long are closed. */
+export const IDLE_CLOSE_MS = 90_000
+const IDLE_SWEEP_MS = 15_000
 const GATEWAY_CURSOR_KEY = 'gateway.lastSeqBySession'
 
 export interface BridgeOptions {
@@ -72,8 +78,10 @@ export class Bridge implements ConnectionHost {
   private gatewayCursor: Record<string, number> = {}
   private pruneTimer: NodeJS.Timeout | null = null
   private deviceTimer: NodeJS.Timeout | null = null
+  private idleTimer: NodeJS.Timeout | null = null
   private relay: RelayClient | null = null
   private relayInfo: RelayInfo | null = null
+  private pusher: PushNotifier | null = null
   readonly logLines: string[] = []
 
   constructor(opts: BridgeOptions) {
@@ -102,6 +110,13 @@ export class Bridge implements ConnectionHost {
     if (this.settings.relay.enabled && isRelayUrlConfigured(this.settings.relay.url)) {
       const key = loadSigningKey(this.paths)
       this.relayInfo = { u: this.settings.relay.url.replace(/\/+$/, ''), i: relayIdFromPublicKey(key.publicKey) }
+      this.pusher = new PushNotifier({
+        store: this.store,
+        relay: { url: this.relayInfo.u, id: this.relayInfo.i },
+        signingKey: key,
+        isConnected: (id) => this.isDeviceLive(id),
+        log: (m) => this.log(m),
+      })
       this.relay = new RelayClient({
         url: this.relayInfo.u,
         signingKey: key,
@@ -140,6 +155,8 @@ export class Bridge implements ConnectionHost {
       for (const c of [...this.connections]) c.recheckDevice()
     }, 5000)
 
+    this.idleTimer = setInterval(() => this.sweepIdle(), IDLE_SWEEP_MS)
+
     this.pruneTimer = setInterval(
       () => {
         this.store.purgeExpiredPairings()
@@ -153,6 +170,7 @@ export class Bridge implements ConnectionHost {
   async stop(): Promise<void> {
     if (this.pruneTimer) clearInterval(this.pruneTimer)
     if (this.deviceTimer) clearInterval(this.deviceTimer)
+    if (this.idleTimer) clearInterval(this.idleTimer)
     for (const c of this.connections) c.close('bridge shutting down')
     this.relay?.stop()
     this.gateway?.stop()
@@ -163,6 +181,27 @@ export class Bridge implements ConnectionHost {
       this.http.closeAllConnections?.()
     })
     this.store.close()
+  }
+
+  /**
+   * A phone counts as connected only if it has spoken recently. iOS suspends a
+   * backgrounded app but its socket often stays open for a long time; the phone
+   * pings every 20s while running, so silence means it is not looking.
+   */
+  isDeviceLive(deviceId: string, now = Date.now()): boolean {
+    return [...this.connections].some((c) => c.device?.id === deviceId && c.isAuthed && now - c.lastInboundAt < LIVE_WINDOW_MS)
+  }
+
+  /** Drop connections that have been silent too long so dead sockets do not pile up. */
+  sweepIdle(now = Date.now()): number {
+    let closed = 0
+    for (const c of [...this.connections]) {
+      if (now - c.lastInboundAt < IDLE_CLOSE_MS) continue
+      this.log(`closing idle connection${c.device ? ` for "${c.device.name}"` : ''} (no traffic for ${Math.round((now - c.lastInboundAt) / 1000)}s)`)
+      c.close('idle')
+      closed++
+    }
+    return closed
   }
 
   private listen(): Promise<void> {
@@ -333,6 +372,7 @@ export class Bridge implements ConnectionHost {
     }
 
     for (const c of this.connections) c.forward(name, data, bridgeSeq, sessionKey)
+    this.pusher?.onGatewayEvent(name, data)
   }
 
   /**
@@ -460,6 +500,42 @@ export class Bridge implements ConnectionHost {
       case 'remote.scopeRequests': {
         this.requireScope(conn, 'admin')
         return this.store.listScopeRequests('pending')
+      }
+
+      case 'remote.registerPush': {
+        const device = conn.device
+        if (!device) throw new Error('not authenticated')
+        const token = String(params.token ?? '')
+        const platform = params.platform
+        const env = params.env === 'sandbox' ? 'sandbox' : 'production'
+        if (!PUSH_TOKEN_RE.test(token)) throw new Error('invalid push token')
+        if (platform !== 'ios' && platform !== 'android') throw new Error('invalid push platform')
+        if (params.env !== undefined && params.env !== 'production' && params.env !== 'sandbox') throw new Error('invalid push env')
+        this.store.setPushToken(device.id, token, platform, env)
+        this.log(`push registered for "${device.name}" (${platform}, ${env})`)
+        return { registered: true, notifyOnResult: this.store.getDevice(device.id)?.pushOnResult ?? false }
+      }
+
+      case 'remote.unregisterPush': {
+        const device = conn.device
+        if (!device) throw new Error('not authenticated')
+        this.store.setPushToken(device.id, null, null)
+        this.log(`push unregistered for "${device.name}"`)
+        return { unregistered: true }
+      }
+
+      case 'remote.setPushPrefs': {
+        const device = conn.device
+        if (!device) throw new Error('not authenticated')
+        if (typeof params.notifyOnResult !== 'boolean') throw new Error('notifyOnResult must be a boolean')
+        this.store.setPushOnResult(device.id, params.notifyOnResult)
+        return { notifyOnResult: params.notifyOnResult }
+      }
+
+      case 'remote.pushPrefs': {
+        const device = conn.device ? this.store.getDevice(conn.device.id) : null
+        if (!device) throw new Error('not authenticated')
+        return { registered: Boolean(device.pushToken), notifyOnResult: Boolean(device.pushOnResult) }
       }
 
       case 'remote.events': {

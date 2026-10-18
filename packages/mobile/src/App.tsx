@@ -7,10 +7,13 @@ import { WorkScreen } from './components/WorkScreen.js'
 import { PairScreen } from './components/PairScreen.js'
 import { SessionList } from './components/SessionList.js'
 import { SessionView } from './components/SessionView.js'
+import { PushPrompt } from './components/PushPrompt.js'
 import { Button, Spinner, cx } from './components/ui.js'
 import { ConnectionProvider, useConnection } from './lib/connection.js'
 import { InboxProvider, useInbox } from './lib/inbox-context.js'
 import { setStatusBarDark } from './lib/platform.js'
+import { clearDeliveredNotifications, onPushNavigate } from './lib/push.js'
+import { PushProvider } from './lib/push-context.js'
 
 type TabName = 'sessions' | 'inbox' | 'work' | 'code' | 'more'
 
@@ -22,9 +25,11 @@ export default function App(): ReactNode {
   }, [])
   return (
     <ConnectionProvider>
-      <InboxProvider>
-        <Shell />
-      </InboxProvider>
+      <PushProvider>
+        <InboxProvider>
+          <Shell />
+        </InboxProvider>
+      </PushProvider>
     </ConnectionProvider>
   )
 }
@@ -48,6 +53,32 @@ function Shell(): ReactNode {
   const inbox = useInbox()
   const [tab, setTab] = useState<TabName>('sessions')
   const [open, setOpen] = useState<Open>(null)
+  // A tapped notification carries only a routing id; wait for the matching inbox item.
+  const [pendingRid, setPendingRid] = useState<string | null>(null)
+  const paired = Boolean(conn.pairing)
+
+  useEffect(() => {
+    if (!paired) return
+    return onPushNavigate((nav) => {
+      setTab('inbox')
+      setOpen(null)
+      void clearDeliveredNotifications()
+      if (nav.rid) {
+        setPendingRid(nav.rid)
+        setTimeout(() => setPendingRid((r) => (r === nav.rid ? null : r)), 15_000)
+      }
+    })
+  }, [paired])
+
+  useEffect(() => {
+    if (!pendingRid) return
+    const item = inbox.items.find((i) => i.id.endsWith(`:${pendingRid}`))
+    if (!item) return
+    setPendingRid(null)
+    if (!item.sessionKey) return
+    const s = conn.sessions.find((x) => x.channel && x.chatType && x.chatId && `${x.channel}:${x.chatType}:${x.chatId}` === item.sessionKey)
+    setOpen({ session: s ?? null, sessionKey: item.sessionKey })
+  }, [pendingRid, inbox.items, conn.sessions])
 
   if (!conn.ready) {
     return (
@@ -79,6 +110,7 @@ function Shell(): ReactNode {
           </Button>
         </div>
       )}
+      {!open && (tab === 'sessions' || tab === 'inbox') && <PushPrompt />}
       <div className="relative min-h-0 flex-1">
         {pane('sessions', <SessionList onOpen={openSession} onSettings={() => setTab('more')} />)}
         {pane('inbox', <InboxScreen onOpenSession={openSession} />)}

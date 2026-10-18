@@ -5,6 +5,7 @@
  * after the user taps.
  */
 import { isRelayId, verifyForRelayId } from '@dorabot-remote/protocol'
+import { APNS_DEFAULT_TOPIC, sendApns, type ApnsCache } from './apns.js'
 import { LIMITS } from './limits.js'
 
 export const PUSH_KINDS = ['question', 'approval', 'result', 'error', 'withdraw'] as const
@@ -15,6 +16,8 @@ export interface PushBody {
   platform: 'ios' | 'android'
   kind: PushKind
   rid?: string
+  /** iOS only: which APNs environment the token belongs to. Defaults to production. */
+  env?: 'production' | 'sandbox'
   ts: number
 }
 export interface ServiceAccount {
@@ -32,13 +35,14 @@ export function parsePushBody(raw: string): PushBody | null {
     return null
   }
   if (!v || typeof v !== 'object') return null
-  const { token, platform, kind, rid, ts } = v
+  const { token, platform, kind, rid, ts, env } = v
   if (typeof token !== 'string' || token.length < 8 || token.length > 4096) return null
   if (platform !== 'ios' && platform !== 'android') return null
   if (typeof kind !== 'string' || !(PUSH_KINDS as readonly string[]).includes(kind)) return null
   if (rid !== undefined && (typeof rid !== 'string' || rid.length === 0 || rid.length > 128)) return null
   if (typeof ts !== 'number' || !Number.isFinite(ts)) return null
-  return { token, platform, kind: kind as PushKind, rid: rid as string | undefined, ts }
+  if (env !== undefined && env !== 'production' && env !== 'sandbox') return null
+  return { token, platform, kind: kind as PushKind, rid: rid as string | undefined, ts, ...(env ? { env } : {}) }
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +203,9 @@ export interface PushDeps {
   /** True if this relayId is still within its push budget. */
   rateLimit: () => Promise<boolean>
   cache?: TokenCache
+  /** APNs credentials (Worker secrets); absent means iOS push is off. */
+  apns?: { keyP8?: string; keyId?: string; teamId?: string; topic?: string }
+  apnsCache?: ApnsCache
 }
 
 const json = (status: number, body: unknown): Response =>
@@ -224,6 +231,24 @@ export async function handlePush(request: Request, relayId: string, deps: PushDe
   const body = parsePushBody(new TextDecoder().decode(raw))
   if (!body) return json(400, { error: 'bad_request' })
   if (Math.abs(deps.now() - body.ts) >= LIMITS.pushMaxAgeMs) return json(400, { error: 'stale_timestamp' })
+
+  if (body.platform === 'ios') {
+    const a = deps.apns
+    if (!a?.keyP8 || !a.keyId || !a.teamId) return json(503, { error: 'push_not_configured' })
+    if (!(await deps.rateLimit())) return json(429, { error: 'rate_limited' })
+    try {
+      const r = await sendApns(
+        body,
+        { keyP8: a.keyP8.replace(/\\n/g, '\n'), keyId: a.keyId, teamId: a.teamId, topic: a.topic || APNS_DEFAULT_TOPIC },
+        deps.fetch,
+        deps.now(),
+        deps.apnsCache,
+      )
+      return r.status === 204 ? new Response(null, { status: 204 }) : json(r.status, r.body)
+    } catch {
+      return json(502, { error: 'push_failed' })
+    }
+  }
 
   if (!deps.serviceAccount) return json(503, { error: 'push_not_configured' })
   let sa: ServiceAccount

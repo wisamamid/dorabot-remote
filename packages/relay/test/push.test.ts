@@ -27,7 +27,7 @@ const relayId = relayIdFromPublicKey(key.publicKey)
 
 const body = (over: Partial<PushBody> = {}): PushBody => ({
   token: 'device-token-1234',
-  platform: 'ios',
+  platform: 'android',
   kind: 'question',
   rid: 'req-1',
   ts: Date.now(),
@@ -145,7 +145,7 @@ describe('handlePush', () => {
 })
 
 describe('buildFcmMessage', () => {
-  const msg = (b: Partial<PushBody>) => buildFcmMessage(body(b), relayId).message as Record<string, any>
+  const msg = (b: Partial<PushBody>) => buildFcmMessage(body({ platform: 'ios', ...b }), relayId).message as Record<string, any>
 
   it('is contentless: only a kind, a routing id and the relayId travel in data', () => {
     const m = msg({ kind: 'approval', rid: 'abc' })
