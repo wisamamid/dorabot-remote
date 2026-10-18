@@ -1,0 +1,68 @@
+import { describe, expect, it } from 'vitest'
+import { isMethodAllowed, methodsForScopes, denialReason } from './policy.js'
+import { SCOPES, SCOPE_DEFAULTS, SCOPE_LABELS, SCOPE_DESCRIPTIONS, type Scope } from './wire.js'
+
+const only = (scope: Scope): Scope[] => [scope]
+const exact = (scope: Scope): string[] => methodsForScopes(only(scope)).filter((m) => !m.endsWith('.*'))
+
+describe('scope split', () => {
+  it('has a label and description for every scope', () => {
+    for (const s of SCOPES) {
+      expect(SCOPE_LABELS[s]).toBeTruthy()
+      expect(SCOPE_DESCRIPTIONS[s]).toBeTruthy()
+    }
+  })
+
+  it('turns git and file reads on by default, and every write off', () => {
+    expect(SCOPE_DEFAULTS).toEqual(['sessions', 'chat', 'approvals', 'work', 'files', 'git'])
+    for (const s of ['git_write', 'terminal', 'admin'] as Scope[]) expect(SCOPE_DEFAULTS).not.toContain(s)
+  })
+
+  it('never lists an exact method under two scopes', () => {
+    const seen = new Map<string, Scope>()
+    for (const s of SCOPES) {
+      for (const m of exact(s)) {
+        expect(seen.get(m), `${m} is in both ${seen.get(m)} and ${s}`).toBeUndefined()
+        seen.set(m, s)
+      }
+    }
+  })
+
+  it('keeps git writes out of the read-only git scope', () => {
+    const reads = new Set(exact('git'))
+    const writes = exact('git_write')
+    expect(writes.length).toBeGreaterThan(0)
+    for (const m of writes) expect(reads.has(m), m).toBe(false)
+    for (const m of ['git.stageFile', 'git.unstageFile', 'git.stageAll', 'git.unstageAll', 'git.commit', 'git.push', 'git.pull', 'git.fetch', 'git.checkout']) {
+      expect(isMethodAllowed(m, ['git', 'files', 'work'])).toBe(false)
+      expect(isMethodAllowed(m, ['git_write'])).toBe(true)
+    }
+  })
+
+  it('lets git read methods through with the git scope alone', () => {
+    for (const m of ['git.status', 'git.diff', 'git.log', 'git.branches', 'git.showFile', 'git.detect']) {
+      expect(isMethodAllowed(m, ['git'])).toBe(true)
+      expect(isMethodAllowed(m, ['git_write'])).toBe(false)
+    }
+  })
+
+  it('keeps files read-only and owns the file search methods', () => {
+    expect(exact('files').every((m) => /^(fs\.(list|read|readBinary|stat)|search\.(files|ripgrep))$/.test(m))).toBe(true)
+    expect(isMethodAllowed('search.files', ['chat'])).toBe(false)
+    expect(isMethodAllowed('search.files', ['files'])).toBe(true)
+    for (const m of ['fs.write', 'fs.mkdir', 'fs.rename', 'fs.copy', 'fs.delete', 'fs.reveal']) {
+      expect(isMethodAllowed(m, ['files', 'git', 'git_write'])).toBe(false)
+    }
+  })
+
+  it('is deny-by-default for gateway methods that were never mapped', () => {
+    for (const m of ['git.discardFile', 'git.worktreeRemove', 'git.nonsense', 'fs.watch.start']) {
+      expect(isMethodAllowed(m, ['git', 'git_write', 'files', 'work'])).toBe(false)
+    }
+  })
+
+  it('names the scope that is missing in a refusal', () => {
+    expect(denialReason('git.push', ['git'])).toMatch(/"git_write"/)
+    expect(denialReason('git.push', SCOPE_DEFAULTS)).toMatch(/"git_write"/)
+  })
+})

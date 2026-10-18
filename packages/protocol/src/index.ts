@@ -1,5 +1,6 @@
 export * from './crypto.js'
 export * from './wire.js'
+export * from './relay.js'
 export * from './policy.js'
 export * from './gateway.js'
 export * from './stream.js'

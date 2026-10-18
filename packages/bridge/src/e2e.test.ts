@@ -194,7 +194,7 @@ describe('pairing', () => {
     const pair = await freshPairing()
     expect(pair.deviceId).toBeTruthy()
     expect(pair.hostName).toBeTruthy()
-    expect(pair.scopes.sort()).toEqual(['approvals', 'chat', 'sessions', 'work'])
+    expect([...pair.scopes].sort()).toEqual(['approvals', 'chat', 'files', 'git', 'sessions', 'work'])
     // Terminal is never granted at pairing time.
     expect(pair.scopes).not.toContain('terminal')
   })
@@ -267,7 +267,19 @@ describe('authorisation', () => {
 
   it('refuses a method outside the device scopes, with a reason', async () => {
     const client = await connectAs(await freshPairing())
-    await expect(client.rpc('git.push', {})).rejects.toThrow(/"git" permission/)
+    await expect(client.rpc('git.push', {})).rejects.toThrow(/"git_write" permission/)
+    client.disconnect()
+  })
+
+  it('lets a freshly paired phone read git but not write it', async () => {
+    const pair = await freshPairing()
+    expect(pair.scopes).toEqual(expect.arrayContaining(['git', 'files']))
+    expect(pair.scopes).not.toContain('git_write')
+    const client = await connectAs(pair)
+    expect(client.can('git.status')).toBe(true)
+    expect(client.can('fs.read')).toBe(true)
+    expect(client.can('git.commit')).toBe(false)
+    await expect(client.rpc('git.stageFile', { path: '/x', file: 'a' })).rejects.toThrow(/"git_write" permission/)
     client.disconnect()
   })
 

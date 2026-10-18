@@ -22,6 +22,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
+            <!-- dorabot-remote://pair#... pairing links (QR opened from the Camera app) -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="dorabot-remote" android:host="pair" />
+            </intent-filter>
+
         </activity>
 
         <provider

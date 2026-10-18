@@ -109,8 +109,8 @@ export const CONTROL_PAGE = `<!doctype html>
 </main>
 
 <script>
-const SCOPES = ['sessions','chat','approvals','work','files','git','terminal','admin'];
-const RISKY = new Set(['terminal','admin','git']);
+const SCOPES = ['sessions','chat','approvals','work','files','git','git_write','terminal','admin'];
+const RISKY = new Set(['terminal','admin','git_write']);
 let state = null;
 
 async function load() {

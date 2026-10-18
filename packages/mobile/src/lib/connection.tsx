@@ -193,6 +193,10 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
 
   const handleEvent = useCallback(
     (event: string, data: unknown, seq: number | undefined, sessionKey?: string) => {
+      // Tap for features that keep their own cross-session state (the Inbox).
+      // Same pattern as shell.data below: a window event, so they need no hook
+      // into this file's internals.
+      window.dispatchEvent(new CustomEvent('dorabot:event', { detail: { event, data, seq, sessionKey } }))
       if (event === 'remote.gateway_state') {
         setGatewayConnected((data as { state: string }).state === 'ready')
         return

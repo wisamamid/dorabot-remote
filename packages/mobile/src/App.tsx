@@ -1,19 +1,20 @@
 import type { StoredSession } from '@dorabot-remote/protocol'
 import { useEffect, useState, type ReactNode } from 'react'
+import { CodeScreen } from './components/CodeScreen.js'
+import { InboxScreen } from './components/InboxScreen.js'
+import { MoreScreen } from './components/MoreScreen.js'
+import { WorkScreen } from './components/WorkScreen.js'
 import { PairScreen } from './components/PairScreen.js'
 import { SessionList } from './components/SessionList.js'
 import { SessionView } from './components/SessionView.js'
-import { SettingsScreen } from './components/SettingsScreen.js'
-import { TerminalScreen } from './components/TerminalScreen.js'
 import { Spinner, cx } from './components/ui.js'
 import { ConnectionProvider, useConnection } from './lib/connection.js'
+import { InboxProvider, useInbox } from './lib/inbox-context.js'
 import { setStatusBarDark } from './lib/platform.js'
 
-type View =
-  | { name: 'sessions' }
-  | { name: 'session'; session: StoredSession | null; sessionKey: string }
-  | { name: 'terminal' }
-  | { name: 'settings' }
+type TabName = 'sessions' | 'inbox' | 'work' | 'code' | 'more'
+
+type Open = { session: StoredSession | null; sessionKey: string } | null
 
 export default function App(): ReactNode {
   useEffect(() => {
@@ -21,14 +22,32 @@ export default function App(): ReactNode {
   }, [])
   return (
     <ConnectionProvider>
-      <Shell />
+      <InboxProvider>
+        <Shell />
+      </InboxProvider>
     </ConnectionProvider>
   )
 }
 
+const icon = {
+  sessions: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" strokeLinecap="round" strokeLinejoin="round" />,
+  inbox: <path d="M22 12h-6l-2 3h-4l-2-3H2M5.5 5h13L22 12v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z" strokeLinecap="round" strokeLinejoin="round" />,
+  work: <path d="M9 11l3 3 8-8M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9" strokeLinecap="round" strokeLinejoin="round" />,
+  code: <path d="M16 18l6-6-6-6M8 6l-6 6 6 6" strokeLinecap="round" strokeLinejoin="round" />,
+  more: (
+    <>
+      <circle cx="5" cy="12" r="1.5" />
+      <circle cx="12" cy="12" r="1.5" />
+      <circle cx="19" cy="12" r="1.5" />
+    </>
+  ),
+}
+
 function Shell(): ReactNode {
   const conn = useConnection()
-  const [view, setView] = useState<View>({ name: 'sessions' })
+  const inbox = useInbox()
+  const [tab, setTab] = useState<TabName>('sessions')
+  const [open, setOpen] = useState<Open>(null)
 
   if (!conn.ready) {
     return (
@@ -40,59 +59,38 @@ function Shell(): ReactNode {
 
   if (!conn.pairing) return <PairScreen />
 
-  const waitingCount = conn.attention.length
+  const openSession = (session: StoredSession | null, sessionKey: string): void => setOpen({ session, sessionKey })
+
+  // Tabs stay mounted so a half-typed commit message or a scroll position
+  // survives a switch; only the active one is visible.
+  const pane = (name: TabName, node: ReactNode): ReactNode => (
+    <div className={cx('absolute inset-0', tab !== name && 'hidden')}>{node}</div>
+  )
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="min-h-0 flex-1">
-        {view.name === 'sessions' && (
-          <SessionList
-            onOpen={(session, sessionKey) => setView({ name: 'session', session, sessionKey })}
-            onSettings={() => setView({ name: 'settings' })}
-          />
+      <div className="relative min-h-0 flex-1">
+        {pane('sessions', <SessionList onOpen={openSession} onSettings={() => setTab('more')} />)}
+        {pane('inbox', <InboxScreen onOpenSession={openSession} />)}
+        {pane('work', <WorkScreen onOpenSession={openSession} />)}
+        {pane('code', <CodeScreen />)}
+        {pane('more', <MoreScreen />)}
+        {open && (
+          <div className="absolute inset-0 z-30 bg-ink-900">
+            <SessionView session={open.session} sessionKey={open.sessionKey} onBack={() => setOpen(null)} />
+          </div>
         )}
-        {view.name === 'session' && (
-          <SessionView
-            session={view.session}
-            sessionKey={view.sessionKey}
-            onBack={() => setView({ name: 'sessions' })}
-          />
-        )}
-        {view.name === 'terminal' && <TerminalScreen onBack={() => setView({ name: 'sessions' })} />}
-        {view.name === 'settings' && <SettingsScreen onBack={() => setView({ name: 'sessions' })} />}
       </div>
 
       {/* The tab bar disappears inside a conversation so the composer owns the
           bottom of the screen, which is where a thumb already is. */}
-      {view.name !== 'session' && (
-        <nav className="safe-bottom flex shrink-0 border-t border-ink-700 bg-ink-900 px-2 pt-1.5">
-          <Tab
-            active={view.name === 'sessions'}
-            onClick={() => setView({ name: 'sessions' })}
-            badge={waitingCount}
-            label="Sessions"
-            icon={
-              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" strokeLinecap="round" strokeLinejoin="round" />
-            }
-          />
-          <Tab
-            active={view.name === 'terminal'}
-            onClick={() => setView({ name: 'terminal' })}
-            locked={!conn.hasScope('terminal')}
-            label="Terminal"
-            icon={<path d="M4 17l6-5-6-5M12 19h8" strokeLinecap="round" strokeLinejoin="round" />}
-          />
-          <Tab
-            active={view.name === 'settings'}
-            onClick={() => setView({ name: 'settings' })}
-            label="Settings"
-            icon={
-              <>
-                <circle cx="12" cy="12" r="3" />
-                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.63.68 1.1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-              </>
-            }
-          />
+      {!open && (
+        <nav className="safe-bottom flex shrink-0 border-t border-ink-700 bg-ink-900 px-1 pt-1.5">
+          <Tab active={tab === 'sessions'} onClick={() => setTab('sessions')} label="Sessions" icon={icon.sessions} />
+          <Tab active={tab === 'inbox'} onClick={() => setTab('inbox')} badge={inbox.count} label="Inbox" icon={icon.inbox} />
+          <Tab active={tab === 'work'} onClick={() => setTab('work')} locked={!conn.hasScope('work')} label="Work" icon={icon.work} />
+          <Tab active={tab === 'code'} onClick={() => setTab('code')} locked={!conn.hasScope('files') && !conn.hasScope('git')} label="Code" icon={icon.code} />
+          <Tab active={tab === 'more'} onClick={() => setTab('more')} label="More" icon={icon.more} />
         </nav>
       )}
     </div>
@@ -127,7 +125,7 @@ function Tab({
           {icon}
         </svg>
         {badge ? (
-          <span className="absolute -right-1.5 -top-1 flex min-w-[17px] items-center justify-center rounded-full bg-amber-glow px-1 text-[11px] font-semibold leading-[17px] text-ink-950">
+          <span className="absolute -right-1.5 -top-1 flex min-w-[18px] items-center justify-center rounded-full bg-amber-glow px-1 text-[13px] font-semibold leading-[18px] text-ink-950">
             {badge}
           </span>
         ) : null}
@@ -139,7 +137,7 @@ function Tab({
           </span>
         )}
       </span>
-      <span className="text-[11px] font-medium">{label}</span>
+      <span className="text-[13px] font-medium">{label}</span>
     </button>
   )
 }

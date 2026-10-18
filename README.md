@@ -5,8 +5,9 @@ run real work from it.
 
 Approve the tool calls it is blocked on, answer the questions it asks, read the
 stream as it happens, send a new prompt, and open a shell if you let it. Your
-phone talks **directly** to your own Mac over your network or your Tailnet. There
-is no server in the middle, no account, and nothing to sign up for.
+phone talks **directly** to your own Mac over your network or your Tailnet, with no
+account and nothing to sign up for. For access away from either, an optional
+blind relay is being rolled out (see [Working from anywhere](#working-from-anywhere)).
 
 <p align="center">
   <img src="docs/pair.png" width="260" alt="Pairing screen" />
@@ -99,13 +100,22 @@ name, and any Tailscale address — and the app races them all on every connect.
 
 So "same wifi" and "anywhere over Tailscale" are the same code path. Walk out of
 the house with Tailscale on and the app re-races, finds the Tailnet address and
-carries on. No mode switch, no re-pairing, no relay server.
+carries on. No mode switch, no re-pairing. Direct over LAN or Tailnet is the
+preferred path and needs nothing else.
 
 If Tailscale assigns a MagicDNS name you would rather advertise:
 
 ```bash
 dorabot-remote start --advertise my-mac.tail1234.ts.net:7788
 ```
+
+### Optional relay (being rolled out)
+
+For off-LAN access without Tailscale there is an optional relay in
+`packages/relay`, a Cloudflare Durable Object. It is blind: the phone and the
+bridge still run the same end-to-end handshake, so the relay only forwards
+ciphertext and cannot read or forge your traffic. It is not required, and it is
+still being rolled out.
 
 ## Permissions
 
@@ -165,7 +175,8 @@ it did not open.
 
 ## Security model, briefly
 
-**Transport.** Every frame after the handshake is XChaCha20-Poly1305 with a per
+**Transport.** Keys are agreed with X25519 and frames are sealed with
+XChaCha20-Poly1305, both from the pure JavaScript `@noble` libraries. Every frame after the handshake is XChaCha20-Poly1305 with a per
 stream random nonce prefix and a message counter, so a replayed or reordered
 frame fails to open.
 
@@ -191,9 +202,14 @@ out of band by the QR. Adding TLS on top would authenticate nothing extra.
 **Revocation** is immediate: revoke on the control page or with
 `dorabot-remote revoke <deviceId>` and any live connection is dropped.
 
-**Known gap.** The device private key is currently in Capacitor Preferences
-(UserDefaults on iOS), not the Keychain. Tracked, and worth closing before this is
-installed anywhere you do not control.
+**Device secrets.** The device private key (inside the pairing record) is stored in
+the iOS Keychain (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`: readable by
+background push handling after first unlock, never synced to iCloud or restored onto
+another device) and, on Android, in AES-GCM encrypted storage under an Android
+Keystore key, via `@aparajita/capacitor-secure-storage`. Builds that kept the key in
+Preferences migrate it on first read and delete the old copy. The web/PWA build has
+no hardware-backed store and keeps it in `localStorage`; treat that as development
+only. Note iOS keeps Keychain items across an app reinstall.
 
 ## Offline and resume
 
@@ -216,7 +232,18 @@ dorabot-remote grant <id> <scope>    Add a permission
 dorabot-remote revoke <id>           Block a device, keep the record
 dorabot-remote remove <id>           Delete it entirely
 dorabot-remote addresses             Show reachable addresses
+dorabot-remote install               Start the bridge at login (launchd agent)
+dorabot-remote uninstall             Stop and remove the launchd agent
+dorabot-remote status                Show whether the agent is running
 ```
+
+### Running at login
+
+`dorabot-remote install` writes `~/Library/LaunchAgents/com.xische.dorabotremote.bridge.plist`
+(RunAtLoad, KeepAlive, 10s throttle, absolute path to the current `node` and
+`dist/cli.js start`) and loads it with `launchctl bootstrap gui/$UID`. Logs go to
+`~/.dorabot-remote/logs/`. It is idempotent; re-run it after moving the repo or
+changing Node versions. `uninstall` removes it.
 
 ## Building the app
 
@@ -225,6 +252,19 @@ npm run dev -w @dorabot-remote/mobile     # web, for development
 npm run ios -w @dorabot-remote/mobile     # open Xcode
 npm run android -w @dorabot-remote/mobile # open Android Studio
 ```
+
+Release builds (set `ASC_KEY_PATH`/`ASC_KEY_ID`/`ASC_ISSUER_ID`, an App Store Connect API key):
+
+```bash
+packages/mobile/scripts/ios-release.sh            # archive + export .ipa, no upload
+UPLOAD=1 packages/mobile/scripts/ios-release.sh   # also upload to TestFlight
+packages/mobile/scripts/android-release.sh        # signed AAB; needs ANDROID_KEYSTORE_* env
+```
+
+The app talks plain `ws://` (payload is end-to-end encrypted). On iOS that needs
+`NSAllowsLocalNetworking` (LAN IPs, `.local`) plus `NSAllowsArbitraryLoadsInWebContent`
+(Tailscale `100.x` addresses and MagicDNS names, which ATS otherwise blocks); native
+code stays under ATS.
 
 The web build is a usable PWA on its own if you would rather not install anything.
 
@@ -256,9 +296,8 @@ subscribe backfill.
 
 Works, and used daily against a real dorabot. Not yet on TestFlight.
 
-Before installing somewhere you do not control: move the device key to the
-Keychain, and read the permissions table above properly rather than granting
-everything.
+Before installing somewhere you do not control, read the permissions table above
+properly rather than granting everything.
 
 ## Licence
 

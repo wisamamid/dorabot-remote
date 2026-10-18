@@ -1,5 +1,12 @@
-import type { ElicitationField, PendingApproval, PendingElicitation, PendingQuestion } from '@dorabot-remote/protocol'
+import type {
+  AskUserQuestion,
+  ElicitationField,
+  PendingApproval,
+  PendingElicitation,
+  PendingQuestion,
+} from '@dorabot-remote/protocol'
 import { useEffect, useState, type ReactNode } from 'react'
+import { QUESTION_TIMEOUT_MS } from '../lib/inbox.js'
 import { haptic } from '../lib/platform.js'
 import { Button, Card, cx } from './ui.js'
 
@@ -40,27 +47,67 @@ function approvalDetail(approval: PendingApproval): { label: string; body: strin
  * approving takes one tap or two. The patterns mirror the ones the gateway uses
  * to decide an approval was needed in the first place.
  */
-function looksDestructive(approval: PendingApproval): boolean {
+export function looksDestructive(approval: PendingApproval): boolean {
   const cmd = typeof approval.input?.command === 'string' ? approval.input.command : ''
   return /\b(rm|sudo|mkfs|dd\s+if=|shutdown|reboot|killall|pkill)\b|git\s+push|reset\s+--hard|--force/.test(cmd)
 }
 
+/** The editable text for an approval: the command itself, or the input as JSON. */
+function editableInput(approval: PendingApproval): { text: string; kind: 'command' | 'json' } {
+  const input = approval.input ?? {}
+  if (typeof input.command === 'string') return { text: input.command, kind: 'command' }
+  return { text: JSON.stringify(input, null, 2), kind: 'json' }
+}
+
 export function ApprovalCard({
   approval,
+  session,
   onApprove,
   onDeny,
+  compact,
 }: {
   approval: PendingApproval
-  onApprove: () => Promise<void>
+  /** Session name, shown when the card is not already inside that session. */
+  session?: string
+  onApprove: (modifiedInput?: Record<string, unknown>) => Promise<void>
   onDeny: (reason?: string) => Promise<void>
+  compact?: boolean
 }): ReactNode {
   const [busy, setBusy] = useState<'approve' | 'deny' | null>(null)
   const [confirming, setConfirming] = useState(false)
+  const [denying, setDenying] = useState(false)
+  const [reason, setReason] = useState('')
+  const [editing, setEditing] = useState(false)
+  const initial = editableInput(approval)
+  const [draft, setDraft] = useState(initial.text)
+  const [error, setError] = useState<string | null>(null)
   const detail = approvalDetail(approval)
   const risky = looksDestructive(approval)
 
+  /** What will actually run: the edited input if the person changed it. */
+  function modified(): Record<string, unknown> | undefined | null {
+    if (!editing || draft === initial.text) return undefined
+    if (initial.kind === 'command') return { ...approval.input, command: draft }
+    try {
+      const parsed = JSON.parse(draft) as unknown
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object')
+      return parsed as Record<string, unknown>
+    } catch {
+      return null
+    }
+  }
+
   async function approve(): Promise<void> {
-    if (risky && !confirming) {
+    const mod = modified()
+    if (mod === null) {
+      setError('That is not valid JSON, so it cannot be sent.')
+      return
+    }
+    setError(null)
+    // An edit changes what runs, so a destructive-looking edited command still
+    // gets the second tap, judged on the edited text rather than the original.
+    const effective = mod ? ({ ...approval, input: mod } as PendingApproval) : approval
+    if (looksDestructive(effective) && !confirming) {
       setConfirming(true)
       await haptic('warning')
       return
@@ -68,7 +115,9 @@ export function ApprovalCard({
     setBusy('approve')
     await haptic('medium')
     try {
-      await onApprove()
+      await onApprove(mod)
+    } catch (err) {
+      setError((err as Error).message)
     } finally {
       setBusy(null)
       setConfirming(false)
@@ -79,7 +128,9 @@ export function ApprovalCard({
     setBusy('deny')
     await haptic('light')
     try {
-      await onDeny()
+      await onDeny(reason.trim() || undefined)
+    } catch (err) {
+      setError((err as Error).message)
     } finally {
       setBusy(null)
     }
@@ -88,38 +139,70 @@ export function ApprovalCard({
   return (
     <Card tone={risky ? 'danger' : 'warn'} className="slide-up space-y-3">
       <div className="flex items-center gap-2">
-        <span className={cx('size-2 rounded-full breathe', risky ? 'bg-rose-glow' : 'bg-amber-glow')} />
-        <span className="text-[13px] font-semibold uppercase tracking-wider text-ink-200">
-          {risky ? 'Needs a careful look' : 'Waiting on you'}
+        <span className={cx('size-2 shrink-0 rounded-full breathe', risky ? 'bg-rose-glow' : 'bg-amber-glow')} />
+        <span className="min-w-0 flex-1 truncate text-[13px] font-semibold uppercase tracking-wider text-ink-200">
+          {session ?? (risky ? 'Needs a careful look' : 'Waiting on you')}
         </span>
-        <span className="ml-auto font-mono text-[13px] text-ink-300">{approval.toolName}</span>
+        <span className="shrink-0 font-mono text-[13px] text-ink-300">{approval.toolName}</span>
       </div>
+
+      {session && risky && <div className="text-[13px] font-semibold uppercase tracking-wider text-rose-glow">Needs a careful look</div>}
 
       {approval.title && <div className="text-[15px] leading-snug">{approval.title}</div>}
 
-      {detail && (
-        <div className="space-y-1">
-          <div className="font-mono text-[12px] uppercase tracking-wide text-ink-400">{detail.label}</div>
-          {detail.body && (
-            <pre className="selectable scroll no-scrollbar max-h-56 whitespace-pre-wrap break-words rounded-lg bg-ink-950 p-3 font-mono text-[12.5px] leading-relaxed text-ink-200">
-              {detail.body}
-            </pre>
-          )}
+      {editing ? (
+        <div className="space-y-1.5">
+          <div className="font-mono text-[13px] uppercase tracking-wide text-ink-400">
+            {initial.kind === 'command' ? 'Command (edited before running)' : 'Input (JSON)'}
+          </div>
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            rows={Math.min(10, Math.max(3, draft.split('\n').length))}
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            className="selectable w-full rounded-lg border border-ink-600 bg-ink-950 p-3 font-mono text-[14px] leading-relaxed text-ink-100"
+          />
         </div>
+      ) : (
+        detail && (
+          <div className="space-y-1">
+            <div className="font-mono text-[13px] uppercase tracking-wide text-ink-400">{detail.label}</div>
+            {detail.body && (
+              <pre
+                className={cx(
+                  'selectable scroll no-scrollbar whitespace-pre-wrap break-words rounded-lg bg-ink-950 p-3 font-mono text-[13px] leading-relaxed text-ink-200',
+                  compact ? 'max-h-40' : 'max-h-56',
+                )}
+              >
+                {detail.body}
+              </pre>
+            )}
+          </div>
+        )
       )}
 
-      {approval.decisionReason && (
-        <div className="text-[13px] leading-relaxed text-ink-400">{approval.decisionReason}</div>
-      )}
+      {approval.decisionReason && <div className="text-[13px] leading-relaxed text-ink-400">{approval.decisionReason}</div>}
       {approval.blockedPath && (
-        <div className="font-mono text-[12.5px] text-rose-glow">outside allowed paths: {approval.blockedPath}</div>
+        <div className="font-mono text-[13px] text-rose-glow">outside allowed paths: {approval.blockedPath}</div>
       )}
+
+      {denying && (
+        <input
+          autoFocus
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="Why? (optional, the agent sees this)"
+          className="selectable min-h-11 w-full rounded-xl border border-ink-600 bg-ink-900 px-3.5 py-2.5"
+        />
+      )}
+
+      {error && <div className="text-[14px] text-rose-glow">{error}</div>}
 
       {confirming ? (
         <div className="space-y-2">
-          <div className="text-[14px] font-medium text-rose-glow">
-            This looks destructive. Run it anyway?
-          </div>
+          <div className="text-[14px] font-medium text-rose-glow">This looks destructive. Run it anyway?</div>
           <div className="flex gap-2">
             <Button variant="ghost" onClick={() => setConfirming(false)} className="flex-1">
               Cancel
@@ -129,18 +212,48 @@ export function ApprovalCard({
             </Button>
           </div>
         </div>
-      ) : (
+      ) : denying ? (
         <div className="flex gap-2">
-          <Button variant="default" onClick={() => void deny()} disabled={busy !== null} className="flex-1">
-            {busy === 'deny' ? 'Denying…' : 'Deny'}
+          <Button variant="ghost" onClick={() => setDenying(false)} disabled={busy !== null} className="flex-1">
+            Back
           </Button>
-          <Button variant="primary" onClick={() => void approve()} disabled={busy !== null} className="flex-1">
-            {busy === 'approve' ? 'Approving…' : 'Approve'}
+          <Button variant="danger" onClick={() => void deny()} disabled={busy !== null} className="flex-1">
+            {busy === 'deny' ? 'Denying…' : 'Send denial'}
           </Button>
         </div>
+      ) : (
+        <>
+          <div className="flex gap-2">
+            <Button variant="default" onClick={() => setDenying(true)} disabled={busy !== null} className="flex-1">
+              Deny
+            </Button>
+            <Button variant="primary" onClick={() => void approve()} disabled={busy !== null} className="flex-1">
+              {busy === 'approve' ? 'Approving…' : editing ? 'Approve edited' : 'Approve'}
+            </Button>
+          </div>
+          <div className="flex items-center justify-between">
+            <button
+              onClick={() => {
+                setEditing((e) => !e)
+                setDraft(initial.text)
+                setError(null)
+              }}
+              className="tap -ml-1 px-1 text-[14px] font-medium text-ink-300 active:text-ink-100"
+            >
+              {editing ? 'Discard edits' : 'Edit before approving'}
+            </button>
+            <button
+              onClick={() => void deny()}
+              disabled={busy !== null}
+              className="tap -mr-1 px-1 text-[14px] text-ink-400 active:text-ink-100 disabled:opacity-40"
+            >
+              {busy === 'deny' ? 'Denying…' : 'Quick deny'}
+            </button>
+          </div>
+        </>
       )}
 
-      <p className="text-center text-[12px] text-ink-500">The run is paused until you answer.</p>
+      {!compact && <p className="text-center text-[13px] text-ink-500">The run is paused until you answer.</p>}
     </Card>
   )
 }
@@ -149,28 +262,39 @@ export function ApprovalCard({
 // AskUserQuestion
 // ---------------------------------------------------------------------------
 
-/** The gateway rejects an unanswered question after five minutes. */
-const QUESTION_TIMEOUT_MS = 300_000
-
 export function QuestionCard({
   question,
+  session,
+  startedAt,
+  timedOut,
   onAnswer,
+  onDismiss,
 }: {
   question: PendingQuestion
+  session?: string
+  /** When the phone first saw it. Falls back to the gateway's timestamp. */
+  startedAt?: number
+  /** Set by the Inbox once the deadline has passed or the gateway said so. */
+  timedOut?: boolean
   onAnswer: (answers: Record<string, string>) => Promise<void>
+  onDismiss?: () => void
 }): ReactNode {
   const [answers, setAnswers] = useState<Record<string, string>>({})
   const [other, setOther] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const [, force] = useState(0)
 
   // A countdown, because this one really does expire and take the turn with it.
   useEffect(() => {
+    if (timedOut) return
     const t = setInterval(() => force((n) => n + 1), 1000)
     return () => clearInterval(t)
-  }, [])
+  }, [timedOut])
 
-  const remaining = Math.max(0, QUESTION_TIMEOUT_MS - (Date.now() - question.timestamp))
+  const from = startedAt ?? question.timestamp
+  const remaining = timedOut ? 0 : Math.max(0, QUESTION_TIMEOUT_MS - (Date.now() - from))
+  const expired = timedOut || remaining === 0
   const mins = Math.floor(remaining / 60_000)
   const secs = Math.floor((remaining % 60_000) / 1000)
   const urgent = remaining < 60_000
@@ -178,8 +302,24 @@ export function QuestionCard({
   const questions = question.questions ?? []
   const complete = questions.every((q) => answers[q.question] || other[q.question]?.trim())
 
+  function pick(q: AskUserQuestion, label: string): void {
+    setOther((o) => ({ ...o, [q.question]: '' }))
+    setAnswers((a) => {
+      if (!q.multiSelect) return { ...a, [q.question]: label }
+      // Multi-select answers travel as one comma-joined string, the way the
+      // desktop client sends them.
+      const labels = a[q.question] ? a[q.question]!.split(', ') : []
+      const i = labels.indexOf(label)
+      if (i >= 0) labels.splice(i, 1)
+      else labels.push(label)
+      return { ...a, [q.question]: labels.join(', ') }
+    })
+    void haptic('light')
+  }
+
   async function submit(): Promise<void> {
     setBusy(true)
+    setError(null)
     await haptic('medium')
     try {
       const payload: Record<string, string> = {}
@@ -187,64 +327,100 @@ export function QuestionCard({
         payload[q.question] = other[q.question]?.trim() || answers[q.question] || ''
       }
       await onAnswer(payload)
+    } catch (err) {
+      setError((err as Error).message)
     } finally {
       setBusy(false)
     }
   }
 
+  if (expired) {
+    return (
+      <Card className="space-y-3 opacity-90">
+        <div className="flex items-center gap-2">
+          <span className="size-2 shrink-0 rounded-full bg-ink-500" />
+          <span className="min-w-0 flex-1 truncate text-[13px] font-semibold uppercase tracking-wider text-ink-300">
+            {session ?? 'dorabot asked'}
+          </span>
+          <span className="shrink-0 rounded-md bg-rose-dim px-2 py-0.5 text-[13px] font-medium text-rose-glow">Timed out</span>
+        </div>
+        {questions.map((q) => (
+          <div key={q.question} className="text-[15px] leading-snug text-ink-300">
+            {q.question}
+          </div>
+        ))}
+        <p className="text-[14px] leading-relaxed text-ink-400">
+          Nobody answered in five minutes, so the run gave up on this question. Send a new message in the session to carry on.
+        </p>
+        {onDismiss && (
+          <Button variant="default" onClick={onDismiss} className="w-full">
+            Dismiss
+          </Button>
+        )}
+      </Card>
+    )
+  }
+
   return (
     <Card tone="warn" className="slide-up space-y-4">
       <div className="flex items-center gap-2">
-        <span className="size-2 rounded-full bg-amber-glow breathe" />
-        <span className="text-[13px] font-semibold uppercase tracking-wider text-ink-200">dorabot is asking</span>
-        <span className={cx('ml-auto font-mono text-[13px] tabular-nums', urgent ? 'text-rose-glow' : 'text-ink-400')}>
+        <span className="size-2 shrink-0 rounded-full bg-amber-glow breathe" />
+        <span className="min-w-0 flex-1 truncate text-[13px] font-semibold uppercase tracking-wider text-ink-200">
+          {session ?? 'dorabot is asking'}
+        </span>
+        <span
+          className={cx('shrink-0 font-mono text-[14px] tabular-nums', urgent ? 'text-rose-glow' : 'text-ink-300')}
+          aria-label="time left to answer"
+        >
           {mins}:{String(secs).padStart(2, '0')}
         </span>
       </div>
 
-      {questions.map((q) => (
-        <div key={q.question} className="space-y-2">
-          <div className="text-[15px] leading-snug">{q.question}</div>
-          <div className="space-y-1.5">
-            {(q.options ?? []).map((opt) => {
-              const selected = answers[q.question] === opt.label
-              return (
-                <button
-                  key={opt.label}
-                  onClick={() => {
-                    setAnswers((a) => ({ ...a, [q.question]: opt.label }))
-                    setOther((o) => ({ ...o, [q.question]: '' }))
-                    void haptic('light')
-                  }}
-                  className={cx(
-                    'w-full rounded-xl border px-3.5 py-3 text-left transition-colors',
-                    selected ? 'border-mint-500 bg-mint-900' : 'border-ink-600 bg-ink-900 active:bg-ink-800',
-                  )}
-                >
-                  <div className={cx('text-[15px]', selected ? 'text-mint-500' : 'text-ink-100')}>{opt.label}</div>
-                  {opt.description && <div className="mt-0.5 text-[13px] leading-snug text-ink-400">{opt.description}</div>}
-                </button>
-              )
-            })}
-            <input
-              value={other[q.question] ?? ''}
-              onChange={(e) => {
-                setOther((o) => ({ ...o, [q.question]: e.target.value }))
-                setAnswers((a) => ({ ...a, [q.question]: '' }))
-              }}
-              placeholder="Or type your own answer"
-              className="w-full rounded-xl border border-ink-600 bg-ink-900 px-3.5 py-3"
-            />
+      {questions.map((q) => {
+        const chosen = (answers[q.question] ?? '').split(', ')
+        return (
+          <div key={q.question} className="space-y-2">
+            {q.header && <div className="text-[13px] font-medium uppercase tracking-wide text-ink-400">{q.header}</div>}
+            <div className="text-[15px] leading-snug">{q.question}</div>
+            {q.multiSelect && <div className="text-[13px] text-ink-400">Choose any that apply</div>}
+            <div className="space-y-1.5">
+              {(q.options ?? []).map((opt) => {
+                const selected = chosen.includes(opt.label)
+                return (
+                  <button
+                    key={opt.label}
+                    onClick={() => pick(q, opt.label)}
+                    aria-pressed={selected}
+                    className={cx(
+                      'tap w-full rounded-xl border px-3.5 py-3 text-left transition-colors',
+                      selected ? 'border-mint-500 bg-mint-900' : 'border-ink-600 bg-ink-900 active:bg-ink-800',
+                    )}
+                  >
+                    <div className={cx('text-[15px]', selected ? 'text-mint-500' : 'text-ink-100')}>{opt.label}</div>
+                    {opt.description && <div className="mt-0.5 text-[13px] leading-snug text-ink-400">{opt.description}</div>}
+                  </button>
+                )
+              })}
+              <input
+                value={other[q.question] ?? ''}
+                onChange={(e) => {
+                  setOther((o) => ({ ...o, [q.question]: e.target.value }))
+                  setAnswers((a) => ({ ...a, [q.question]: '' }))
+                }}
+                placeholder="Or type your own answer"
+                className="selectable min-h-11 w-full rounded-xl border border-ink-600 bg-ink-900 px-3.5 py-3"
+              />
+            </div>
           </div>
-        </div>
-      ))}
+        )
+      })}
+
+      {error && <div className="text-[14px] text-rose-glow">{error}</div>}
 
       <Button variant="primary" onClick={() => void submit()} disabled={!complete || busy} className="w-full">
         {busy ? 'Sending…' : 'Answer'}
       </Button>
-      <p className="text-center text-[12px] text-ink-500">
-        If nobody answers in five minutes the run fails.
-      </p>
+      <p className="text-center text-[13px] text-ink-500">If nobody answers in five minutes the run fails.</p>
     </Card>
   )
 }
@@ -255,10 +431,12 @@ export function QuestionCard({
 
 export function ElicitationCard({
   elicitation,
+  session,
   onSubmit,
   onDismiss,
 }: {
   elicitation: PendingElicitation
+  session?: string
   onSubmit: (values: Record<string, unknown>) => Promise<void>
   onDismiss: () => Promise<void>
 }): ReactNode {
@@ -270,6 +448,7 @@ export function ElicitationCard({
     return initial
   })
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   const fields = elicitation.fields ?? []
   const complete = fields.every((f) => !f.required || values[f.name] !== undefined)
@@ -278,7 +457,9 @@ export function ElicitationCard({
     <Card tone="warn" className="slide-up space-y-4">
       <div className="flex items-center gap-2">
         <span className="size-2 rounded-full bg-amber-glow breathe" />
-        <span className="text-[13px] font-semibold uppercase tracking-wider text-ink-200">Needs details</span>
+        <span className="min-w-0 flex-1 truncate text-[13px] font-semibold uppercase tracking-wider text-ink-200">
+          {session ?? 'Needs details'}
+        </span>
       </div>
       <div className="text-[15px] leading-snug">{elicitation.message}</div>
 
@@ -286,12 +467,17 @@ export function ElicitationCard({
         <FieldInput key={f.name} field={f} value={values[f.name]} onChange={(v) => setValues((s) => ({ ...s, [f.name]: v }))} />
       ))}
 
+      {error && <div className="text-[14px] text-rose-glow">{error}</div>}
+
       <div className="flex gap-2">
         <Button
           variant="default"
           onClick={() => {
             setBusy(true)
-            void onDismiss().finally(() => setBusy(false))
+            setError(null)
+            onDismiss()
+              .catch((err: Error) => setError(err.message))
+              .finally(() => setBusy(false))
           }}
           disabled={busy}
           className="flex-1"
@@ -303,7 +489,9 @@ export function ElicitationCard({
           onClick={() => {
             setBusy(true)
             void haptic('medium')
-            void onSubmit(values).finally(() => setBusy(false))
+            onSubmit(values)
+              .catch((err: Error) => setError(err.message))
+              .finally(() => setBusy(false))
           }}
           disabled={!complete || busy}
           className="flex-1"
@@ -367,7 +555,7 @@ function FieldInput({
           type={field.type === 'number' ? 'number' : 'text'}
           value={value === undefined ? '' : String(value)}
           onChange={(e) => onChange(field.type === 'number' ? Number(e.target.value) : e.target.value)}
-          className="w-full rounded-xl border border-ink-600 bg-ink-900 px-3.5 py-3"
+          className="selectable min-h-11 w-full rounded-xl border border-ink-600 bg-ink-900 px-3.5 py-3"
         />
       )}
     </div>

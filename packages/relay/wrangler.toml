@@ -1,0 +1,15 @@
+name = "dorabot-relay"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "Room"
+
+# SQLite-backed so the free plan can host it. Rooms hold no durable state of their
+# own; this is only the storage flavour Cloudflare allows for new classes.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
+
+# FCM_SERVICE_ACCOUNT is a secret, set with `wrangler secret put`. Never put it here.

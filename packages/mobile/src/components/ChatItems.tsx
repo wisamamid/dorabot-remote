@@ -79,14 +79,14 @@ function ToolBlock({ item }: { item: Extract<ChatItem, { type: 'tool_use' }> }):
       {open && (
         <div className="mt-1.5 space-y-1.5">
           {item.input && (
-            <pre className="selectable scroll no-scrollbar max-h-64 rounded-xl bg-ink-950 p-3 font-mono text-[12px] leading-relaxed text-ink-300">
+            <pre className="selectable scroll no-scrollbar max-h-64 rounded-xl bg-ink-950 p-3 font-mono text-[13px] leading-relaxed text-ink-300">
               {formatInput(item.input)}
             </pre>
           )}
           {item.output && (
             <pre
               className={cx(
-                'selectable scroll no-scrollbar max-h-72 rounded-xl p-3 font-mono text-[12px] leading-relaxed',
+                'selectable scroll no-scrollbar max-h-72 rounded-xl p-3 font-mono text-[13px] leading-relaxed',
                 failed ? 'bg-rose-dim text-rose-glow' : 'bg-ink-950 text-ink-300',
               )}
             >

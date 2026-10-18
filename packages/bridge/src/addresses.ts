@@ -33,7 +33,13 @@ function isPrivateLan(ip: string): boolean {
  * WiFi" and "anywhere over Tailscale" the same code path with no mode switch and
  * no re-pairing when the phone moves between them.
  */
-export function candidateAddresses(port: number, extra: string[] = []): Candidate[] {
+export function candidateAddresses(port: number, extra: string[] = [], bind = '0.0.0.0'): Candidate[] {
+  // Bound to one specific interface: only that address is reachable, so
+  // advertising LAN IPs or the .local name would send the phone to a closed port.
+  if (bind !== '0.0.0.0' && bind !== '::') {
+    return [...extra.map((e) => ({ address: e.includes(':') ? e : `${e}:${port}`, label: 'configured', rank: 0 })), { address: `${bind}:${port}`, label: `bound (${bind})`, rank: 1 }]
+  }
+
   const out: Candidate[] = []
   const seen = new Set<string>()
 
@@ -72,7 +78,7 @@ export function candidateAddresses(port: number, extra: string[] = []): Candidat
   return out.sort((a, b) => a.rank - b.rank)
 }
 
-export function primaryAddress(port: number, extra: string[] = []): string {
-  const c = candidateAddresses(port, extra)
+export function primaryAddress(port: number, extra: string[] = [], bind = '0.0.0.0'): string {
+  const c = candidateAddresses(port, extra, bind)
   return c[0]?.address ?? `127.0.0.1:${port}`
 }

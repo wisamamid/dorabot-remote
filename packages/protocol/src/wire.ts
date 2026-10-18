@@ -5,6 +5,8 @@
  * binary secretstream frame whose plaintext is one of the Envelope types below.
  */
 
+import type { RelayInfo } from './relay.js'
+
 export const DEFAULT_BRIDGE_PORT = 7788
 
 // ---------------------------------------------------------------------------
@@ -137,11 +139,16 @@ export type Envelope =
  * Scopes are coarse on purpose: each maps to a set of gateway RPC methods.
  * `terminal` is never granted at pairing time; see SCOPE_DEFAULTS.
  */
-export const SCOPES = ['sessions', 'chat', 'approvals', 'work', 'files', 'git', 'terminal', 'admin'] as const
+export const SCOPES = ['sessions', 'chat', 'approvals', 'work', 'files', 'git', 'git_write', 'terminal', 'admin'] as const
 export type Scope = (typeof SCOPES)[number]
 
-/** What a freshly paired device gets. Terminal, files, git and admin stay off. */
-export const SCOPE_DEFAULTS: Scope[] = ['sessions', 'chat', 'approvals', 'work']
+/**
+ * What a freshly paired device gets. Reading files and git state is on because a
+ * phone that cannot show you what the agent changed is not much of a remote.
+ * Anything that writes to the Mac (git_write), opens a shell (terminal) or changes
+ * settings (admin) stays off until a human grants it on the Mac.
+ */
+export const SCOPE_DEFAULTS: Scope[] = ['sessions', 'chat', 'approvals', 'work', 'files', 'git']
 
 export const SCOPE_LABELS: Record<Scope, string> = {
   sessions: 'Sessions',
@@ -149,7 +156,8 @@ export const SCOPE_LABELS: Record<Scope, string> = {
   approvals: 'Approvals',
   work: 'Tasks & projects',
   files: 'File browsing',
-  git: 'Git',
+  git: 'Git (read)',
+  git_write: 'Git (write)',
   terminal: 'Terminal',
   admin: 'Settings & devices',
 }
@@ -160,7 +168,8 @@ export const SCOPE_DESCRIPTIONS: Record<Scope, string> = {
   approvals: 'Approve or deny tool calls the agent is waiting on.',
   work: 'Read and edit tasks, projects, research and the schedule.',
   files: 'Browse and read files on the host machine.',
-  git: 'Read git status and diffs, stage, commit and push.',
+  git: 'Read git status, diffs, branches and history.',
+  git_write: 'Stage, commit, push, pull and switch branches.',
   terminal: 'Open a real shell on the host machine. Full control.',
   admin: 'Change dorabot settings and manage paired devices.',
 }
@@ -182,6 +191,8 @@ export interface HostSummary {
   fingerprint: string
   version: string
   dorabotVersion?: string
+  /** Relay this host is reachable through, so already-paired devices learn it on next connect. */
+  relay?: RelayInfo
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +213,8 @@ export interface PairingPayload {
   a: string[]
   /** expiry, unix ms */
   e: number
+  /** blind relay (url + relayId) for reaching the host from anywhere */
+  r?: RelayInfo
 }
 
 export const PAIRING_URL_SCHEME = 'dorabot-remote://pair'
@@ -219,7 +232,8 @@ export function decodePairingPayload(input: string): PairingPayload {
   const json = new TextDecoder().decode(base64UrlDecode(b64))
   const parsed = JSON.parse(json) as PairingPayload
   if (parsed.v !== 1) throw new Error(`Unsupported pairing code version ${parsed.v}`)
-  if (!parsed.k || !parsed.c || !Array.isArray(parsed.a) || parsed.a.length === 0) {
+  const hasRelay = typeof parsed.r?.u === 'string' && typeof parsed.r?.i === 'string'
+  if (!parsed.k || !parsed.c || !Array.isArray(parsed.a) || (parsed.a.length === 0 && !hasRelay)) {
     throw new Error('Pairing code is missing required fields')
   }
   return parsed
