@@ -66,3 +66,19 @@ describe('scope split', () => {
     expect(denialReason('git.push', SCOPE_DEFAULTS)).toMatch(/"git_write"/)
   })
 })
+
+describe('bridge method gating', () => {
+  it('requires the sessions scope for remote.events', async () => {
+    const { isMethodAllowed } = await import('./policy.js')
+    expect(isMethodAllowed('remote.events', ['chat'])).toBe(false)
+    expect(isMethodAllowed('remote.events', ['sessions'])).toBe(true)
+    expect(isMethodAllowed('remote.health', [])).toBe(true)
+  })
+  it('does not expose unimplemented push methods or admin write fs / security.*', async () => {
+    const { isMethodAllowed } = await import('./policy.js')
+    expect(isMethodAllowed('bridge.registerPush', ['admin'])).toBe(false)
+    expect(isMethodAllowed('fs.write', ['admin'])).toBe(false)
+    expect(isMethodAllowed('security.set', ['admin'])).toBe(false)
+    expect(isMethodAllowed('fs.read', ['files'])).toBe(true)
+  })
+})

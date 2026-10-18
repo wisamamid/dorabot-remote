@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { hostname, networkInterfaces } from 'node:os'
 
 export interface Candidate {
@@ -71,8 +72,7 @@ export function candidateAddresses(port: number, extra: string[] = [], bind = '0
   // mDNS name. Works on iOS once local network permission is granted, and keeps
   // working across DHCP lease changes, so it is a useful fallback even though it
   // resolves more slowly than a bare IP.
-  const host = hostname()
-  const mdns = host.endsWith('.local') ? host : `${host}.local`
+  const mdns = mdnsName()
   push(`${mdns}:${port}`, 'bonjour', 3)
 
   return out.sort((a, b) => a.rank - b.rank)
@@ -81,4 +81,19 @@ export function candidateAddresses(port: number, extra: string[] = [], bind = '0
 export function primaryAddress(port: number, extra: string[] = [], bind = '0.0.0.0'): string {
   const c = candidateAddresses(port, extra, bind)
   return c[0]?.address ?? `127.0.0.1:${port}`
+}
+
+/** The Bonjour name: macOS LocalHostName + .local, else the short hostname. */
+export function mdnsName(): string {
+  if (process.platform === 'darwin') {
+    try {
+      const n = execFileSync('scutil', ['--get', 'LocalHostName'], { encoding: 'utf8', timeout: 2000 }).trim()
+      if (n) return `${n}.local`
+    } catch {
+      // Fall through.
+    }
+  }
+  const host = hostname()
+  if (host.endsWith('.local')) return host
+  return `${host.split('.')[0]}.local`
 }

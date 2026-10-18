@@ -295,7 +295,8 @@ describe('event delivery and resume', () => {
     client.connect()
     await new Promise((r) => setTimeout(r, 800))
     await client.subscribe(['desktop:dm:abc'])
-    const cursor = client.lastSeq
+    // A cursor of 0 means a fresh device, which deliberately replays nothing.
+    const cursor = Math.max(client.lastSeq, bridge.currentSeq())
     client.disconnect()
     await new Promise((r) => setTimeout(r, 200))
 

@@ -23,6 +23,8 @@ import type {
 } from '@dorabot-remote/protocol'
 import type { DeviceSocket } from './device-socket.js'
 import type { DeviceRecord } from './store.js'
+import { trimHistoryResult } from './history-trim.js'
+import { checkPathParams } from './path-guard.js'
 
 /** Replay is paced against this so a long catch-up cannot blow the socket buffer. */
 const SEND_HIGH_WATER_BYTES = 512 * 1024
@@ -52,6 +54,8 @@ export interface ConnectionHost {
   handleBridgeMethod(conn: DeviceConnection, method: string, params: Record<string, unknown>): Promise<unknown>
   log(msg: string): void
   onClosed(conn: DeviceConnection): void
+  /** Bridge-owned directories that fs.* / search.* must never reach. */
+  protectedPaths?(): string[]
 }
 
 /**
@@ -81,6 +85,11 @@ export class DeviceConnection {
   ownedShells = new Set<string>()
   /** Highest seq delivered per session, so a late subscribe can backfill exactly. */
   private sentSeqByKey = new Map<string, number>()
+  /** Highest seq delivered for events that carry no session key. */
+  private sentGlobalSeq = 0
+  /** Live events held back while a reconnect replay is in flight, to keep order. */
+  private replaying = false
+  private heldLive: Array<[string, unknown, number | undefined, string | null]> = []
   /** The device's resume cursor at connect time. */
   private authSeq = 0
   private sendQueue: Promise<void> = Promise.resolve()
@@ -222,7 +231,10 @@ export class DeviceConnection {
           gatewayConnected: this.host.gatewayConnected(),
         })
 
-        this.authSeq = typeof env.lastSeq === 'number' ? env.lastSeq : this.host.currentSeq()
+        // A fresh device (no cursor) replays nothing: history comes from
+        // sessions.get and pending prompts from the snapshot cache.
+        this.authSeq =
+          typeof env.lastSeq === 'number' && env.lastSeq > 0 ? env.lastSeq : this.host.currentSeq()
         if (this.authSeq < this.host.currentSeq()) void this.replayFrom(this.authSeq)
         return
       }
@@ -251,6 +263,10 @@ export class DeviceConnection {
       return
     }
 
+    // The CLI edits the device record from another process; pick that up here.
+    this.recheckDevice()
+    if (this.closed || !this.device) return
+
     if (!isMethodAllowed(env.method, this.device.scopes)) {
       this.host.log(`refused ${env.method} from ${this.device.name} (scopes: ${this.device.scopes.join(', ')})`)
       fail(denialReason(env.method, this.device.scopes), 'forbidden')
@@ -272,12 +288,9 @@ export class DeviceConnection {
         // started following them. Without this, a session the phone itself just
         // started appears empty: its first events landed before the subscribe.
         for (const k of fresh) {
-          const from = this.sentSeqByKey.get(k) ?? this.authSeq
+          const from = Math.max(this.sentSeqByKey.get(k) ?? 0, this.authSeq)
           const rows = this.host.eventsSince(from, 1000, [k]).filter((r) => r.sessionKey === k)
-          for (const row of rows) {
-            this.send({ t: 'event', event: row.event, data: JSON.parse(row.data), seq: row.seq, sessionKey: k })
-            this.sentSeqByKey.set(k, row.seq)
-          }
+          for (const row of rows) this.deliver(row.event, JSON.parse(row.data), row.seq, k)
         }
 
         for (const k of keys) {
@@ -291,6 +304,13 @@ export class DeviceConnection {
         const keys = Array.isArray(params.sessionKeys) ? (params.sessionKeys as string[]) : []
         for (const k of keys) this.subscriptions.delete(k)
         reply({ unsubscribed: keys })
+        return
+      }
+
+      const blocked = checkPathParams(env.method, params, this.host.protectedPaths?.() ?? [])
+      if (blocked) {
+        this.host.log(`refused ${env.method} from ${this.device.name}: ${blocked}`)
+        fail(blocked, 'forbidden')
         return
       }
 
@@ -309,7 +329,8 @@ export class DeviceConnection {
         return
       }
 
-      reply(await this.host.callGateway(env.method, params))
+      const result = await this.host.callGateway(env.method, params)
+      reply(trimHistoryResult(env.method, result, this.ws.maxFrameBytes))
     } catch (err) {
       fail((err as Error).message)
     }
@@ -330,8 +351,20 @@ export class DeviceConnection {
     const scoped = requested.startsWith(this.shellPrefix) ? requested : `${this.shellPrefix}${requested}`
 
     if (method === 'shell.spawn') {
-      const result = await this.host.callGateway('shell.spawn', { ...params, shellId: scoped })
+      // Own the id before the call so early output is not dropped; roll back on
+      // failure. If the socket closed meanwhile, kill the shell we just made.
       this.ownedShells.add(scoped)
+      let result: unknown
+      try {
+        result = await this.host.callGateway('shell.spawn', { ...params, shellId: scoped })
+      } catch (err) {
+        this.ownedShells.delete(scoped)
+        throw err
+      }
+      if (this.closed) {
+        void this.host.callGateway('shell.kill', { shellId: scoped }).catch(() => {})
+        this.ownedShells.delete(scoped)
+      }
       return result
     }
 
@@ -404,11 +437,44 @@ export class DeviceConnection {
   forward(event: string, data: unknown, seq: number | undefined, sessionKey: string | null): void {
     if (!this.authed) return
     if (sessionKey && !this.subscriptions.has(sessionKey)) return
-    if (sessionKey && typeof seq === 'number') {
-      if (seq <= (this.sentSeqByKey.get(sessionKey) ?? 0)) return
-      this.sentSeqByKey.set(sessionKey, seq)
+    if (this.replaying) {
+      this.heldLive.push([event, data, seq, sessionKey])
+      return
+    }
+    this.deliver(event, data, seq, sessionKey)
+  }
+
+  /**
+   * The single exit for events (replay, backfill, live). Never sends a seq at or
+   * below the highest already sent for that session (or globally for events with
+   * no session key), so overlapping paths cannot duplicate.
+   */
+  private deliver(event: string, data: unknown, seq: number | undefined, sessionKey: string | null): void {
+    if (typeof seq === 'number') {
+      if (sessionKey) {
+        if (seq <= (this.sentSeqByKey.get(sessionKey) ?? 0)) return
+        this.sentSeqByKey.set(sessionKey, seq)
+      } else {
+        if (seq <= this.sentGlobalSeq) return
+        this.sentGlobalSeq = seq
+      }
     }
     this.send({ t: 'event', event, data, seq, sessionKey: sessionKey ?? undefined })
+  }
+
+  /** Re-read this device's record: honour a revoke or scope change made elsewhere. */
+  recheckDevice(): void {
+    if (this.closed || !this.device) return
+    const fresh = this.host.getDevice(this.device.id)
+    if (!fresh || fresh.revoked) {
+      this.close(fresh ? 'revoked' : 'removed')
+      return
+    }
+    const key = (d: DeviceRecord): string => [...d.scopes].sort().join(',')
+    if (key(fresh) !== key(this.device)) {
+      this.device = fresh
+      this.forward('remote.scopes_changed', { scopes: fresh.scopes, granted: null }, undefined, null)
+    }
   }
 
   /** The internal, per-connection shell id prefix. */
@@ -429,12 +495,31 @@ export class DeviceConnection {
     if (!this.authed) return
     if (!this.ownedShells.has(shellId)) return
     if (!this.scopes.includes('terminal')) return
+    this.sendShellData(shellId, data)
+  }
+
+  private sendShellData(shellId: string, data: Record<string, unknown>): void {
     const clientId = shellId.startsWith(this.shellPrefix) ? shellId.slice(this.shellPrefix.length) : shellId
     this.send({ t: 'event', event: 'shell.data', data: { ...data, shellId: clientId } })
   }
 
   /** Catch a reconnecting device up from the durable log, in paced chunks. */
   private async replayFrom(afterSeq: number): Promise<void> {
+    this.replaying = true
+    try {
+      await this.replayLoop(afterSeq)
+    } finally {
+      this.replaying = false
+      const held = this.heldLive
+      this.heldLive = []
+      for (const [e, d, s, k] of held) {
+        if (k && !this.subscriptions.has(k)) continue
+        this.deliver(e, d, s, k)
+      }
+    }
+  }
+
+  private async replayLoop(afterSeq: number): Promise<void> {
     let cursor = afterSeq
     const keys = this.subscriptions.size > 0 ? [...this.subscriptions] : this.host.knownSessionKeys()
     for (;;) {
@@ -442,14 +527,7 @@ export class DeviceConnection {
       const rows = this.host.eventsSince(cursor, REPLAY_CHUNK, keys)
       if (rows.length === 0) break
       for (const row of rows) {
-        this.send({
-          t: 'event',
-          event: row.event,
-          data: JSON.parse(row.data),
-          seq: row.seq,
-          sessionKey: row.sessionKey ?? undefined,
-        })
-        if (row.sessionKey) this.sentSeqByKey.set(row.sessionKey, row.seq)
+        this.deliver(row.event, JSON.parse(row.data), row.seq, row.sessionKey)
         cursor = row.seq
       }
       await this.sendQueue
