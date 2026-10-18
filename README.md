@@ -5,8 +5,9 @@ run real work from it.
 
 Approve the tool calls it is blocked on, answer the questions it asks, read the
 stream as it happens, send a new prompt, and open a shell if you let it. Your
-phone talks **directly** to your own Mac over your network or your Tailnet. There
-is no server in the middle, no account, and nothing to sign up for.
+phone talks **directly** to your own Mac over your network or your Tailnet, with no
+account and nothing to sign up for. For access away from either, an optional
+blind relay is being rolled out (see [Working from anywhere](#working-from-anywhere)).
 
 <p align="center">
   <img src="docs/pair.png" width="260" alt="Pairing screen" />
@@ -99,13 +100,22 @@ name, and any Tailscale address — and the app races them all on every connect.
 
 So "same wifi" and "anywhere over Tailscale" are the same code path. Walk out of
 the house with Tailscale on and the app re-races, finds the Tailnet address and
-carries on. No mode switch, no re-pairing, no relay server.
+carries on. No mode switch, no re-pairing. Direct over LAN or Tailnet is the
+preferred path and needs nothing else.
 
 If Tailscale assigns a MagicDNS name you would rather advertise:
 
 ```bash
 dorabot-remote start --advertise my-mac.tail1234.ts.net:7788
 ```
+
+### Optional relay (being rolled out)
+
+For off-LAN access without Tailscale there is an optional relay in
+`packages/relay`, a Cloudflare Durable Object. It is blind: the phone and the
+bridge still run the same end-to-end handshake, so the relay only forwards
+ciphertext and cannot read or forge your traffic. It is not required, and it is
+still being rolled out.
 
 ## Permissions
 
@@ -165,7 +175,8 @@ it did not open.
 
 ## Security model, briefly
 
-**Transport.** Every frame after the handshake is XChaCha20-Poly1305 with a per
+**Transport.** Keys are agreed with X25519 and frames are sealed with
+XChaCha20-Poly1305, both from the pure JavaScript `@noble` libraries. Every frame after the handshake is XChaCha20-Poly1305 with a per
 stream random nonce prefix and a message counter, so a replayed or reordered
 frame fails to open.
 
