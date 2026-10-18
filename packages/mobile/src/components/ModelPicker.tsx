@@ -1,5 +1,6 @@
 import type { StoredSession } from '@dorabot-remote/protocol'
 import { useEffect, useState, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { useConnection } from '../lib/connection.js'
 import { haptic } from '../lib/platform.js'
 import {
@@ -104,6 +105,10 @@ export function ModelPicker({
           <path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </button>
+      {/* Portalled: the header has backdrop-blur and the screen may be transformed by
+          swipe-back, either of which would confine a fixed overlay to the header. */}
+      {createPortal(
+        <>
       {(error || note) && (
         <div
           role="status"
@@ -175,6 +180,9 @@ export function ModelPicker({
             </div>
           </div>
         </div>
+      )}
+        </>,
+        document.body,
       )}
     </>
   )
