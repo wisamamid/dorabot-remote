@@ -86,6 +86,7 @@ export const CONTROL_PAGE = `<!doctype html>
         <div class="small muted">Key fingerprint <span id="host-fp" class="mono"></span></div>
       </div>
       <span id="gw" class="pill">checking…</span>
+      <span id="relay" class="pill" style="display:none"></span>
     </div>
   </div>
 
@@ -125,6 +126,15 @@ function render() {
   const gw = document.getElementById('gw');
   gw.textContent = state.gatewayConnected ? 'dorabot connected' : 'dorabot not reachable';
   gw.className = 'pill ' + (state.gatewayConnected ? 'on' : 'off');
+
+  const rl = document.getElementById('relay');
+  if (state.relay) {
+    rl.style.display = '';
+    rl.textContent = 'relay ' + state.relay.state;
+    rl.className = 'pill ' + (state.relay.state === 'online' ? 'on' : 'off');
+  } else {
+    rl.style.display = 'none';
+  }
 
   const reqs = document.getElementById('requests');
   if (!state.scopeRequests.length) {

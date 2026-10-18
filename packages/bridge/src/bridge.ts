@@ -7,6 +7,8 @@ import {
   encodePairingPayload,
   fingerprint,
   fromB64,
+  isRelayUrlConfigured,
+  relayIdFromPublicKey,
   openSealedJson,
   sealJson,
   sodiumReady,
@@ -19,23 +21,27 @@ import type {
   PairingPayload,
   PairingRequest,
   PairingResponse,
+  RelayInfo,
   Scope,
   SessionSnapshot,
   Sodium,
   StatusUpdate,
 } from '@dorabot-remote/protocol'
 import QRCode from 'qrcode'
-import { WebSocketServer, type WebSocket } from 'ws'
+import { WebSocketServer } from 'ws'
 import { candidateAddresses } from './addresses.js'
 import {
   BRIDGE_VERSION,
   type BridgePaths,
   type BridgeSettings,
   loadIdentity,
+  loadSigningKey,
   readDorabotVersion,
   readGatewayToken,
 } from './config.js'
 import { DeviceConnection, type ConnectionHost } from './connection.js'
+import type { DeviceSocket } from './device-socket.js'
+import { RelayClient, type RelayState } from './relay-client.js'
 import { CONTROL_PAGE } from './control-page.js'
 import { GatewayClient } from './gateway-client.js'
 import { Store, type DeviceRecord } from './store.js'
@@ -64,6 +70,8 @@ export class Bridge implements ConnectionHost {
   private sessionKeys = new Set<string>()
   private gatewayCursor: Record<string, number> = {}
   private pruneTimer: NodeJS.Timeout | null = null
+  private relay: RelayClient | null = null
+  private relayInfo: RelayInfo | null = null
   readonly logLines: string[] = []
 
   constructor(opts: BridgeOptions) {
@@ -89,12 +97,23 @@ export class Bridge implements ConnectionHost {
   async start(): Promise<void> {
     this.sodium = await sodiumReady()
     this.hostIdentity = loadIdentity(this.sodium, this.paths)
+    if (this.settings.relay.enabled && isRelayUrlConfigured(this.settings.relay.url)) {
+      const key = loadSigningKey(this.paths)
+      this.relayInfo = { u: this.settings.relay.url.replace(/\/+$/, ''), i: relayIdFromPublicKey(key.publicKey) }
+      this.relay = new RelayClient({
+        url: this.relayInfo.u,
+        signingKey: key,
+        log: (m) => this.log(m),
+        onDeviceSocket: (sock, label) => this.routeRelaySocket(sock, label),
+      })
+    }
     this.hostSummary = {
       id: this.settings.hostId,
       name: this.settings.hostName,
       fingerprint: fingerprint(this.sodium, this.hostIdentity.publicKey),
       version: BRIDGE_VERSION,
       dorabotVersion: readDorabotVersion(this.paths),
+      ...(this.relayInfo ? { relay: this.relayInfo } : {}),
     }
     this.gatewayCursor = this.store.getMeta<Record<string, number>>(GATEWAY_CURSOR_KEY, {})
 
@@ -109,6 +128,10 @@ export class Bridge implements ConnectionHost {
     this.gateway.start()
 
     await this.listen()
+    if (this.relay) {
+      this.relay.on('state', (s) => this.broadcastBridgeEvent('remote.relay_state', { state: s }))
+      this.relay.start()
+    }
 
     this.pruneTimer = setInterval(
       () => {
@@ -123,6 +146,7 @@ export class Bridge implements ConnectionHost {
   async stop(): Promise<void> {
     if (this.pruneTimer) clearInterval(this.pruneTimer)
     for (const c of this.connections) c.close('bridge shutting down')
+    this.relay?.stop()
     this.gateway?.stop()
     await new Promise<void>((resolve) => {
       if (!this.http) return resolve()
@@ -472,11 +496,12 @@ export class Bridge implements ConnectionHost {
       c: code,
       a: candidateAddresses(this.settings.port, this.settings.extraAddresses, this.settings.bind).map((c) => c.address),
       e: expiresAt,
+      ...(this.relayInfo ? { r: this.relayInfo } : {}),
     }
     return { payload, uri: encodePairingPayload(payload), code }
   }
 
-  private onPairSocket(ws: WebSocket, remote: string): void {
+  private onPairSocket(ws: DeviceSocket, remote: string): void {
     const timer = setTimeout(() => ws.close(), 15_000)
     ws.on('message', (raw: Buffer) => {
       clearTimeout(timer)
@@ -524,7 +549,39 @@ export class Bridge implements ConnectionHost {
     ws.on('error', () => clearTimeout(timer))
   }
 
-  private onDeviceSocket(ws: WebSocket, remote: string): void {
+  /**
+   * The phone uses one relay URL for both pairing and connecting, so the path
+   * cannot say which it is. The first frame does: `pair` or `hello`. It is held
+   * back, dispatched to the right handler, then re-delivered.
+   */
+  private routeRelaySocket(sock: DeviceSocket, remote: string): void {
+    let routed = false
+    const timer = setTimeout(() => {
+      if (!routed) sock.close(4400, 'no first frame')
+    }, 15_000)
+    sock.on('close', () => clearTimeout(timer))
+    sock.on('message', (raw: Buffer, isBinary: boolean) => {
+      if (routed) return
+      routed = true
+      clearTimeout(timer)
+      let t: unknown
+      try {
+        if (!isBinary) t = (JSON.parse(raw.toString()) as { t?: unknown }).t
+      } catch {
+        // Falls through to the unknown-frame close.
+      }
+      if (t !== 'pair' && t !== 'hello') {
+        this.log(`relay: unexpected first frame, closing`)
+        sock.close(4400, 'unexpected first frame')
+        return
+      }
+      if (t === 'pair') this.onPairSocket(sock, remote)
+      else this.onDeviceSocket(sock, remote)
+      ;(sock as unknown as { emit(e: string, ...a: unknown[]): boolean }).emit('message', raw, isBinary)
+    })
+  }
+
+  private onDeviceSocket(ws: DeviceSocket, remote: string): void {
     const conn = new DeviceConnection(ws, this, remote)
     this.connections.add(conn)
   }
@@ -569,6 +626,7 @@ export class Bridge implements ConnectionHost {
       json(200, {
         host: this.hostSummary,
         gatewayConnected: this.gatewayConnected(),
+        relay: this.relay ? { state: this.relay.state, id: this.relayInfo?.i, url: this.relayInfo?.u } : null,
         devices: this.store.listDevices().map((d) => this.deviceSummary(d)),
         scopeRequests: this.store.listScopeRequests('pending'),
         addresses: candidateAddresses(this.settings.port, this.settings.extraAddresses, this.settings.bind),
