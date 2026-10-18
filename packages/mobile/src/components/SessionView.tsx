@@ -103,6 +103,11 @@ export function SessionView({
     >
       <div className="flex h-full min-h-0 flex-col">
         <div ref={scrollRef} onScroll={onScroll} className="scroll min-h-0 flex-1 px-3 py-3">
+          {conn.getHistoryInfo(sessionKey) && (
+            <div className="mb-3 text-center text-[12.5px] text-ink-500">
+              Showing the latest {conn.getHistoryInfo(sessionKey)!.shown} of {conn.getHistoryInfo(sessionKey)!.total} messages
+            </div>
+          )}
           {state.chatItems.length === 0 ? (
             <div className="flex h-full items-center justify-center px-8 text-center text-[14px] leading-relaxed text-ink-500">
               Nothing here yet. Send a message to start.

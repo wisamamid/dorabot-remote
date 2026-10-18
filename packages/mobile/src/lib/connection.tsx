@@ -14,6 +14,7 @@ import {
   identityToB64,
   toB64,
   sessionMessagesToChatItems,
+  mergeHistory,
   type ConnectionState,
   type DeviceSummary,
   type HostSummary,
@@ -79,6 +80,8 @@ interface ConnectionValue {
   refreshSessions: () => Promise<void>
   openSession: (sessionKey: string, sessionId?: string) => Promise<void>
   getSession: (sessionKey: string) => SessionState
+  /** Set when the bridge returned only the newest part of a long history. */
+  getHistoryInfo: (sessionKey: string) => { shown: number; total: number } | null
   clearAttention: (sessionKey: string) => void
 }
 
@@ -109,6 +112,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   const clientRef = useRef<RemoteClient | null>(null)
   const aggRef = useRef(new SessionAggregator())
   const loadedHistory = useRef(new Set<string>())
+  const historyInfo = useRef(new Map<string, { shown: number; total: number }>())
   const bump = useCallback(() => setRevision((r) => r + 1), [])
 
   // ---- restore ------------------------------------------------------------
@@ -185,8 +189,11 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   useEffect(() => {
     return onAppResume(() => {
       const c = clientRef.current
-      if (c && c.state !== 'ready') c.connect()
-      else if (c) void refreshSessionsInternal()
+      if (!c) return
+      // Probe the socket: after a long sleep it is usually half-open, and a
+      // reconnect is forced at once if nothing answers. Not ready? Skip backoff.
+      c.checkAlive(3000)
+      if (c.state === 'ready') void refreshSessionsInternal()
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -218,7 +225,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
         return
       }
 
-      const touched = aggRef.current.apply(event, data, seq)
+      const touched = aggRef.current.apply(event, data, seq, sessionKey)
       if (typeof seq === 'number') void storage.set(CURSOR_KEY, String(aggRef.current.cursor))
 
       // Three events mean a human has to do something or a run is stuck.
@@ -287,13 +294,23 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       }
       loadedHistory.current.add(sessionKey)
       try {
-        const res = await c.rpc<{ messages?: SessionMessage[] } | SessionMessage[]>('sessions.get', { sessionId })
+        const res = await c.rpc<
+          { messages?: SessionMessage[]; truncated?: boolean; totalMessages?: number; returnedMessages?: number } | SessionMessage[]
+        >('sessions.get', { sessionId })
         const messages = Array.isArray(res) ? res : (res?.messages ?? [])
+        if (!Array.isArray(res) && res?.truncated) {
+          historyInfo.current.set(sessionKey, {
+            shown: res.returnedMessages ?? messages.length,
+            total: res.totalMessages ?? messages.length,
+          })
+        } else {
+          historyInfo.current.delete(sessionKey)
+        }
         const existing = aggRef.current.get(sessionKey).chatItems
         const history = sessionMessagesToChatItems(messages)
-        // Anything already streamed in live wins over history, so nothing is
-        // duplicated when a run is in flight while history loads.
-        aggRef.current.setChatItems(sessionKey, existing.length > 0 ? [...history, ...existing] : history)
+        // History is authoritative. Items replayed live after a cold start are
+        // already in it, so only live items newer than history are kept.
+        aggRef.current.setChatItems(sessionKey, mergeHistory(history, existing))
       } catch {
         loadedHistory.current.delete(sessionKey)
       }
@@ -323,6 +340,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     clientRef.current = null
     aggRef.current = new SessionAggregator()
     loadedHistory.current.clear()
+    historyInfo.current.clear()
     await storage.remove(PAIRING_KEY)
     await storage.remove(CURSOR_KEY)
     setPairing(null)
@@ -353,6 +371,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       hasScope: (scope) => (device?.scopes ?? pairing?.scopes ?? []).includes(scope),
       refreshSessions: refreshSessionsInternal,
       openSession,
+      getHistoryInfo: (key) => historyInfo.current.get(key) ?? null,
       getSession: (key) => (aggRef.current.keys().includes(key) ? aggRef.current.get(key) : emptySessionState(key)),
       clearAttention: (key) => setAttention((prev) => prev.filter((a) => a.sessionKey !== key)),
     }),

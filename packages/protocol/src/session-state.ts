@@ -63,11 +63,49 @@ interface Deferred {
   deltas: Array<{ toolUseId: string; delta: string }>
 }
 
+function itemKey(it: ChatItem): string {
+  switch (it.type) {
+    case 'tool_use':
+      return `tool:${it.id}`
+    case 'result':
+      return `result:${it.cost ?? ''}`
+    case 'compacting':
+      return 'compacting'
+    default:
+      return `${it.type}:${it.content}`
+  }
+}
+
+/**
+ * Merge loaded history with items the aggregator already built live (typically
+ * from the bridge replaying events after a cold start, which history also holds).
+ * History is authoritative: live items it already contains, or that precede
+ * something it contains, are dropped; only live items newer than the last
+ * overlap are appended. Works when history is a partial, newest-only slice.
+ */
+export function mergeHistory(history: ChatItem[], live: ChatItem[]): ChatItem[] {
+  if (live.length === 0) return history
+  const keys = history.map(itemKey)
+  let pointer = 0
+  let lastMatchedLive = -1
+  for (let i = 0; i < live.length; i++) {
+    const k = itemKey(live[i]!)
+    const at = keys.indexOf(k, pointer)
+    if (at !== -1) {
+      pointer = at + 1
+      lastMatchedLive = i
+    }
+  }
+  return [...history, ...live.slice(lastMatchedLive + 1)]
+}
+
 export class SessionAggregator {
   private states = new Map<string, SessionState>()
   private deferred = new Map<string, Deferred>()
   /** Highest bridge seq applied, for gap-free resume after a dropped socket. */
   private lastSeq = 0
+  /** Highest seq applied per session, so a replayed or re-sent event is ignored. */
+  private seqByKey = new Map<string, number>()
 
   get cursor(): number {
     return this.lastSeq
@@ -140,8 +178,15 @@ export class SessionAggregator {
    * Apply one gateway event. Returns the session key that changed, or null if the
    * event was global or irrelevant.
    */
-  apply(event: string, data: unknown, seq?: number): string | null {
-    if (typeof seq === 'number' && seq > this.lastSeq) this.lastSeq = seq
+  apply(event: string, data: unknown, seq?: number, envelopeSessionKey?: string): string | null {
+    if (typeof seq === 'number') {
+      if (seq > this.lastSeq) this.lastSeq = seq
+      // Per session, not global: a subscribe backfill legitimately delivers lower
+      // seqs for a newly followed session than other sessions already reached.
+      const key = envelopeSessionKey ?? ((data as { sessionKey?: string } | null)?.sessionKey ?? '')
+      if (seq <= (this.seqByKey.get(key) ?? 0)) return null
+      this.seqByKey.set(key, seq)
+    }
     const d = (data ?? {}) as Record<string, unknown>
     const sk = d.sessionKey as string | undefined
 
