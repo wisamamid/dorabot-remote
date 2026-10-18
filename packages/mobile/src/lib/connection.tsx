@@ -36,7 +36,7 @@ import {
   type ReactNode,
 } from 'react'
 import { applySessionEvent, sortSessions } from './sessions-sync.js'
-import { haptic, onAppBackground, onAppResume, storage } from './platform.js'
+import { haptic, onAppBackground, onAppResume, onNetworkChange, storage } from './platform.js'
 
 const PAIRING_KEY = 'dorabot-remote.pairing.v1'
 const CURSOR_KEY = 'dorabot-remote.cursor.v1'
@@ -81,6 +81,8 @@ interface ConnectionValue {
   refreshSessions: () => Promise<void>
   openSession: (sessionKey: string, sessionId?: string) => Promise<void>
   /** Reload one session's transcript from the gateway (pull to refresh). */
+  /** Winning transport while connected, for the status banner. */
+  transport: 'lan' | 'relay' | null
   reloadHistory: (sessionKey: string, sessionId?: string) => Promise<void>
   getSession: (sessionKey: string) => SessionState
   /** Set when the bridge returned only the newest part of a long history. */
@@ -109,6 +111,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   const [gatewayConnected, setGatewayConnected] = useState(false)
   const [sessions, setSessions] = useState<StoredSession[]>([])
   const [sessionsLoading, setSessionsLoading] = useState(false)
+  const [transport, setTransport] = useState<'lan' | 'relay' | null>(null)
+  const lastOpened = useRef<{ key: string; id?: string } | null>(null)
   const [revision, setRevision] = useState(0)
   const [attention, setAttention] = useState<Attention[]>([])
 
@@ -169,6 +173,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
           setState(s)
           setStateDetail(detail)
         },
+        onTransport: (t) => setTransport(t),
         onReady: (info) => {
           setHost(info.host)
           setDevice(info.device)
@@ -177,6 +182,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
           // Follow every session so an approval on any of them reaches the phone,
           // not just the one currently on screen.
           void client?.subscribe(aggRef.current.keys()).catch(() => {})
+          // Whatever was on screen went stale while the link was down.
+          const lo = lastOpened.current
+          if (lo && loadedHistory.current.has(lo.key)) void openSessionRef.current(lo.key, lo.id, true)
         },
         onEvent: (event, data, seq, sessionKey) => {
           handleEvent(event, data, seq, sessionKey)
@@ -206,6 +214,17 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       if (!c || c.state === 'revoked') return
       backgrounded.current = true
       c.disconnect()
+    })
+  }, [])
+
+  // Wi-Fi to cellular (or back): the old socket is bound to a dead interface, so
+  // replace it now rather than waiting for the ping timeout.
+  useEffect(() => {
+    return onNetworkChange(() => {
+      const c = clientRef.current
+      if (!c || c.state === 'revoked') return
+      backgrounded.current = false
+      c.forceReconnect()
     })
   }, [])
 
@@ -353,6 +372,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       const c = clientRef.current
       if (!c) return
       await c.subscribe([sessionKey])
+      if (sessionId) lastOpened.current = { key: sessionKey, id: sessionId }
       if (force) loadedHistory.current.delete(sessionKey)
       if (loadedHistory.current.has(sessionKey) || !sessionId) {
         bump()
@@ -384,6 +404,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     },
     [bump],
   )
+
+  const openSessionRef = useRef(openSession)
+  openSessionRef.current = openSession
 
   const savePairing = useCallback(async (result: PairResult) => {
     const record: StoredPairing = {
@@ -440,6 +463,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       scopes: device?.scopes ?? pairing?.scopes ?? [],
       sessions,
       sessionsLoading,
+      transport,
       revision,
       attention,
       savePairing,
@@ -464,6 +488,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       gatewayConnected,
       sessions,
       sessionsLoading,
+      transport,
       revision,
       attention,
       savePairing,

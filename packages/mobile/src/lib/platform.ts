@@ -6,6 +6,7 @@
  * instead of a camera) and as a native app on a phone.
  */
 import { Capacitor } from '@capacitor/core'
+import { shouldReconnect, type NetStatus } from './network.js'
 
 export const isNative = Capacitor.isNativePlatform()
 export const platformName = Capacitor.getPlatform()
@@ -244,6 +245,41 @@ export function onAppResume(handler: () => void): () => void {
     cleanup = () => void sub.remove()
   })()
   return () => cleanup?.()
+}
+
+/**
+ * Fired when the network interface changes or returns (Wi-Fi off, cellular on,
+ * and so on). Uses @capacitor/network natively and the `online` event on the web.
+ */
+export function onNetworkChange(handler: () => void): () => void {
+  const online = (): void => handler()
+  window.addEventListener('online', online)
+  if (!isNative) return () => window.removeEventListener('online', online)
+  let cleanup: (() => void) | null = null
+  let removed = false
+  void (async () => {
+    const { Network } = await import('@capacitor/network')
+    let prev: NetStatus | null = null
+    try {
+      const s = await Network.getStatus()
+      prev = { connected: s.connected, connectionType: s.connectionType }
+    } catch {
+      // The first change event seeds it instead.
+    }
+    const sub = await Network.addListener('networkStatusChange', (s) => {
+      const next = { connected: s.connected, connectionType: s.connectionType }
+      const was = prev
+      prev = next
+      if (shouldReconnect(was, next)) handler()
+    })
+    if (removed) void sub.remove()
+    else cleanup = () => void sub.remove()
+  })()
+  return () => {
+    removed = true
+    window.removeEventListener('online', online)
+    cleanup?.()
+  }
 }
 
 /** Fired when the app goes to the background (iOS then suspends it, freezing its sockets). */

@@ -78,9 +78,9 @@ export interface PairResult {
 }
 
 const CONNECT_TIMEOUT_MS = 6000
-const PING_INTERVAL_MS = 20_000
+const PING_INTERVAL_MS = 10_000
 /** A ping with no inbound frame at all within this long means the socket is half-open. */
-const PONG_TIMEOUT_MS = 10_000
+const PONG_TIMEOUT_MS = 5_000
 
 /** Normalise the two WebSocket event styles into one. */
 function bind(
@@ -303,6 +303,8 @@ export class RemoteClient {
   private rxCount = 0
   private probeTimer: ReturnType<typeof setTimeout> | null = null
   private stopped = false
+  /** One-shot: the next race starts the relay at once (network just changed, LAN is unlikely). */
+  private skipLanHeadStart = false
   private subscriptions = new Set<string>()
 
   constructor(private readonly opts: RemoteClientOptions) {
@@ -364,6 +366,24 @@ export class RemoteClient {
     if (this.racing || this.socket) return
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
+    this.openNext()
+  }
+
+  /**
+   * The network changed (Wi-Fi to cellular and so on). The current socket is bound
+   * to the old interface and may look open for minutes: drop it and reconnect now,
+   * with no backoff, racing the relay straight away.
+   */
+  forceReconnect(): void {
+    if (this.state === 'revoked') return
+    this.stopped = false
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+    this.attempt = 0
+    this.activeAddress = null
+    this.skipLanHeadStart = true
+    this.failPending(new Error('network changed'))
+    this.setTransport(null)
     this.openNext()
   }
 
@@ -619,7 +639,9 @@ export class RemoteClient {
         // A relay socket that could not even be created leaves nothing to wait on.
         lose('unreachable')
       }
-      if (addresses.length === 0) startRelay()
+      const fast = this.skipLanHeadStart
+      this.skipLanHeadStart = false
+      if (addresses.length === 0 || fast) startRelay()
       else relayTimer = setTimeout(() => startRelay?.(), RELAY_HEAD_START_MS)
     }
   }

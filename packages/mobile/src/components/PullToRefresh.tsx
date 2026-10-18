@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { EDGE_PX } from './SwipeBack.js'
 import { Spinner, cx } from './ui.js'
 
 /** Distance the content must be pulled, in px, to trigger a refresh. */
@@ -47,7 +48,8 @@ export function PullToRefresh({
       setPull(v)
     }
     const onStart = (e: TouchEvent): void => {
-      if (busy.current || el.scrollTop > 0) {
+      // The left edge belongs to the back swipe.
+      if (busy.current || el.scrollTop > 0 || (e.touches[0]?.clientX ?? 99) <= EDGE_PX) {
         startY = null
         return
       }

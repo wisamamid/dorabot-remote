@@ -1,5 +1,5 @@
 import type { StoredSession } from '@dorabot-remote/protocol'
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { CodeScreen } from './components/CodeScreen.js'
 import { InboxScreen } from './components/InboxScreen.js'
 import { MoreScreen } from './components/MoreScreen.js'
@@ -11,6 +11,7 @@ import { PushPrompt } from './components/PushPrompt.js'
 import { Button, Spinner, cx } from './components/ui.js'
 import { ConnectionProvider, useConnection } from './lib/connection.js'
 import { InboxProvider, useInbox } from './lib/inbox-context.js'
+import { bannerFor } from './lib/status-banner.js'
 import { setStatusBarDark } from './lib/platform.js'
 import { clearDeliveredNotifications, onPushNavigate } from './lib/push.js'
 import { PushProvider } from './lib/push-context.js'
@@ -110,6 +111,7 @@ function Shell(): ReactNode {
           </Button>
         </div>
       )}
+      <StatusBanner />
       {!open && (tab === 'sessions' || tab === 'inbox') && <PushPrompt />}
       <div className="relative min-h-0 flex-1">
         {pane('sessions', <SessionList onOpen={openSession} onSettings={() => setTab('more')} />)}
@@ -135,6 +137,52 @@ function Shell(): ReactNode {
           <Tab active={tab === 'more'} onClick={() => setTab('more')} label="More" icon={icon.more} />
         </nav>
       )}
+    </div>
+  )
+}
+
+function StatusBanner(): ReactNode {
+  const conn = useConnection()
+  const [online, setOnline] = useState(() => navigator.onLine)
+  const [just, setJust] = useState(false)
+  const wasDown = useRef(false)
+
+  useEffect(() => {
+    const on = (): void => setOnline(true)
+    const off = (): void => setOnline(false)
+    window.addEventListener('online', on)
+    window.addEventListener('offline', off)
+    return () => {
+      window.removeEventListener('online', on)
+      window.removeEventListener('offline', off)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (conn.state !== 'ready') {
+      wasDown.current = true
+      return
+    }
+    if (!wasDown.current) return
+    wasDown.current = false
+    setJust(true)
+    const t = setTimeout(() => setJust(false), 3000)
+    return () => clearTimeout(t)
+  }, [conn.state])
+
+  const b = bannerFor({ state: conn.state, online, transport: conn.transport, justReconnected: just })
+  if (!b) return null
+  return (
+    <div
+      role="status"
+      className={cx(
+        'shrink-0 px-4 py-1.5 text-center text-[13px] font-medium',
+        b.tone === 'bad' && 'bg-rose-dim text-rose-glow',
+        b.tone === 'warn' && 'bg-amber-dim text-amber-glow',
+        b.tone === 'good' && 'bg-mint-500/15 text-mint-500',
+      )}
+    >
+      {b.text}
     </div>
   )
 }
