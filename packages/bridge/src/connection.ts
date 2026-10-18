@@ -78,6 +78,9 @@ export class DeviceConnection {
   private channel: SecureChannel | null = null
   private ephemeral: KeyPair | null = null
   private authed = false
+  get isAuthed(): boolean {
+    return this.authed && !this.closed
+  }
   private closed = false
   /** Session keys this device asked to follow. */
   subscriptions = new Set<string>()

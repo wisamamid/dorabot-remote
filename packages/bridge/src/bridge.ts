@@ -41,6 +41,7 @@ import {
 } from './config.js'
 import { DeviceConnection, type ConnectionHost } from './connection.js'
 import type { DeviceSocket } from './device-socket.js'
+import { PushNotifier, PUSH_TOKEN_RE } from './push.js'
 import { RelayClient, type RelayState } from './relay-client.js'
 import { CONTROL_PAGE } from './control-page.js'
 import { GatewayClient } from './gateway-client.js'
@@ -74,6 +75,7 @@ export class Bridge implements ConnectionHost {
   private deviceTimer: NodeJS.Timeout | null = null
   private relay: RelayClient | null = null
   private relayInfo: RelayInfo | null = null
+  private pusher: PushNotifier | null = null
   readonly logLines: string[] = []
 
   constructor(opts: BridgeOptions) {
@@ -102,6 +104,13 @@ export class Bridge implements ConnectionHost {
     if (this.settings.relay.enabled && isRelayUrlConfigured(this.settings.relay.url)) {
       const key = loadSigningKey(this.paths)
       this.relayInfo = { u: this.settings.relay.url.replace(/\/+$/, ''), i: relayIdFromPublicKey(key.publicKey) }
+      this.pusher = new PushNotifier({
+        store: this.store,
+        relay: { url: this.relayInfo.u, id: this.relayInfo.i },
+        signingKey: key,
+        isConnected: (id) => [...this.connections].some((c) => c.device?.id === id && c.isAuthed),
+        log: (m) => this.log(m),
+      })
       this.relay = new RelayClient({
         url: this.relayInfo.u,
         signingKey: key,
@@ -333,6 +342,7 @@ export class Bridge implements ConnectionHost {
     }
 
     for (const c of this.connections) c.forward(name, data, bridgeSeq, sessionKey)
+    this.pusher?.onGatewayEvent(name, data)
   }
 
   /**
@@ -460,6 +470,42 @@ export class Bridge implements ConnectionHost {
       case 'remote.scopeRequests': {
         this.requireScope(conn, 'admin')
         return this.store.listScopeRequests('pending')
+      }
+
+      case 'remote.registerPush': {
+        const device = conn.device
+        if (!device) throw new Error('not authenticated')
+        const token = String(params.token ?? '')
+        const platform = params.platform
+        const env = params.env === 'sandbox' ? 'sandbox' : 'production'
+        if (!PUSH_TOKEN_RE.test(token)) throw new Error('invalid push token')
+        if (platform !== 'ios' && platform !== 'android') throw new Error('invalid push platform')
+        if (params.env !== undefined && params.env !== 'production' && params.env !== 'sandbox') throw new Error('invalid push env')
+        this.store.setPushToken(device.id, token, platform, env)
+        this.log(`push registered for "${device.name}" (${platform}, ${env})`)
+        return { registered: true, notifyOnResult: this.store.getDevice(device.id)?.pushOnResult ?? false }
+      }
+
+      case 'remote.unregisterPush': {
+        const device = conn.device
+        if (!device) throw new Error('not authenticated')
+        this.store.setPushToken(device.id, null, null)
+        this.log(`push unregistered for "${device.name}"`)
+        return { unregistered: true }
+      }
+
+      case 'remote.setPushPrefs': {
+        const device = conn.device
+        if (!device) throw new Error('not authenticated')
+        if (typeof params.notifyOnResult !== 'boolean') throw new Error('notifyOnResult must be a boolean')
+        this.store.setPushOnResult(device.id, params.notifyOnResult)
+        return { notifyOnResult: params.notifyOnResult }
+      }
+
+      case 'remote.pushPrefs': {
+        const device = conn.device ? this.store.getDevice(conn.device.id) : null
+        if (!device) throw new Error('not authenticated')
+        return { registered: Boolean(device.pushToken), notifyOnResult: Boolean(device.pushOnResult) }
       }
 
       case 'remote.events': {
