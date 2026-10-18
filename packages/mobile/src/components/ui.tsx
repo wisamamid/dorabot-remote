@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { SwipeBack } from './SwipeBack.js'
 
 export function cx(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(' ')
@@ -24,7 +25,7 @@ export function Screen({
   children: ReactNode
   onBack?: () => void
 }): ReactNode {
-  return (
+  const screen = (
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex min-h-14 shrink-0 items-center gap-3 border-b border-ink-700 bg-ink-900/95 px-4 py-2 backdrop-blur">
         {onBack && (
@@ -43,6 +44,7 @@ export function Screen({
       <div className="min-h-0 flex-1">{children}</div>
     </div>
   )
+  return onBack ? <SwipeBack onBack={onBack}>{screen}</SwipeBack> : screen
 }
 
 export function Button({

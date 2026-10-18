@@ -142,7 +142,7 @@ describe('half-open detection', () => {
     await settle()
     expect(c.state).toBe('ready')
     host.mute = true
-    await settle(20_000 + 10_000 + 50)
+    await settle(10_000 + 5_000 + 50)
     expect(host.sockets[0]!.closed).toBe(true)
     host.mute = false
     await settle(3000)
@@ -190,6 +190,62 @@ describe('half-open detection', () => {
     await settle(50)
     expect(host.sockets.length).toBe(2)
     expect(c.state).toBe('ready')
+    c.disconnect()
+  })
+})
+
+describe('forceReconnect (network change)', () => {
+  it('drops a live socket at once and reconnects without backoff', async () => {
+    const host = new FakeHost()
+    const c = make(host)
+    c.connect()
+    await settle()
+    expect(c.state).toBe('ready')
+    c.forceReconnect()
+    expect(host.sockets[0]!.closed).toBe(true)
+    await settle(50)
+    expect(host.sockets.length).toBe(2)
+    expect(c.state).toBe('ready')
+    c.disconnect()
+  })
+
+  it('cancels a pending backoff and reconnects now', async () => {
+    const host = new FakeHost()
+    const c = make(host)
+    c.connect()
+    await settle()
+    host.refuse = 'nope'
+    host.sockets[0]!.close()
+    await settle(10)
+    expect(c.state).toBe('disconnected')
+    host.refuse = null
+    c.forceReconnect()
+    await settle(50)
+    expect(c.state).toBe('ready')
+    c.disconnect()
+  })
+
+  it('does not resurrect a revoked client', async () => {
+    const host = new FakeHost()
+    host.refuse = 'revoked'
+    const c = make(host)
+    c.connect()
+    await settle(100)
+    expect(c.state).toBe('revoked')
+    const n = host.sockets.length
+    c.forceReconnect()
+    await settle(100)
+    expect(host.sockets.length).toBe(n)
+  })
+
+  it('detects a dead socket within the 10s ping + 5s pong window', async () => {
+    const host = new FakeHost()
+    const c = make(host)
+    c.connect()
+    await settle()
+    host.mute = true
+    await settle(10_000 + 5_000 + 100)
+    expect(host.sockets[0]!.closed).toBe(true)
     c.disconnect()
   })
 })

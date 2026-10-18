@@ -9,6 +9,9 @@ const config: CapacitorConfig = {
     // translucent header, matching how the design treats the top of the screen.
     contentInset: 'never',
     backgroundColor: '#0b0c0e',
+    // No outer rubber-band: inner lists scroll on their own, and the edge swipe
+    // and pull-to-refresh are handled in the page.
+    scrollEnabled: false,
   },
   android: {
     backgroundColor: '#0b0c0e',

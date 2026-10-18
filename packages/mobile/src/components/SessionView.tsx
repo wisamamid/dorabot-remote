@@ -2,6 +2,7 @@ import type { StoredSession } from '@dorabot-remote/protocol'
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
 import { haptic, watchKeyboard } from '../lib/platform.js'
+import { PullToRefresh } from './PullToRefresh.js'
 import { ChatItemList, StatusLine } from './ChatItems.js'
 import { ApprovalCard, ElicitationCard, QuestionCard } from './Interrupts.js'
 import { Button, Dot, Screen, cx } from './ui.js'
@@ -102,7 +103,13 @@ export function SessionView({
       }
     >
       <div className="flex h-full min-h-0 flex-col">
-        <div ref={scrollRef} onScroll={onScroll} className="scroll min-h-0 flex-1 px-3 py-3">
+        <div className="min-h-0 flex-1">
+        <PullToRefresh
+          scrollRef={scrollRef}
+          onScroll={onScroll}
+          onRefresh={() => conn.reloadHistory(sessionKey, session?.id)}
+          className="px-3 py-3"
+        >
           {conn.getHistoryInfo(sessionKey) && (
             <div className="mb-3 text-center text-[12.5px] text-ink-500">
               Showing the latest {conn.getHistoryInfo(sessionKey)!.shown} of {conn.getHistoryInfo(sessionKey)!.total} messages
@@ -116,6 +123,7 @@ export function SessionView({
             <ChatItemList items={state.chatItems} />
           )}
           <StatusLine status={state.status} detail={state.statusDetail} />
+        </PullToRefresh>
         </div>
 
         {blocked && (
