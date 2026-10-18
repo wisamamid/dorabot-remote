@@ -24,3 +24,4 @@ xcuserdata/
 
 # Capacitor copies the web build into the native projects on sync
 packages/mobile/android/app/src/main/assets/public/
+.wrangler/
