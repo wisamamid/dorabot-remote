@@ -13,9 +13,9 @@ import { randomBytes } from '@noble/hashes/utils.js'
 import { fromB64, toB64, utf8 } from './crypto.js'
 
 /**
- * The one place the hosted relay's address lives. Replace after `wrangler deploy`.
+ * The one place the hosted relay's address lives. Deployed with `wrangler deploy` from packages/relay.
  */
-export const DEFAULT_RELAY_URL = 'wss://dorabot-relay.REPLACE_ME.workers.dev'
+export const DEFAULT_RELAY_URL = 'wss://dorabot-relay.wisam.workers.dev'
 
 /** False until the real subdomain replaces the placeholder, so dev builds stay quiet. */
 export function isRelayUrlConfigured(url: string): boolean {
