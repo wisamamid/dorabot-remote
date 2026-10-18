@@ -343,7 +343,7 @@ export async function setStatusBarDark(): Promise<void> {
 
 /** A device name the user will recognise in the Mac's device list. */
 export function suggestDeviceName(): string {
-  if (platformName === 'ios') return 'iPhone'
+  if (platformName === 'ios') return Math.min(screen.width, screen.height) >= 700 ? 'iPad' : 'iPhone'
   if (platformName === 'android') return 'Android phone'
   const ua = navigator.userAgent
   if (/iPhone/.test(ua)) return 'iPhone'
