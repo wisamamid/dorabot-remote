@@ -96,6 +96,11 @@ export function checkPathParams(
   // fs.* defaults to the gateway cwd for relative paths; resolving against home
   // is the stricter reading for ".." escapes.
   for (const c of candidates) {
+    // The gateway resolves relative paths against its own cwd, not home, so a ".."
+    // could step somewhere this check never looked. A phone has no need for it.
+    if (c.split(/[\\/]+/).includes('..')) {
+      return `access to "${c}" is blocked: paths may not contain "..".`
+    }
     const p = normalisePath(c, home)
     if (denied.some((d) => within(p, d)) || sensitiveSegment(p)) {
       return `access to "${c}" is blocked: it holds credentials or private data that remote devices may not read.`

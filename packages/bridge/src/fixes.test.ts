@@ -175,6 +175,8 @@ describe('path guard', () => {
     expect(checkPathParams('fs.read', { path: join(home, 'host-key.json') }, extra)).toMatch(/blocked/)
     expect(checkPathParams('fs.read', { path: '~/.ssh/id_rsa' }, extra)).toMatch(/blocked/)
     expect(checkPathParams('fs.list', { path: '~/Documents/../.aws' }, extra)).toMatch(/blocked/)
+    expect(checkPathParams('fs.read', { path: '../.config/gh/hosts.yml' }, extra)).toMatch(/blocked/)
+    expect(checkPathParams('fs.read', { path: 'Desktop/../../x' }, extra)).toMatch(/blocked/)
     expect(checkPathParams('fs.read', { path: '.config/gh/hosts.yml' }, extra)).toMatch(/blocked/)
     expect(checkPathParams('fs.read', { path: join(h, 'proj/.env') }, extra)).toMatch(/blocked/)
     expect(checkPathParams('fs.read', { path: join(h, 'proj/a.pem') }, extra)).toMatch(/blocked/)
