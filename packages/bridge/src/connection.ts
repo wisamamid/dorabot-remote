@@ -21,12 +21,14 @@ import type {
   Scope,
   Sodium,
 } from '@dorabot-remote/protocol'
-import type { WebSocket } from 'ws'
+import type { DeviceSocket } from './device-socket.js'
 import type { DeviceRecord } from './store.js'
 
 /** Replay is paced against this so a long catch-up cannot blow the socket buffer. */
 const SEND_HIGH_WATER_BYTES = 512 * 1024
 const REPLAY_CHUNK = 200
+/** XChaCha20-Poly1305 tag. */
+const SEAL_OVERHEAD_BYTES = 16
 
 export interface ConnectionHost {
   sodium: Sodium
@@ -85,7 +87,7 @@ export class DeviceConnection {
   private handshakeTimer: NodeJS.Timeout | null = null
 
   constructor(
-    private readonly ws: WebSocket,
+    private readonly ws: DeviceSocket,
     private readonly host: ConnectionHost,
     readonly remoteAddress: string,
   ) {
@@ -356,8 +358,28 @@ export class DeviceConnection {
     this.sendQueue = this.sendQueue.then(async () => {
       if (this.closed || !this.channel) return
       try {
+        const limit = this.ws.maxFrameBytes
+        if (limit !== undefined) {
+          // Sealing advances the stream counter, so an oversize frame cannot be
+          // sealed and then discarded: the phone would lose sync. Size it first
+          // (ciphertext = JSON bytes + 16 byte tag) and substitute or drop.
+          const size = Buffer.byteLength(JSON.stringify(env)) + SEAL_OVERHEAD_BYTES
+          if (size > limit) {
+            if (env.t === 'rpc_res') {
+              this.host.log(`response of ${size} bytes is too large for the relay; replacing with an error`)
+              env = {
+                t: 'rpc_res',
+                id: env.id,
+                error: { message: `response too large to send over the relay (${size} bytes)`, code: 'too_large' },
+              }
+            } else {
+              this.host.log(`dropped a ${size} byte ${env.t} event: too large for the relay`)
+              return
+            }
+          }
+        }
         const frame = this.channel.seal(env)
-        this.ws.send(frame)
+        this.ws.send(Buffer.from(frame.buffer, frame.byteOffset, frame.byteLength))
         await this.waitForDrain()
       } catch (err) {
         this.host.log(`send failed for ${this.device?.name ?? 'device'}: ${(err as Error).message}`)
