@@ -119,15 +119,22 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
 
   useEffect(() => {
     void (async () => {
-      const raw = await storage.get(PAIRING_KEY)
-      if (raw) {
-        try {
-          setPairing(JSON.parse(raw) as StoredPairing)
-        } catch {
-          await storage.remove(PAIRING_KEY)
+      try {
+        const raw = await storage.get(PAIRING_KEY)
+        if (raw) {
+          try {
+            setPairing(JSON.parse(raw) as StoredPairing)
+          } catch {
+            await storage.remove(PAIRING_KEY).catch(() => {})
+          }
         }
+      } catch (err) {
+        // Storage failed or hung: fall through to the Pair screen rather than
+        // leaving the app on the spinner forever.
+        console.error('[dorabot-remote] could not restore pairing', err)
+      } finally {
+        setReady(true)
       }
-      setReady(true)
     })()
   }, [])
 
@@ -140,7 +147,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     let client: RemoteClient | null = null
 
     void (async () => {
-      const cursorRaw = await storage.get(CURSOR_KEY)
+      const cursorRaw = await storage.get(CURSOR_KEY).catch(() => null)
       const cursor = cursorRaw ? Number(cursorRaw) : 0
       if (cancelled) return
 
@@ -330,8 +337,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       scopes: result.scopes,
       pairedAt: Date.now(),
     }
+    // Throws if the secure store fails or hangs; PairScreen shows that error.
     await storage.set(PAIRING_KEY, JSON.stringify(record))
-    await storage.remove(CURSOR_KEY)
+    await storage.remove(CURSOR_KEY).catch(() => {})
     setPairing(record)
   }, [])
 

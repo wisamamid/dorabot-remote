@@ -28,68 +28,112 @@ export const platformName = Capacitor.getPlatform()
 
 const SECRET_KEY = /\.(pairing|secret)\./
 
-let secureReady: Promise<(typeof import('@aparajita/capacitor-secure-storage'))['SecureStorage']> | null = null
+// Capacitor plugin objects are Proxies that answer *any* property, including
+// `then`. Returning one from an async function (or resolving a promise with it)
+// makes the runtime treat it as a thenable and call `plugin.then(...)`, which
+// Capacitor forwards to native as an unimplemented method: the promise then never
+// settles. That hung app startup on a spinner. Plugins are therefore only ever
+// passed around inside a plain wrapper object, never returned bare.
+type SecurePlugin = (typeof import('@aparajita/capacitor-secure-storage'))['SecureStorage']
+type PrefsPlugin = (typeof import('@capacitor/preferences'))['Preferences']
 
-function secureStorage() {
+let secureReady: Promise<{ plugin: SecurePlugin }> | null = null
+
+function secureStorage(): Promise<{ plugin: SecurePlugin }> {
   secureReady ??= (async () => {
     const { SecureStorage, KeychainAccess } = await import('@aparajita/capacitor-secure-storage')
     await SecureStorage.setKeyPrefix('dorabot-remote_')
     await SecureStorage.setSynchronize(false)
     await SecureStorage.setDefaultKeychainAccess(KeychainAccess.afterFirstUnlockThisDeviceOnly)
-    return SecureStorage
+    return { plugin: SecureStorage }
   })()
+  // A failed or hung init must not be cached forever.
+  secureReady.catch(() => {
+    secureReady = null
+  })
   return secureReady
 }
 
-async function prefs() {
+async function prefs(): Promise<{ plugin: PrefsPlugin }> {
   const { Preferences } = await import('@capacitor/preferences')
-  return Preferences
+  return { plugin: Preferences }
+}
+
+export const NATIVE_STORAGE_TIMEOUT_MS = 3000
+
+/** Rejects if a native storage call has not settled in time, so a hung plugin cannot block the UI. */
+function withTimeout<T>(label: string, work: () => Promise<T>, ms = NATIVE_STORAGE_TIMEOUT_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      secureReady = null
+      reject(new Error(`Secure storage did not respond (${label}). Restart the app and try again.`))
+    }, ms)
+    work().then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (e) => {
+        clearTimeout(timer)
+        reject(e)
+      },
+    )
+  })
 }
 
 export const storage = {
-  async get(key: string): Promise<string | null> {
-    if (!isNative) return localStorage.getItem(key)
-    if (!SECRET_KEY.test(key)) return ((await prefs()).get({ key })).then((r) => r.value ?? null)
+  get(key: string): Promise<string | null> {
+    if (!isNative) return Promise.resolve(localStorage.getItem(key))
+    return withTimeout(`get ${key}`, async () => {
+      if (!SECRET_KEY.test(key)) {
+        const { value } = await (await prefs()).plugin.get({ key })
+        return value ?? null
+      }
 
-    const secure = await secureStorage()
-    const stored = await secure.getItem(key)
-    if (stored !== null && stored !== undefined) return stored
+      const secure = (await secureStorage()).plugin
+      const stored = await secure.getItem(key)
+      if (stored !== null && stored !== undefined) return stored
 
-    // One-time migration from builds that kept secrets in Preferences
-    // (UserDefaults on iOS): copy into secure storage, then delete the old copy.
-    const p = await prefs()
-    const { value } = await p.get({ key })
-    if (value == null) return null
-    await secure.setItem(key, value)
-    await p.remove({ key })
-    return value
+      // One-time migration from builds that kept secrets in Preferences
+      // (UserDefaults on iOS): copy into secure storage, then delete the old copy.
+      const p = (await prefs()).plugin
+      const { value } = await p.get({ key })
+      if (value == null) return null
+      await secure.setItem(key, value)
+      await p.remove({ key })
+      return value
+    })
   },
-  async set(key: string, value: string): Promise<void> {
+  set(key: string, value: string): Promise<void> {
     if (!isNative) {
       localStorage.setItem(key, value)
-      return
+      return Promise.resolve()
     }
-    if (!SECRET_KEY.test(key)) {
-      await (await prefs()).set({ key, value })
-      return
-    }
-    await (await secureStorage()).setItem(key, value)
-    // Never leave a stale plaintext copy behind.
-    await (await prefs()).remove({ key })
+    return withTimeout(`set ${key}`, async () => {
+      if (!SECRET_KEY.test(key)) {
+        await (await prefs()).plugin.set({ key, value })
+        return
+      }
+      await (await secureStorage()).plugin.setItem(key, value)
+      // Never leave a stale plaintext copy behind.
+      await (await prefs()).plugin.remove({ key })
+    })
   },
-  async remove(key: string): Promise<void> {
+  remove(key: string): Promise<void> {
     if (!isNative) {
       localStorage.removeItem(key)
-      return
+      return Promise.resolve()
     }
-    if (SECRET_KEY.test(key)) {
-      try {
-        await (await secureStorage()).removeItem(key)
-      } catch {
-        // Nothing stored under that key.
+    return withTimeout(`remove ${key}`, async () => {
+      if (SECRET_KEY.test(key)) {
+        try {
+          await (await secureStorage()).plugin.removeItem(key)
+        } catch {
+          // Nothing stored under that key.
+        }
       }
-    }
-    await (await prefs()).remove({ key })
+      await (await prefs()).plugin.remove({ key })
+    })
   },
 }
 
