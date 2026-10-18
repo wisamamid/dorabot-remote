@@ -344,6 +344,17 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   }, [])
 
   const forget = useCallback(async () => {
+    // Tell the Mac to stop notifying this phone before the key is gone. Best effort:
+    // offline, or without the approvals scope, the Mac's token is dropped on revoke
+    // or by APNs once the app is deleted.
+    const live = clientRef.current
+    if (live && live.state === 'ready') {
+      await Promise.race([
+        live.rpc('remote.unregisterPush').catch(() => {}),
+        new Promise((r) => setTimeout(r, 3000)),
+      ])
+    }
+    await storage.remove('dorabot-remote.push.sent.v1').catch(() => {})
     clientRef.current?.disconnect()
     clientRef.current = null
     aggRef.current = new SessionAggregator()

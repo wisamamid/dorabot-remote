@@ -2,6 +2,7 @@ import { SCOPE_DESCRIPTIONS, SCOPE_LABELS, SCOPES, type Scope } from '@dorabot-r
 import { useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
 import { haptic, platformName } from '../lib/platform.js'
+import { usePush } from '../lib/push-context.js'
 import { Button, Card, Dot, Screen, cx } from './ui.js'
 
 /**
@@ -11,6 +12,7 @@ import { Button, Card, Dot, Screen, cx } from './ui.js'
  */
 export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
   const conn = useConnection()
+  const push = usePush()
   const [confirmForget, setConfirmForget] = useState(false)
   const [requesting, setRequesting] = useState<Scope | null>(null)
   const [note, setNote] = useState<string | null>(null)
@@ -69,6 +71,52 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
             />
           </Card>
         </section>
+
+        {push.supported && conn.hasScope('approvals') && (
+          <section className="space-y-2">
+            <h2 className="px-1 text-[13px] font-semibold uppercase tracking-wider text-ink-400">Notifications</h2>
+            <Card className="space-y-3 text-[13.5px]">
+              <Row
+                label="Status"
+                value={
+                  push.permission === 'granted'
+                    ? push.registered
+                      ? 'on'
+                      : 'on, connecting…'
+                    : push.permission === 'denied'
+                      ? 'off in iOS Settings'
+                      : 'not enabled'
+                }
+              />
+              {push.permission === 'prompt' && (
+                <Button variant="primary" onClick={() => void push.enable()} className="w-full">
+                  Enable notifications
+                </Button>
+              )}
+              {push.permission === 'denied' && (
+                <p className="text-[13px] leading-snug text-ink-400">
+                  Allow notifications for DoraBot Remote in the iOS Settings app.
+                </p>
+              )}
+              {push.permission === 'granted' && (
+                <label className="flex items-center justify-between gap-3 border-t border-ink-700 pt-3">
+                  <span className="text-[14px]">Notify when a run finishes</span>
+                  <input
+                    type="checkbox"
+                    className="size-5 accent-mint-500"
+                    checked={push.notifyOnResult}
+                    disabled={conn.state !== 'ready'}
+                    onChange={(e) => void push.setNotifyOnResult(e.target.checked).catch((err) => setNote((err as Error).message))}
+                  />
+                </label>
+              )}
+              <p className="text-[12.5px] leading-snug text-ink-500">
+                Notifications never include the question, tool or session. They are sent only when this phone is not
+                connected.
+              </p>
+            </Card>
+          </section>
+        )}
 
         <section className="space-y-2">
           <h2 className="px-1 text-[13px] font-semibold uppercase tracking-wider text-ink-400">Permissions</h2>
