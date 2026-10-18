@@ -46,6 +46,25 @@ describe('scope split', () => {
     }
   })
 
+  it('lists models read-only under sessions, and switching the model needs chat', () => {
+    for (const m of ['provider.detect', 'provider.get', 'provider.codex.models']) {
+      expect(isMethodAllowed(m, ['sessions']), m).toBe(true)
+      expect(isMethodAllowed(m, ['chat']), m).toBe(false)
+    }
+    for (const m of ['sessions.setModel', 'agent.setModel']) {
+      expect(isMethodAllowed(m, ['chat']), m).toBe(true)
+      expect(isMethodAllowed(m, ['sessions']), m).toBe(false)
+    }
+    for (const m of ['config.set', 'provider.set', 'provider.auth.apiKey', 'provider.auth.oauth', 'provider.codex.rpc', 'provider.codex.appServerSnapshot']) {
+      expect(isMethodAllowed(m, ['sessions', 'chat', 'approvals', 'work', 'files', 'git']), m).toBe(false)
+    }
+  })
+
+  it('renames sessions under the sessions scope', () => {
+    expect(isMethodAllowed('sessions.rename', ['sessions'])).toBe(true)
+    expect(isMethodAllowed('sessions.rename', ['chat'])).toBe(false)
+  })
+
   it('keeps files read-only and owns the file search methods', () => {
     expect(exact('files').every((m) => /^(fs\.(list|read|readBinary|stat)|search\.(files|ripgrep))$/.test(m))).toBe(true)
     expect(isMethodAllowed('search.files', ['chat'])).toBe(false)

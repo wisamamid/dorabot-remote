@@ -47,6 +47,19 @@
     height: 100%;
   }
 
+  /* Keyboard inset, set by initKeyboardInset(). The webview itself never
+     resizes (Keyboard resize: none), so the app shell gives up the space
+     instead and everything inside reflows above the keyboard. */
+  html {
+    --kb: 0px;
+  }
+
+  #root {
+    height: calc(100% - var(--kb));
+    overflow: hidden;
+    transition: height 0.25s ease-out;
+  }
+
   body {
     margin: 0;
     background: var(--color-ink-900);
@@ -102,6 +115,15 @@
 @layer utilities {
   .safe-bottom {
     padding-bottom: max(env(safe-area-inset-bottom), 12px);
+  }
+
+  /* The keyboard covers the home indicator, so its inset must not be counted twice. */
+  .kb-open .safe-bottom {
+    padding-bottom: 10px;
+  }
+
+  .kb-open .kb-hide {
+    display: none;
   }
 
   .tap {

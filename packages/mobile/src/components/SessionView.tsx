@@ -5,6 +5,8 @@ import { haptic, watchKeyboard } from '../lib/platform.js'
 import { PullToRefresh } from './PullToRefresh.js'
 import { ChatItemList, StatusLine } from './ChatItems.js'
 import { ApprovalCard, ElicitationCard, QuestionCard } from './Interrupts.js'
+import { ModelPicker } from './ModelPicker.js'
+import { useRename } from './RenameSheet.js'
 import { Button, Dot, Screen, cx } from './ui.js'
 
 /**
@@ -21,9 +23,11 @@ export function SessionView({
 }: {
   session: StoredSession | null
   sessionKey: string
-  onBack: () => void
+  /** Omitted in the iPad two-pane layout, where the list is already on screen. */
+  onBack?: () => void
 }): ReactNode {
   const conn = useConnection()
+  const rename = useRename()
   const state = conn.getSession(sessionKey)
   const scrollRef = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
@@ -45,6 +49,16 @@ export function SessionView({
     if (el && stick.current) el.scrollTop = el.scrollHeight
   }, [conn.revision, keyboard])
 
+  // The transcript shrinks as the keyboard animates in (see initKeyboardInset),
+  // so re-pin to the bottom once the animation has settled.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const el = scrollRef.current
+      if (el && stick.current) el.scrollTop = el.scrollHeight
+    }, 300)
+    return () => clearTimeout(t)
+  }, [keyboard])
+
   function onScroll(): void {
     const el = scrollRef.current
     if (!el) return
@@ -61,7 +75,7 @@ export function SessionView({
     setError(null)
     stick.current = true
     try {
-      await conn.rpc('chat.send', { prompt, sessionKey, chatId: session?.chatId })
+      await conn.rpc('chat.send', { prompt, sessionKey, chatId: session?.chatId, source: 'remote/mobile' })
       setDraft('')
       await haptic('light')
     } catch (err) {
@@ -92,14 +106,18 @@ export function SessionView({
       title={title}
       subtitle={<span className="font-mono text-[12.5px]">{session?.channel ?? sessionKey.split(':')[0]}</span>}
       onBack={onBack}
+      onTitleClick={session ? () => rename.open(session) : undefined}
       right={
-        busy ? (
-          <Button variant="ghost" onClick={() => void interrupt()} className="px-3 text-[14px] text-amber-glow">
-            Stop
-          </Button>
-        ) : (
-          <Dot tone={conn.state === 'ready' ? (conn.gatewayConnected ? 'good' : 'warn') : 'bad'} />
-        )
+        <div className="flex items-center gap-2">
+          <ModelPicker session={session} sessionKey={sessionKey} running={busy} />
+          {busy ? (
+            <Button variant="ghost" onClick={() => void interrupt()} className="px-3 text-[14px] text-amber-glow">
+              Stop
+            </Button>
+          ) : (
+            <Dot tone={conn.state === 'ready' ? (conn.gatewayConnected ? 'good' : 'warn') : 'bad'} />
+          )}
+        </div>
       }
     >
       <div className="flex h-full min-h-0 flex-col">
@@ -172,7 +190,6 @@ export function SessionView({
 
         <div
           className="safe-bottom shrink-0 border-t border-ink-700 bg-ink-900 px-3 pt-2.5"
-          style={{ paddingBottom: keyboard > 0 ? keyboard + 10 : undefined }}
         >
           <div className="flex items-end gap-2">
             <textarea

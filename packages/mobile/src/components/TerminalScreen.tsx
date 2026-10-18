@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
-import { haptic, watchKeyboard } from '../lib/platform.js'
+import { haptic } from '../lib/platform.js'
 import { Button, Card, Screen, Spinner, cx } from './ui.js'
 
 /**
@@ -120,10 +120,8 @@ function LiveTerminal(): ReactNode {
   const writeRef = useRef<(data: string) => void>(() => {})
   const [status, setStatus] = useState<'loading' | 'live' | 'error'>('loading')
   const [error, setError] = useState<string | null>(null)
-  const [keyboard, setKeyboard] = useState(0)
   const shellId = useRef(`t${Math.random().toString(36).slice(2, 9)}`)
 
-  useEffect(() => watchKeyboard(setKeyboard), [])
 
   useEffect(() => {
     let disposed = false
@@ -225,7 +223,6 @@ function LiveTerminal(): ReactNode {
 
       <div
         className="safe-bottom shrink-0 border-t border-ink-700 bg-ink-900"
-        style={{ paddingBottom: keyboard > 0 ? keyboard + 8 : undefined }}
       >
         <div className="scroll no-scrollbar flex gap-1.5 overflow-x-auto px-3 py-2">
           {KEYS.map((k) => (
