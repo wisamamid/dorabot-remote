@@ -5,6 +5,8 @@ import { haptic, watchKeyboard } from '../lib/platform.js'
 import { PullToRefresh } from './PullToRefresh.js'
 import { ChatItemList, StatusLine } from './ChatItems.js'
 import { ApprovalCard, ElicitationCard, QuestionCard } from './Interrupts.js'
+import { ModelPicker } from './ModelPicker.js'
+import { useRename } from './RenameSheet.js'
 import { Button, Dot, Screen, cx } from './ui.js'
 
 /**
@@ -21,9 +23,11 @@ export function SessionView({
 }: {
   session: StoredSession | null
   sessionKey: string
-  onBack: () => void
+  /** Omitted in the iPad two-pane layout, where the list is already on screen. */
+  onBack?: () => void
 }): ReactNode {
   const conn = useConnection()
+  const rename = useRename()
   const state = conn.getSession(sessionKey)
   const scrollRef = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
@@ -92,14 +96,18 @@ export function SessionView({
       title={title}
       subtitle={<span className="font-mono text-[12.5px]">{session?.channel ?? sessionKey.split(':')[0]}</span>}
       onBack={onBack}
+      onTitleClick={session ? () => rename.open(session) : undefined}
       right={
-        busy ? (
-          <Button variant="ghost" onClick={() => void interrupt()} className="px-3 text-[14px] text-amber-glow">
-            Stop
-          </Button>
-        ) : (
-          <Dot tone={conn.state === 'ready' ? (conn.gatewayConnected ? 'good' : 'warn') : 'bad'} />
-        )
+        <div className="flex items-center gap-2">
+          <ModelPicker session={session} sessionKey={sessionKey} running={busy} />
+          {busy ? (
+            <Button variant="ghost" onClick={() => void interrupt()} className="px-3 text-[14px] text-amber-glow">
+              Stop
+            </Button>
+          ) : (
+            <Dot tone={conn.state === 'ready' ? (conn.gatewayConnected ? 'good' : 'warn') : 'bad'} />
+          )}
+        </div>
       }
     >
       <div className="flex h-full min-h-0 flex-col">

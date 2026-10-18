@@ -18,12 +18,15 @@ export function Screen({
   right,
   children,
   onBack,
+  onTitleClick,
 }: {
   title: string
   subtitle?: ReactNode
   right?: ReactNode
   children: ReactNode
   onBack?: () => void
+  /** Makes the title tappable (rename). */
+  onTitleClick?: () => void
 }): ReactNode {
   const screen = (
     <div className="flex h-full min-h-0 flex-col">
@@ -36,7 +39,13 @@ export function Screen({
           </button>
         )}
         <div className="min-w-0 flex-1">
-          <h1 className="truncate text-[17px] font-semibold tracking-[-0.01em]">{title}</h1>
+          {onTitleClick ? (
+            <button onClick={onTitleClick} aria-label={`Rename ${title}`} className="block max-w-full text-left">
+              <h1 className="truncate text-[17px] font-semibold tracking-[-0.01em]">{title}</h1>
+            </button>
+          ) : (
+            <h1 className="truncate text-[17px] font-semibold tracking-[-0.01em]">{title}</h1>
+          )}
           {subtitle && <div className="truncate text-[13px] text-ink-300">{subtitle}</div>}
         </div>
         {right}

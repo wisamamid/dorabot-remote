@@ -36,6 +36,8 @@ import {
   type ReactNode,
 } from 'react'
 import { applySessionEvent, sortSessions } from './sessions-sync.js'
+import { renameSession as renameSessionLogic } from './rename.js'
+import { switchModel } from './models.js'
 import { haptic, onAppBackground, onAppResume, onNetworkChange, storage } from './platform.js'
 
 const PAIRING_KEY = 'dorabot-remote.pairing.v1'
@@ -79,6 +81,10 @@ interface ConnectionValue {
   can: (method: string) => boolean
   hasScope: (scope: Scope) => boolean
   refreshSessions: () => Promise<void>
+  /** Optimistic rename by stored session id; rolls back and throws if the gateway refuses. */
+  renameSession: (sessionId: string, name: string) => Promise<void>
+  /** Optimistic per-session model switch; rolls back and throws on failure. */
+  setSessionModel: (target: { sessionId: string; sessionKey: string; running: boolean }, model: string) => Promise<{ live: boolean }>
   openSession: (sessionKey: string, sessionId?: string) => Promise<void>
   /** Reload one session's transcript from the gateway (pull to refresh). */
   /** Winning transport while connected, for the status banner. */
@@ -472,6 +478,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       can: (method) => clientRef.current?.can(method) ?? false,
       hasScope: (scope) => (device?.scopes ?? pairing?.scopes ?? []).includes(scope),
       refreshSessions: refreshSessionsInternal,
+      renameSession: (id, name) => renameSessionLogic({ rpc, setSessions }, id, name),
+      setSessionModel: (t, m) => switchModel({ rpc, setSessions }, t, m),
       openSession: (k, id) => openSession(k, id),
       reloadHistory: (k, id) => openSession(k, id, true),
       getHistoryInfo: (key) => historyInfo.current.get(key) ?? null,

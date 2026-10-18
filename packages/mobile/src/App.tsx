@@ -1,5 +1,6 @@
 import type { StoredSession } from '@dorabot-remote/protocol'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { keyOf } from './lib/connection.js'
 import { CodeScreen } from './components/CodeScreen.js'
 import { InboxScreen } from './components/InboxScreen.js'
 import { MoreScreen } from './components/MoreScreen.js'
@@ -8,7 +9,9 @@ import { PairScreen } from './components/PairScreen.js'
 import { SessionList } from './components/SessionList.js'
 import { SessionView } from './components/SessionView.js'
 import { PushPrompt } from './components/PushPrompt.js'
+import { RenameProvider } from './components/RenameSheet.js'
 import { Button, Spinner, cx } from './components/ui.js'
+import { useSplit } from './lib/layout.js'
 import { ConnectionProvider, useConnection } from './lib/connection.js'
 import { InboxProvider, useInbox } from './lib/inbox-context.js'
 import { bannerFor } from './lib/status-banner.js'
@@ -28,7 +31,9 @@ export default function App(): ReactNode {
     <ConnectionProvider>
       <PushProvider>
         <InboxProvider>
-          <Shell />
+          <RenameProvider>
+            <Shell />
+          </RenameProvider>
         </InboxProvider>
       </PushProvider>
     </ConnectionProvider>
@@ -57,6 +62,7 @@ function Shell(): ReactNode {
   // A tapped notification carries only a routing id; wait for the matching inbox item.
   const [pendingRid, setPendingRid] = useState<string | null>(null)
   const paired = Boolean(conn.pairing)
+  const split = useSplit()
 
   useEffect(() => {
     if (!paired) return
@@ -81,6 +87,11 @@ function Shell(): ReactNode {
     setOpen({ session: s ?? null, sessionKey: item.sessionKey })
   }, [pendingRid, inbox.items, conn.sessions])
 
+  // Entering the two-pane layout with a conversation open: show it where it lives.
+  useEffect(() => {
+    if (split && open) setTab('sessions')
+  }, [split, open])
+
   if (!conn.ready) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -91,12 +102,55 @@ function Shell(): ReactNode {
 
   if (!conn.pairing) return <PairScreen />
 
-  const openSession = (session: StoredSession | null, sessionKey: string): void => setOpen({ session, sessionKey })
+  const openSession = (session: StoredSession | null, sessionKey: string): void => {
+    setOpen({ session, sessionKey })
+    if (split) setTab('sessions')
+  }
+
+  // The open row can be stale after a rename; always show the live one.
+  const liveSession = open
+    ? (conn.sessions.find((s) => (open.session && s.id === open.session.id) || keyOf(s) === open.sessionKey) ?? open.session)
+    : null
 
   // Tabs stay mounted so a half-typed commit message or a scroll position
   // survives a switch; only the active one is visible.
-  const pane = (name: TabName, node: ReactNode): ReactNode => (
-    <div className={cx('absolute inset-0', tab !== name && 'hidden')}>{node}</div>
+  const pane = (name: TabName, node: ReactNode, wide = false): ReactNode => (
+    <div className={cx('absolute inset-0', tab !== name && 'hidden')}>
+      {split && !wide ? <div className="mx-auto h-full max-w-3xl">{node}</div> : node}
+    </div>
+  )
+
+  const tabs = (rail: boolean): ReactNode => (
+    <>
+      <Tab rail={rail} active={tab === 'sessions'} onClick={() => setTab('sessions')} label="Sessions" icon={icon.sessions} />
+      <Tab rail={rail} active={tab === 'inbox'} onClick={() => setTab('inbox')} badge={inbox.count} label="Inbox" icon={icon.inbox} />
+      <Tab rail={rail} active={tab === 'work'} onClick={() => setTab('work')} locked={!conn.hasScope('work')} label="Work" icon={icon.work} />
+      <Tab rail={rail} active={tab === 'code'} onClick={() => setTab('code')} locked={!conn.hasScope('files') && !conn.hasScope('git')} label="Code" icon={icon.code} />
+      <Tab rail={rail} active={tab === 'more'} onClick={() => setTab('more')} label="More" icon={icon.more} />
+    </>
+  )
+
+  const sessionsPane = split ? (
+    <div className="flex h-full min-h-0">
+      <div className="h-full w-[340px] shrink-0 border-r border-ink-700 lg:w-[360px]">
+        <SessionList onOpen={openSession} onSettings={() => setTab('more')} selectedKey={open?.sessionKey} />
+      </div>
+      <div className="h-full min-w-0 flex-1 bg-ink-900">
+        {open ? (
+          <SessionView key={open.sessionKey} session={liveSession} sessionKey={open.sessionKey} />
+        ) : (
+          <div className="flex h-full flex-col items-center justify-center gap-2 px-8 text-center">
+            <svg viewBox="0 0 24 24" className="size-10 text-ink-500" fill="none" stroke="currentColor" strokeWidth="1.4">
+              {icon.sessions}
+            </svg>
+            <p className="text-[17px] font-medium text-ink-200">Select a session</p>
+            <p className="text-[14px] text-ink-400">Pick a conversation from the list.</p>
+          </div>
+        )}
+      </div>
+    </div>
+  ) : (
+    <SessionList onOpen={openSession} onSettings={() => setTab('more')} />
   )
 
   return (
@@ -112,30 +166,31 @@ function Shell(): ReactNode {
         </div>
       )}
       <StatusBanner />
-      {!open && (tab === 'sessions' || tab === 'inbox') && <PushPrompt />}
-      <div className="relative min-h-0 flex-1">
-        {pane('sessions', <SessionList onOpen={openSession} onSettings={() => setTab('more')} />)}
-        {pane('inbox', <InboxScreen onOpenSession={openSession} />)}
-        {pane('work', <WorkScreen onOpenSession={openSession} />)}
-        {pane('code', <CodeScreen />)}
-        {pane('more', <MoreScreen />)}
-        {open && (
-          <div className="absolute inset-0 z-30 bg-ink-900">
-            <SessionView session={open.session} sessionKey={open.sessionKey} onBack={() => setOpen(null)} />
-          </div>
+      {!(open && !split) && (tab === 'sessions' || tab === 'inbox') && <PushPrompt />}
+      <div className="flex min-h-0 flex-1">
+        {split && (
+          <nav className="safe-bottom flex w-[84px] shrink-0 flex-col gap-1 border-r border-ink-700 bg-ink-900 px-1.5 pt-3">
+            {tabs(true)}
+          </nav>
         )}
+        <div className="relative min-h-0 min-w-0 flex-1">
+          {pane('sessions', sessionsPane, true)}
+          {pane('inbox', <InboxScreen onOpenSession={openSession} />)}
+          {pane('work', <WorkScreen onOpenSession={openSession} />)}
+          {pane('code', <CodeScreen />, true)}
+          {pane('more', <MoreScreen />)}
+          {open && !split && (
+            <div className="absolute inset-0 z-30 bg-ink-900">
+              <SessionView key={open.sessionKey} session={liveSession} sessionKey={open.sessionKey} onBack={() => setOpen(null)} />
+            </div>
+          )}
+        </div>
       </div>
 
       {/* The tab bar disappears inside a conversation so the composer owns the
           bottom of the screen, which is where a thumb already is. */}
-      {!open && (
-        <nav className="safe-bottom flex shrink-0 border-t border-ink-700 bg-ink-900 px-1 pt-1.5">
-          <Tab active={tab === 'sessions'} onClick={() => setTab('sessions')} label="Sessions" icon={icon.sessions} />
-          <Tab active={tab === 'inbox'} onClick={() => setTab('inbox')} badge={inbox.count} label="Inbox" icon={icon.inbox} />
-          <Tab active={tab === 'work'} onClick={() => setTab('work')} locked={!conn.hasScope('work')} label="Work" icon={icon.work} />
-          <Tab active={tab === 'code'} onClick={() => setTab('code')} locked={!conn.hasScope('files') && !conn.hasScope('git')} label="Code" icon={icon.code} />
-          <Tab active={tab === 'more'} onClick={() => setTab('more')} label="More" icon={icon.more} />
-        </nav>
+      {!split && !open && (
+        <nav className="safe-bottom flex shrink-0 border-t border-ink-700 bg-ink-900 px-1 pt-1.5">{tabs(false)}</nav>
       )}
     </div>
   )
@@ -194,6 +249,7 @@ function Tab({
   icon,
   badge,
   locked,
+  rail,
 }: {
   active: boolean
   onClick: () => void
@@ -201,13 +257,17 @@ function Tab({
   icon: ReactNode
   badge?: number
   locked?: boolean
+  /** Vertical sidebar item (iPad) instead of a bottom-bar item. */
+  rail?: boolean
 }): ReactNode {
   return (
     <button
       onClick={onClick}
       className={cx(
-        'relative flex flex-1 flex-col items-center gap-0.5 rounded-lg py-1.5 transition-colors',
+        'relative flex flex-col items-center gap-0.5 rounded-lg py-1.5 transition-colors',
+        rail ? 'w-full py-2.5 hover:bg-ink-800' : 'flex-1',
         active ? 'text-mint-500' : 'text-ink-400',
+        rail && active && 'bg-ink-800',
       )}
     >
       <span className="relative">

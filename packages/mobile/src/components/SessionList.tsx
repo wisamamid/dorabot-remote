@@ -3,6 +3,8 @@ import { useState, type ReactNode } from 'react'
 import { keyOf, useConnection } from '../lib/connection.js'
 import { haptic } from '../lib/platform.js'
 import { PullToRefresh } from './PullToRefresh.js'
+import { useRename } from './RenameSheet.js'
+import { SwipeRow } from './SwipeRow.js'
 import { Button, Card, Dot, Empty, Screen, Spinner, cx, timeAgo } from './ui.js'
 
 /**
@@ -12,11 +14,15 @@ import { Button, Card, Dot, Empty, Screen, Spinner, cx, timeAgo } from './ui.js'
 export function SessionList({
   onOpen,
   onSettings,
+  selectedKey,
 }: {
   onOpen: (session: StoredSession | null, sessionKey: string) => void
   onSettings: () => void
+  /** Highlighted row in the iPad two-pane layout. */
+  selectedKey?: string | null
 }): ReactNode {
   const conn = useConnection()
+  const rename = useRename()
   const [composing, setComposing] = useState(false)
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
@@ -112,15 +118,24 @@ export function SessionList({
               {rows.map(({ session, key }) => {
                 const attn = waiting.get(key)
                 return (
-                  <button
+                  <SwipeRow
                     key={key}
+                    actionLabel="Rename"
+                    onAction={() => rename.open(session)}
+                    onLongPress={() => {
+                      void haptic('medium')
+                      rename.open(session)
+                    }}
+                  >
+                  <button
                     onClick={() => {
                       void haptic('light')
                       onOpen(session, key)
                     }}
                     className={cx(
                       'w-full rounded-card border px-3.5 py-3 text-left transition-colors active:bg-ink-800',
-                      attn ? 'border-amber-glow/40 bg-amber-dim' : 'border-ink-700 bg-ink-850',
+                      attn ? 'border-amber-glow/40 bg-amber-dim' : 'border-ink-700 bg-ink-850 hover:bg-ink-800',
+                      key === selectedKey && !attn && 'border-mint-500/50 bg-ink-800',
                     )}
                   >
                     <div className="flex items-center gap-2">
@@ -151,6 +166,7 @@ export function SessionList({
                       <span>{session.messageCount} messages</span>
                     </div>
                   </button>
+                  </SwipeRow>
                 )
               })}
             </div>

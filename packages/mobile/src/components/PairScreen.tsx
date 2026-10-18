@@ -80,7 +80,8 @@ export function PairScreen(): ReactNode {
   }
 
   return (
-    <div className="scroll flex h-full flex-col justify-center gap-7 px-6 py-10">
+    <div className="scroll h-full">
+    <div className="mx-auto flex min-h-full w-full max-w-md flex-col justify-center gap-7 px-6 py-10">
       <div className="space-y-2">
         <div className="mb-5 flex size-12 items-center justify-center rounded-2xl bg-mint-900 text-mint-500">
           <svg viewBox="0 0 24 24" className="size-6" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -152,6 +153,7 @@ export function PairScreen(): ReactNode {
       <p className="text-center text-[13px] leading-relaxed text-ink-500">
         Your phone talks straight to your Mac on your network. Away from home it goes through a relay that only ever sees encrypted data.
       </p>
+    </div>
     </div>
   )
 }
