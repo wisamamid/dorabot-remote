@@ -1,5 +1,6 @@
 import { generateSigningKey, isMethodAllowed, relayIdFromPublicKey, verifyForRelayId } from '@dorabot-remote/protocol'
 import { describe, expect, it } from 'vitest'
+import { Bridge } from './bridge.js'
 import { PushNotifier, relayHttpBase } from './push.js'
 import { Store } from './store.js'
 
@@ -33,7 +34,7 @@ function setup(opts: { relay?: boolean; status?: number } = {}) {
   const fire = async (name: string, data: Record<string, unknown>) => {
     await Promise.all(n.onGatewayEvent(name, data))
   }
-  return { store, connected, calls, logs, n, device, fire, tick: (ms: number) => (t += ms) }
+  return { staleId: '', store, connected, calls, logs, n, device, fire, tick: (ms: number) => (t += ms) }
 }
 const bodyOf = (c: { body: Uint8Array }) => JSON.parse(new TextDecoder().decode(c.body))
 
@@ -175,5 +176,65 @@ describe('store migration', () => {
     expect(s.store.getDevice(d.id)).toMatchObject({ pushEnv: 'sandbox', pushOnResult: false })
     s.store.deleteDevice(d.id)
     expect(s.store.getDevice(d.id)).toBeNull()
+  })
+})
+
+describe('liveness and idle sweep', () => {
+  function fakeBridge() {
+    const b = new Bridge({ paths: { db: ':memory:' } as never, settings: {} as never })
+    const closed: string[] = []
+    const mk = (deviceId: string, lastInboundAt: number) => ({
+      device: { id: deviceId, name: deviceId },
+      isAuthed: true,
+      lastInboundAt,
+      close: (r: string) => closed.push(`${deviceId}:${r}`),
+    })
+    const conns = (b as unknown as { connections: Set<unknown> }).connections
+    return { b, conns, mk, closed }
+  }
+
+  it('a recently active connection is live; a silent one is not (so push fires)', () => {
+    const { b, conns, mk } = fakeBridge()
+    const now = 10_000_000
+    conns.add(mk('fresh', now - 20_000))
+    conns.add(mk('stale', now - 60_000))
+    expect(b.isDeviceLive('fresh', now)).toBe(true)
+    expect(b.isDeviceLive('stale', now)).toBe(false)
+    expect(b.isDeviceLive('none', now)).toBe(false)
+    b.store.close()
+  })
+
+  it('PushNotifier pushes to a stale device and not to a fresh one', async () => {
+    const { b, conns, mk } = fakeBridge()
+    const now = 10_000_000
+    conns.add(mk('stale', now - 60_000))
+    conns.add(mk('fresh', now - 5_000))
+    const s = setup()
+    const n = new PushNotifier({
+      store: s.store,
+      relay: { url: 'wss://relay.test', id: relayId },
+      signingKey: key,
+      isConnected: (id) => b.isDeviceLive(id === s.staleId ? 'stale' : 'fresh', now),
+      log: () => {},
+      now: () => now,
+      fetch: (async (u: string, init: RequestInit) => {
+        s.calls.push({ url: u, headers: init.headers as Record<string, string>, body: init.body as Uint8Array })
+        return new Response('{}')
+      }) as unknown as typeof fetch,
+    })
+    s.staleId = s.device().id
+    await Promise.all(n.onGatewayEvent('agent.ask_user', { requestId: 'q1' }))
+    expect(s.calls).toHaveLength(1)
+    b.store.close()
+  })
+
+  it('sweepIdle closes connections silent for 90s and keeps others', () => {
+    const { b, conns, mk, closed } = fakeBridge()
+    const now = 10_000_000
+    conns.add(mk('dead', now - 95_000))
+    conns.add(mk('ok', now - 80_000))
+    expect(b.sweepIdle(now)).toBe(1)
+    expect(closed).toEqual(['dead:idle'])
+    b.store.close()
   })
 })

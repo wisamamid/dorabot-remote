@@ -194,6 +194,29 @@ describe('half-open detection', () => {
   })
 })
 
+describe('background / foreground cycle', () => {
+  it('disconnect on background closes the socket; connect on resume reconnects without error state', async () => {
+    const host = new FakeHost()
+    const states: string[] = []
+    const c = make(host, { onState: (st) => states.push(st) })
+    c.connect()
+    await settle()
+    expect(c.state).toBe('ready')
+    c.disconnect() // app backgrounded
+    expect(host.sockets[0]!.closed).toBe(true)
+    expect(c.state).toBe('disconnected')
+    // checkAlive alone would be a no-op after an intentional stop; resume uses connect()
+    c.checkAlive()
+    expect(host.sockets.length).toBe(1)
+    c.connect() // app active
+    await settle(50)
+    expect(host.sockets.length).toBe(2)
+    expect(c.state).toBe('ready')
+    expect(states).not.toContain('revoked')
+    c.disconnect()
+  })
+})
+
 describe('connect races', () => {
   it('connect() during a race or when ready is a no-op and cancels pending backoff', async () => {
     const host = new FakeHost()

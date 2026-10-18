@@ -82,6 +82,8 @@ export class DeviceConnection {
     return this.authed && !this.closed
   }
   private closed = false
+  /** Last time any frame arrived from the phone. A suspended app stops sending, even if the socket stays open. */
+  lastInboundAt = Date.now()
   /** Session keys this device asked to follow. */
   subscriptions = new Set<string>()
   /** Shells this device spawned. The only ones it will ever see output from. */
@@ -108,6 +110,7 @@ export class DeviceConnection {
     }, 10_000)
 
     ws.on('message', (raw: Buffer, isBinary: boolean) => {
+      this.lastInboundAt = Date.now()
       void this.onMessage(raw, isBinary)
     })
     ws.on('close', () => this.cleanup())

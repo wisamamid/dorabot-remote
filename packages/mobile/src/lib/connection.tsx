@@ -35,7 +35,7 @@ import {
   useState,
   type ReactNode,
 } from 'react'
-import { haptic, onAppResume, storage } from './platform.js'
+import { haptic, onAppBackground, onAppResume, storage } from './platform.js'
 
 const PAIRING_KEY = 'dorabot-remote.pairing.v1'
 const CURSOR_KEY = 'dorabot-remote.cursor.v1'
@@ -193,10 +193,29 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
 
   // Coming back from the background: nudge a resync rather than waiting for the
   // next backoff tick.
+  // Going to the background: close cleanly so the Mac knows at once that this phone
+  // is not looking (and can push instead). iOS would otherwise suspend the app with
+  // the socket still open on the Mac's side.
+  const backgrounded = useRef(false)
+  useEffect(() => {
+    return onAppBackground(() => {
+      const c = clientRef.current
+      if (!c || c.state === 'revoked') return
+      backgrounded.current = true
+      c.disconnect()
+    })
+  }, [])
+
   useEffect(() => {
     return onAppResume(() => {
       const c = clientRef.current
       if (!c) return
+      if (backgrounded.current) {
+        // Intentional disconnect: reconnect straight away, skipping any backoff.
+        backgrounded.current = false
+        c.connect()
+        return
+      }
       // Probe the socket: after a long sleep it is usually half-open, and a
       // reconnect is forced at once if nothing answers. Not ready? Skip backoff.
       c.checkAlive(3000)

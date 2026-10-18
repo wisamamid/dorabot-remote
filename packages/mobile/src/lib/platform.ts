@@ -246,6 +246,26 @@ export function onAppResume(handler: () => void): () => void {
   return () => cleanup?.()
 }
 
+/** Fired when the app goes to the background (iOS then suspends it, freezing its sockets). */
+export function onAppBackground(handler: () => void): () => void {
+  if (!isNative) {
+    const vis = (): void => {
+      if (document.visibilityState === 'hidden') handler()
+    }
+    document.addEventListener('visibilitychange', vis)
+    return () => document.removeEventListener('visibilitychange', vis)
+  }
+  let cleanup: (() => void) | null = null
+  void (async () => {
+    const { App } = await import('@capacitor/app')
+    const sub = await App.addListener('appStateChange', ({ isActive }) => {
+      if (!isActive) handler()
+    })
+    cleanup = () => void sub.remove()
+  })()
+  return () => cleanup?.()
+}
+
 /**
  * Pairing links opened from outside the app.
  *

@@ -48,6 +48,11 @@ import { GatewayClient } from './gateway-client.js'
 import { applyEventToSnapshots } from './snapshot-state.js'
 import { Store, type DeviceRecord } from './store.js'
 
+/** Push treats a device as connected only if it sent a frame this recently. */
+export const LIVE_WINDOW_MS = 45_000
+/** Connections silent this long are closed. */
+export const IDLE_CLOSE_MS = 90_000
+const IDLE_SWEEP_MS = 15_000
 const GATEWAY_CURSOR_KEY = 'gateway.lastSeqBySession'
 
 export interface BridgeOptions {
@@ -73,6 +78,7 @@ export class Bridge implements ConnectionHost {
   private gatewayCursor: Record<string, number> = {}
   private pruneTimer: NodeJS.Timeout | null = null
   private deviceTimer: NodeJS.Timeout | null = null
+  private idleTimer: NodeJS.Timeout | null = null
   private relay: RelayClient | null = null
   private relayInfo: RelayInfo | null = null
   private pusher: PushNotifier | null = null
@@ -108,7 +114,7 @@ export class Bridge implements ConnectionHost {
         store: this.store,
         relay: { url: this.relayInfo.u, id: this.relayInfo.i },
         signingKey: key,
-        isConnected: (id) => [...this.connections].some((c) => c.device?.id === id && c.isAuthed),
+        isConnected: (id) => this.isDeviceLive(id),
         log: (m) => this.log(m),
       })
       this.relay = new RelayClient({
@@ -149,6 +155,8 @@ export class Bridge implements ConnectionHost {
       for (const c of [...this.connections]) c.recheckDevice()
     }, 5000)
 
+    this.idleTimer = setInterval(() => this.sweepIdle(), IDLE_SWEEP_MS)
+
     this.pruneTimer = setInterval(
       () => {
         this.store.purgeExpiredPairings()
@@ -162,6 +170,7 @@ export class Bridge implements ConnectionHost {
   async stop(): Promise<void> {
     if (this.pruneTimer) clearInterval(this.pruneTimer)
     if (this.deviceTimer) clearInterval(this.deviceTimer)
+    if (this.idleTimer) clearInterval(this.idleTimer)
     for (const c of this.connections) c.close('bridge shutting down')
     this.relay?.stop()
     this.gateway?.stop()
@@ -172,6 +181,27 @@ export class Bridge implements ConnectionHost {
       this.http.closeAllConnections?.()
     })
     this.store.close()
+  }
+
+  /**
+   * A phone counts as connected only if it has spoken recently. iOS suspends a
+   * backgrounded app but its socket often stays open for a long time; the phone
+   * pings every 20s while running, so silence means it is not looking.
+   */
+  isDeviceLive(deviceId: string, now = Date.now()): boolean {
+    return [...this.connections].some((c) => c.device?.id === deviceId && c.isAuthed && now - c.lastInboundAt < LIVE_WINDOW_MS)
+  }
+
+  /** Drop connections that have been silent too long so dead sockets do not pile up. */
+  sweepIdle(now = Date.now()): number {
+    let closed = 0
+    for (const c of [...this.connections]) {
+      if (now - c.lastInboundAt < IDLE_CLOSE_MS) continue
+      this.log(`closing idle connection${c.device ? ` for "${c.device.name}"` : ''} (no traffic for ${Math.round((now - c.lastInboundAt) / 1000)}s)`)
+      c.close('idle')
+      closed++
+    }
+    return closed
   }
 
   private listen(): Promise<void> {
