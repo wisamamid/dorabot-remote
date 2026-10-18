@@ -150,7 +150,7 @@ export function PairScreen(): ReactNode {
       </div>
 
       <p className="text-center text-[13px] leading-relaxed text-ink-500">
-        Your phone talks straight to your Mac over your network or Tailnet. Nothing goes through a server.
+        Your phone talks straight to your Mac on your network. Away from home it goes through a relay that only ever sees encrypted data.
       </p>
     </div>
   )
