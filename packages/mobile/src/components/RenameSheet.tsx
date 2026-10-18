@@ -1,4 +1,5 @@
 import type { StoredSession } from '@dorabot-remote/protocol'
+import { createPortal } from 'react-dom'
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
 import { haptic } from '../lib/platform.js'
@@ -92,7 +93,7 @@ function RenameSheet({
   const name = normalizeName(value)
   const canSave = allowed && !offline && name !== null && name !== initial.trim()
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/55 md:items-center" onClick={onCancel}>
       <form
         role="dialog"
@@ -130,6 +131,7 @@ function RenameSheet({
           </Button>
         </div>
       </form>
-    </div>
+    </div>,
+    document.body,
   )
 }
