@@ -190,7 +190,7 @@ function Shell(): ReactNode {
       {/* The tab bar disappears inside a conversation so the composer owns the
           bottom of the screen, which is where a thumb already is. */}
       {!split && !open && (
-        <nav className="safe-bottom flex shrink-0 border-t border-ink-700 bg-ink-900 px-1 pt-1.5">{tabs(false)}</nav>
+        <nav className="kb-hide safe-bottom flex shrink-0 border-t border-ink-700 bg-ink-900 px-1 pt-1.5">{tabs(false)}</nav>
       )}
     </div>
   )

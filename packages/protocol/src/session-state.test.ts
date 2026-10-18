@@ -23,6 +23,18 @@ describe('seq de-duplication', () => {
   })
 })
 
+describe('agent.user_message source', () => {
+  it('renders each user message once, whatever its source', () => {
+    const agg = new SessionAggregator()
+    // the phone adds no optimistic item, so its own echo is the only copy
+    agg.apply('agent.user_message', { sessionKey: 's', prompt: 'from phone', source: 'remote/mobile' }, 1, 's')
+    agg.apply('agent.user_message', { sessionKey: 's', prompt: 'from desktop', source: 'desktop/chat' }, 2, 's')
+    // a replayed echo (same seq) must not duplicate
+    agg.apply('agent.user_message', { sessionKey: 's', prompt: 'from phone', source: 'remote/mobile' }, 1, 's')
+    expect(agg.get('s').chatItems.map((i) => (i as { content: string }).content)).toEqual(['from phone', 'from desktop'])
+  })
+})
+
 describe('mergeHistory', () => {
   it('does not duplicate live items already contained in history', () => {
     const history = [user('q'), text('a'), user('q2'), text('a2')]

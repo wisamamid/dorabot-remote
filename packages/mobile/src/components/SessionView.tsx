@@ -49,6 +49,16 @@ export function SessionView({
     if (el && stick.current) el.scrollTop = el.scrollHeight
   }, [conn.revision, keyboard])
 
+  // The transcript shrinks as the keyboard animates in (see initKeyboardInset),
+  // so re-pin to the bottom once the animation has settled.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const el = scrollRef.current
+      if (el && stick.current) el.scrollTop = el.scrollHeight
+    }, 300)
+    return () => clearTimeout(t)
+  }, [keyboard])
+
   function onScroll(): void {
     const el = scrollRef.current
     if (!el) return
@@ -65,7 +75,7 @@ export function SessionView({
     setError(null)
     stick.current = true
     try {
-      await conn.rpc('chat.send', { prompt, sessionKey, chatId: session?.chatId })
+      await conn.rpc('chat.send', { prompt, sessionKey, chatId: session?.chatId, source: 'remote/mobile' })
       setDraft('')
       await haptic('light')
     } catch (err) {
@@ -180,7 +190,6 @@ export function SessionView({
 
         <div
           className="safe-bottom shrink-0 border-t border-ink-700 bg-ink-900 px-3 pt-2.5"
-          style={{ paddingBottom: keyboard > 0 ? keyboard + 10 : undefined }}
         >
           <div className="flex items-end gap-2">
             <textarea
