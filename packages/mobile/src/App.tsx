@@ -129,7 +129,7 @@ function Shell(): ReactNode {
       {/* The tab bar disappears inside a conversation so the composer owns the
           bottom of the screen, which is where a thumb already is. */}
       {!open && (
-        <nav className="safe-bottom flex shrink-0 border-t border-ink-700 bg-ink-900 px-1 pt-1.5">
+        <nav className="kb-hide safe-bottom flex shrink-0 border-t border-ink-700 bg-ink-900 px-1 pt-1.5">
           <Tab active={tab === 'sessions'} onClick={() => setTab('sessions')} label="Sessions" icon={icon.sessions} />
           <Tab active={tab === 'inbox'} onClick={() => setTab('inbox')} badge={inbox.count} label="Inbox" icon={icon.inbox} />
           <Tab active={tab === 'work'} onClick={() => setTab('work')} locked={!conn.hasScope('work')} label="Work" icon={icon.work} />

@@ -227,6 +227,32 @@ export function watchKeyboard(onChange: (height: number) => void): () => void {
   }
 }
 
+/**
+ * Reserve the keyboard's height on the app shell (#root) through --kb so every
+ * screen, including ones with plain text inputs, ends above the keyboard. Also
+ * scrolls a focused field into view inside its scroll container, since the
+ * webview itself never scrolls.
+ */
+export function initKeyboardInset(): () => void {
+  const root = document.documentElement
+  const stop = watchKeyboard((height) => {
+    root.style.setProperty('--kb', `${Math.round(height)}px`)
+    root.classList.toggle('kb-open', height > 0)
+    // iOS can nudge the page itself to reveal a focused field; the shell already made room.
+    window.scrollTo(0, 0)
+  })
+  const onFocus = (e: FocusEvent): void => {
+    const el = e.target
+    if (!(el instanceof HTMLElement) || !el.matches('input, textarea, [contenteditable="true"]')) return
+    setTimeout(() => el.scrollIntoView({ block: 'nearest', behavior: 'smooth' }), 320)
+  }
+  document.addEventListener('focusin', onFocus)
+  return () => {
+    stop()
+    document.removeEventListener('focusin', onFocus)
+  }
+}
+
 /** Fired when the app returns to the foreground, so we can resync immediately. */
 export function onAppResume(handler: () => void): () => void {
   if (!isNative) {
