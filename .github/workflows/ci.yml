@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   check:
@@ -17,6 +18,8 @@ jobs:
       - run: npm ci
       - name: Build every workspace
         run: npm run build
+      - name: Typecheck every workspace
+        run: npm run typecheck
       - name: Test every workspace
         run: npm test
 
