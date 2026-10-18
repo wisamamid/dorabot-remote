@@ -35,6 +35,7 @@ import {
   useState,
   type ReactNode,
 } from 'react'
+import { applySessionEvent, sortSessions } from './sessions-sync.js'
 import { haptic, onAppBackground, onAppResume, storage } from './platform.js'
 
 const PAIRING_KEY = 'dorabot-remote.pairing.v1'
@@ -79,6 +80,8 @@ interface ConnectionValue {
   hasScope: (scope: Scope) => boolean
   refreshSessions: () => Promise<void>
   openSession: (sessionKey: string, sessionId?: string) => Promise<void>
+  /** Reload one session's transcript from the gateway (pull to refresh). */
+  reloadHistory: (sessionKey: string, sessionId?: string) => Promise<void>
   getSession: (sessionKey: string) => SessionState
   /** Set when the bridge returned only the newest part of a long history. */
   getHistoryInfo: (sessionKey: string) => { shown: number; total: number } | null
@@ -224,6 +227,32 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  const sessionsRef = useRef<StoredSession[]>([])
+  useEffect(() => {
+    sessionsRef.current = sessions
+  }, [sessions])
+
+  // Coalesce bursts of list events into one refetch.
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const scheduleSessionsRefresh = useCallback(() => {
+    if (refreshTimer.current) return
+    refreshTimer.current = setTimeout(() => {
+      refreshTimer.current = null
+      void refreshSessionsInternal()
+    }, 400)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  useEffect(() => () => { if (refreshTimer.current) clearTimeout(refreshTimer.current) }, [])
+
+  // The gateway does not announce deletes, so keep the list honest with a slow poll.
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (document.visibilityState !== 'hidden' && clientRef.current?.state === 'ready') void refreshSessionsInternal()
+    }, 20000)
+    return () => clearInterval(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const handleEvent = useCallback(
     (event: string, data: unknown, seq: number | undefined, sessionKey?: string) => {
       // Tap for features that keep their own cross-session state (the Inbox).
@@ -251,6 +280,16 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
         return
       }
 
+      // Session list changes made elsewhere (a rename or new session on the desktop).
+      if (event === 'session.update' || event === 'sessions.update') {
+        const id = event === 'session.update' ? (data as { id?: string })?.id : undefined
+        const isNew = Boolean(id) && !sessionsRef.current.some((s) => s.id === id)
+        setSessions((prev) => applySessionEvent(prev, event, data) ?? prev)
+        // A rename needs the authoritative row; a new session needs it too, and a subscribe.
+        if (event === 'sessions.update' || isNew) scheduleSessionsRefresh()
+        return
+      }
+
       const touched = aggRef.current.apply(event, data, seq, sessionKey)
       if (typeof seq === 'number') void storage.set(CURSOR_KEY, String(aggRef.current.cursor))
 
@@ -274,7 +313,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
 
       if (touched) bump()
     },
-    [bump],
+    [bump, scheduleSessionsRefresh],
   )
 
   // ---- actions ------------------------------------------------------------
@@ -291,7 +330,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     setSessionsLoading(true)
     try {
       const list = await c.rpc<StoredSession[]>('sessions.list')
-      const sorted = [...(list ?? [])].sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))
+      const sorted = sortSessions(list ?? [])
       setSessions(sorted)
       const keys = sorted
         .map((s) => (s.channel && s.chatType && s.chatId ? `${s.channel}:${s.chatType}:${s.chatId}` : null))
@@ -310,10 +349,11 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
    * path and always comes from the gateway's own message store.
    */
   const openSession = useCallback(
-    async (sessionKey: string, sessionId?: string) => {
+    async (sessionKey: string, sessionId?: string, force = false) => {
       const c = clientRef.current
       if (!c) return
       await c.subscribe([sessionKey])
+      if (force) loadedHistory.current.delete(sessionKey)
       if (loadedHistory.current.has(sessionKey) || !sessionId) {
         bump()
         return
@@ -408,7 +448,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       can: (method) => clientRef.current?.can(method) ?? false,
       hasScope: (scope) => (device?.scopes ?? pairing?.scopes ?? []).includes(scope),
       refreshSessions: refreshSessionsInternal,
-      openSession,
+      openSession: (k, id) => openSession(k, id),
+      reloadHistory: (k, id) => openSession(k, id, true),
       getHistoryInfo: (key) => historyInfo.current.get(key) ?? null,
       getSession: (key) => (aggRef.current.keys().includes(key) ? aggRef.current.get(key) : emptySessionState(key)),
       clearAttention: (key) => setAttention((prev) => prev.filter((a) => a.sessionKey !== key)),

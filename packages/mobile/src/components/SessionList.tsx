@@ -2,6 +2,7 @@ import type { StoredSession } from '@dorabot-remote/protocol'
 import { useState, type ReactNode } from 'react'
 import { keyOf, useConnection } from '../lib/connection.js'
 import { haptic } from '../lib/platform.js'
+import { PullToRefresh } from './PullToRefresh.js'
 import { Button, Card, Dot, Empty, Screen, Spinner, cx, timeAgo } from './ui.js'
 
 /**
@@ -84,7 +85,8 @@ export function SessionList({
       }
     >
       <div className="flex h-full min-h-0 flex-col">
-        <div className="scroll min-h-0 flex-1 px-3 py-3">
+        <div className="min-h-0 flex-1">
+        <PullToRefresh onRefresh={conn.refreshSessions} className="px-3 py-3">
           {conn.sessionsLoading && rows.length === 0 ? (
             <div className="flex h-40 items-center justify-center">
               <Spinner className="size-6" />
@@ -153,6 +155,7 @@ export function SessionList({
               })}
             </div>
           )}
+        </PullToRefresh>
         </div>
 
         <div className="safe-bottom shrink-0 border-t border-ink-700 bg-ink-900 px-3 pt-2.5">

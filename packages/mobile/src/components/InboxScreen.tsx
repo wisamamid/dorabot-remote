@@ -6,6 +6,7 @@ import { actionable } from '../lib/inbox.js'
 import type { InboxItem } from '../lib/inbox.js'
 import { sessionLabel } from '../lib/sessionName.js'
 import { ApprovalCard, ElicitationCard, QuestionCard, looksDestructive } from './Interrupts.js'
+import { PullToRefresh } from './PullToRefresh.js'
 import { ScopeGate } from './ScopeGate.js'
 import { Button, Card, Empty, IconButton, Screen, Spinner } from './ui.js'
 
@@ -68,7 +69,7 @@ export function InboxScreen({
       }
     >
       <ScopeGate scope="approvals" title="Approvals">
-        <div className="scroll h-full space-y-3 px-3 py-3">
+        <PullToRefresh onRefresh={refresh} className="space-y-3 px-3 py-3">
           {approvals.length >= 2 && (
             <Card className="space-y-3">
               {confirm ? (
@@ -164,7 +165,7 @@ export function InboxScreen({
               )
             })
           )}
-        </div>
+        </PullToRefresh>
       </ScopeGate>
     </Screen>
   )

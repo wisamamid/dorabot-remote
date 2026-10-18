@@ -119,6 +119,19 @@ describe('stream_batch cursor', () => {
   })
 })
 
+describe('session list events reach the phone', () => {
+  it('forwards a desktop rename and a new session without a subscription', async () => {
+    const p = await pair()
+    const { c, ev } = await connect(p)
+    gateway.push('sessions.update', { sessionId: 'abc', name: 'Renamed on desktop' })
+    gateway.push('session.update', { id: 'new1', channel: 'desktop', chatId: 'new1', chatType: 'dm', messageCount: 1, activeRun: false })
+    await wait(300)
+    expect(ev.find((e) => e.event === 'sessions.update')?.data).toEqual({ sessionId: 'abc', name: 'Renamed on desktop' })
+    expect(ev.find((e) => e.event === 'session.update')?.data.id).toBe('new1')
+    c.disconnect()
+  })
+})
+
 describe('fresh device and dedupe', () => {
   it('does not replay history for a fresh device (lastSeq 0)', async () => {
     gateway.push('agent.message', { sessionKey: 'desktop:dm:abc', message: 'old' })
