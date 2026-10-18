@@ -147,6 +147,16 @@ export function readGatewayToken(paths: BridgePaths): string {
 }
 
 export function readDorabotVersion(paths: BridgePaths): string | undefined {
+  for (const app of ['/Applications/dorabot.app', join(homedir(), 'Applications/dorabot.app')]) {
+    try {
+      const plist = join(app, 'Contents/Info.plist')
+      if (!existsSync(plist)) continue
+      const m = /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(plist, 'utf8'))
+      if (m?.[1]) return m[1].trim()
+    } catch {
+      // Cosmetic.
+    }
+  }
   for (const candidate of [
     '/Applications/dorabot.app/Contents/Resources/app.asar.unpacked/package.json',
     join(paths.dorabotRoot, 'version'),

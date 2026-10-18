@@ -7,7 +7,7 @@ import { WorkScreen } from './components/WorkScreen.js'
 import { PairScreen } from './components/PairScreen.js'
 import { SessionList } from './components/SessionList.js'
 import { SessionView } from './components/SessionView.js'
-import { Spinner, cx } from './components/ui.js'
+import { Button, Spinner, cx } from './components/ui.js'
 import { ConnectionProvider, useConnection } from './lib/connection.js'
 import { InboxProvider, useInbox } from './lib/inbox-context.js'
 import { setStatusBarDark } from './lib/platform.js'
@@ -69,6 +69,16 @@ function Shell(): ReactNode {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {conn.state === 'revoked' && (
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-ink-700 bg-ink-900 px-4 py-2.5">
+          <p className="text-[13.5px] leading-snug text-amber-glow">
+            {conn.stateDetail || 'This Mac no longer trusts this phone.'}
+          </p>
+          <Button variant="primary" onClick={() => void conn.forget()} className="shrink-0 px-3 text-[14px]">
+            Pair again
+          </Button>
+        </div>
+      )}
       <div className="relative min-h-0 flex-1">
         {pane('sessions', <SessionList onOpen={openSession} onSettings={() => setTab('more')} />)}
         {pane('inbox', <InboxScreen onOpenSession={openSession} />)}

@@ -386,6 +386,9 @@ describe('bridge through the relay', () => {
     const pair = await rig.pair()
     const KEY = 'desktop:dm:abc'
     const big = 'x'.repeat(100 * 1024)
+    // lastSeq 0 means a fresh device (no replay); resume from a real cursor.
+    rig.bridge.store.appendEvent('agent.message', KEY, { sessionKey: KEY, message: 'marker' })
+    const cursor = rig.bridge.store.currentSeq()
     for (let i = 0; i < 500; i++) rig.bridge.store.appendEvent('agent.message', KEY, { sessionKey: KEY, message: big, i })
     const link = () => (rig.bridge as unknown as { relay: { ws: WebSocket | null } }).relay.ws
     let peak = 0
@@ -394,7 +397,7 @@ describe('bridge through the relay', () => {
     }, 2)
     let got = 0
     const client = await rig.connect(pair, {
-      lastSeq: 0,
+      lastSeq: cursor,
       onEvent: (e, d) => {
         if (e === 'agent.message' && (d as { message?: string }).message === big) got++
       },

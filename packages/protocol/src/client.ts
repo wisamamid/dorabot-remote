@@ -19,11 +19,15 @@ import {
 } from './crypto.js'
 import { openSealedJson } from './crypto.js'
 import { RELAY_HEAD_START_MS, relayDeviceUrl, type RelayInfo } from './relay.js'
+import { methodsForScopes } from './policy.js'
 import type { DeviceSummary, Envelope, HostSummary, PairingPayload, Scope } from './wire.js'
 
 export type Transport = 'lan' | 'relay'
 
-export type ConnectionState = 'idle' | 'connecting' | 'handshaking' | 'ready' | 'disconnected'
+export type ConnectionState = 'idle' | 'connecting' | 'handshaking' | 'ready' | 'disconnected' | 'revoked'
+
+/** Host error codes that retrying can never fix: the device must pair again. */
+const TERMINAL_ERROR_CODES = new Set(['revoked', 'unknown_device'])
 
 /** Minimal structural type so both the DOM and `ws` WebSocket satisfy it. */
 export interface SocketLike {
@@ -75,6 +79,8 @@ export interface PairResult {
 
 const CONNECT_TIMEOUT_MS = 6000
 const PING_INTERVAL_MS = 20_000
+/** A ping with no inbound frame at all within this long means the socket is half-open. */
+const PONG_TIMEOUT_MS = 10_000
 
 /** Normalise the two WebSocket event styles into one. */
 function bind(
@@ -289,6 +295,13 @@ export class RemoteClient {
   private pingTimer: ReturnType<typeof setInterval> | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private attempt = 0
+  /** Bumped whenever a race is cancelled or restarted, so stale attempts can never win. */
+  private generation = 0
+  private racing = false
+  private raceSockets = new Set<SocketLike>()
+  /** Counts inbound encrypted frames; a probe is answered if this moved. */
+  private rxCount = 0
+  private probeTimer: ReturnType<typeof setTimeout> | null = null
   private stopped = false
   private subscriptions = new Set<string>()
 
@@ -300,7 +313,7 @@ export class RemoteClient {
   private setTransport(t: Transport | null): void {
     if (this.transport === t) return
     this.transport = t
-    this.opts.onTransport?.(t)
+    this.safe(() => this.opts.onTransport?.(t), 'onTransport')
   }
 
   private log(msg: string): void {
@@ -310,11 +323,47 @@ export class RemoteClient {
   private setState(state: ConnectionState, detail?: string): void {
     if (this.state === state) return
     this.state = state
-    this.opts.onState?.(state, detail)
+    this.safe(() => this.opts.onState?.(state, detail), 'onState')
   }
 
+  /** A throwing listener is a UI bug; it must never take the connection down. */
+  private safe(fn: () => void, what: string): void {
+    try {
+      fn()
+    } catch (err) {
+      this.log(`${what} listener threw: ${(err as Error).message}`)
+    }
+  }
+
+  private closeQuietly(socket: SocketLike | null | undefined): void {
+    try {
+      socket?.close()
+    } catch {
+      // Already closing.
+    }
+  }
+
+  /** Cancel any in-flight race and drop the live socket. Stale attempts can no longer win. */
+  private teardown(): void {
+    this.generation += 1
+    this.racing = false
+    for (const s of this.raceSockets) this.closeQuietly(s)
+    this.raceSockets.clear()
+    this.closeQuietly(this.socket)
+    this.socket = null
+    this.channel = null
+    this.stopPing()
+  }
+
+  /**
+   * Start connecting now. A no-op while a race is running or the connection is
+   * live; otherwise it cancels any pending backoff and races immediately.
+   */
   connect(): void {
     this.stopped = false
+    if (this.racing || this.socket) return
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
     this.openNext()
   }
 
@@ -322,17 +371,58 @@ export class RemoteClient {
     this.stopped = true
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
-    this.stopPing()
+    this.teardown()
     this.failPending(new Error('disconnected'))
-    try {
-      this.socket?.close()
-    } catch {
-      // Already closing.
-    }
-    this.socket = null
-    this.channel = null
     this.setTransport(null)
     this.setState('disconnected')
+  }
+
+  /** The live socket is gone (closed or presumed dead): clean up and let the caller reconnect. */
+  private socketLost(socket: SocketLike, reason?: string): boolean {
+    if (this.socket !== socket) return false
+    this.socket = null
+    this.channel = null
+    this.stopPing()
+    this.failPending(new Error('connection closed'))
+    this.setTransport(null)
+    this.setState('disconnected', reason)
+    return true
+  }
+
+  /**
+   * Check the connection is really alive, e.g. on app resume. Sends a ping and, if
+   * nothing at all arrives within `timeoutMs`, drops the socket and reconnects
+   * at once. If we are not ready, just reconnect now (skipping backoff).
+   */
+  checkAlive(timeoutMs = 3000): void {
+    if (this.stopped || this.state === 'revoked') return
+    if (this.state !== 'ready' || !this.socket) {
+      this.connect()
+      return
+    }
+    this.probe(timeoutMs, true)
+  }
+
+  private probe(timeoutMs: number, immediateReconnect: boolean): void {
+    const socket = this.socket
+    if (!socket) return
+    const seen = this.rxCount
+    if (this.probeTimer) clearTimeout(this.probeTimer)
+    this.probeTimer = setTimeout(() => {
+      this.probeTimer = null
+      if (this.socket !== socket || this.rxCount !== seen) return
+      this.log('no reply to ping, dropping half-open socket')
+      this.closeQuietly(socket)
+      if (this.socketLost(socket, 'connection timed out')) {
+        if (immediateReconnect) this.connect()
+        else this.scheduleReconnect('ping timeout')
+      }
+    }, timeoutMs)
+    try {
+      this.sendEnvelope({ t: 'ping', ts: Date.now() })
+    } catch {
+      // The timer above will notice nothing came back.
+    }
   }
 
   private orderedAddresses(): string[] {
@@ -351,16 +441,22 @@ export class RemoteClient {
    */
   private openNext(): void {
     if (this.stopped) return
+    // Any previous race or socket is cancelled first: only one race ever lives.
+    this.teardown()
+    const gen = this.generation
+    this.racing = true
     this.setState('connecting')
     const addresses = this.orderedAddresses()
     const relay = this.relay
     if (addresses.length === 0 && !relay) {
+      this.racing = false
       this.scheduleReconnect('no addresses configured')
       return
     }
 
     let settled = false
     const attempts: SocketLike[] = []
+    const stale = (): boolean => gen !== this.generation
     // The relay starts late so that LAN wins whenever it is reachable, which keeps
     // traffic off the internet and latency low. If every LAN attempt has already
     // failed there is nothing to wait for, so it starts at once.
@@ -368,27 +464,20 @@ export class RemoteClient {
     let startRelay: (() => void) | null = null
 
     const win = (socket: SocketLike, address: string, transport: Transport, channel: SecureChannel, host: HostSummary): void => {
-      if (settled) {
-        try {
-          socket.close()
-        } catch {
-          // Losers are closed silently.
-        }
+      if (settled || stale()) {
+        this.closeQuietly(socket)
         return
       }
       settled = true
+      this.racing = false
       if (relayTimer) clearTimeout(relayTimer)
       relayTimer = null
       startRelay = null
-      for (const other of attempts) {
-        if (other !== socket) {
-          try {
-            other.close()
-          } catch {
-            // Already closing.
-          }
-        }
+      for (const other of new Set([...attempts, ...this.raceSockets, ...(this.socket ? [this.socket] : [])])) {
+        if (other !== socket) this.closeQuietly(other)
       }
+      this.raceSockets.clear()
+      this.rxCount = 0
       this.socket = socket
       this.channel = channel
       this.host = host
@@ -399,13 +488,15 @@ export class RemoteClient {
     }
 
     const lose = (reason: string): void => {
-      if (settled) return
+      if (settled || stale()) return
       if (!attempts.every((s) => s.readyState === 3 /* CLOSED */)) return
       if (startRelay) {
         startRelay()
         return
       }
       settled = true
+      this.racing = false
+      this.raceSockets.clear()
       this.scheduleReconnect(reason)
     }
 
@@ -418,6 +509,7 @@ export class RemoteClient {
         return
       }
       attempts.push(socket)
+      this.raceSockets.add(socket)
 
       const ephemeral = generateIdentity()
       let channel: SecureChannel | null = null
@@ -448,11 +540,16 @@ export class RemoteClient {
               if (frame.t === 'err') {
                 clearTimeout(timer)
                 this.log(`host refused: ${String(frame.message)}`)
-                try {
-                  socket.close()
-                } catch {
-                  // Already closing.
+                if (!stale() && typeof frame.code === 'string' && TERMINAL_ERROR_CODES.has(frame.code)) {
+                  // Retrying can never fix this; stop and say so.
+                  this.stopped = true
+                  if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+                  this.reconnectTimer = null
+                  this.teardown()
+                  this.setState('revoked', String(frame.message ?? frame.code))
+                  return
                 }
+                this.closeQuietly(socket)
                 return
               }
               if (frame.t === 'hello_ack') {
@@ -481,25 +578,23 @@ export class RemoteClient {
               return
             }
             if (this.socket !== socket || !this.channel) return
-            this.onEnvelope(this.channel.open<Envelope>(toBytes(data)))
+            const env = this.channel.open<Envelope>(toBytes(data))
+            this.rxCount += 1
+            // Only a bad frame closes the socket; a throwing listener must not.
+            try {
+              this.onEnvelope(env)
+            } catch (err) {
+              this.log(`handler for "${env.t}" threw: ${(err as Error).message}`)
+            }
           } catch (err) {
             this.log(`frame rejected from ${address}: ${(err as Error).message}`)
-            try {
-              socket.close()
-            } catch {
-              // Already closing.
-            }
+            this.closeQuietly(socket)
           }
         },
         close: (code, reason) => {
           clearTimeout(timer)
-          if (this.socket === socket) {
-            this.socket = null
-            this.channel = null
-            this.stopPing()
-            this.failPending(new Error('connection closed'))
-            this.setTransport(null)
-            this.setState('disconnected', reason)
+          this.raceSockets.delete(socket)
+          if (this.socketLost(socket, reason)) {
             this.scheduleReconnect(reason || `closed ${code ?? ''}`)
             return
           }
@@ -541,7 +636,7 @@ export class RemoteClient {
         if (env.host.relay) this.relay = env.host.relay
         this.setState('ready')
         this.startPing()
-        this.opts.onReady?.(env)
+        this.safe(() => this.opts.onReady?.(env), 'onReady')
         // Re-assert subscriptions after a reconnect so the stream resumes without
         // the UI having to notice anything happened.
         if (this.subscriptions.size > 0) {
@@ -552,9 +647,11 @@ export class RemoteClient {
       case 'event': {
         if (typeof env.seq === 'number' && env.seq > this.lastSeq) this.lastSeq = env.seq
         if (env.event === 'remote.scopes_changed' && this.device) {
-          this.device = { ...this.device, scopes: (env.data as { scopes: Scope[] }).scopes }
+          const scopes = (env.data as { scopes: Scope[] }).scopes
+          this.device = { ...this.device, scopes }
+          this.allowed = methodsForScopes(scopes)
         }
-        this.opts.onEvent?.(env.event, env.data, env.seq, env.sessionKey)
+        this.safe(() => this.opts.onEvent?.(env.event, env.data, env.seq, env.sessionKey), 'onEvent')
         return
       }
       case 'rpc_res': {
@@ -619,18 +716,14 @@ export class RemoteClient {
 
   private startPing(): void {
     this.stopPing()
-    this.pingTimer = setInterval(() => {
-      try {
-        this.sendEnvelope({ t: 'ping', ts: Date.now() })
-      } catch {
-        // The close handler will deal with it.
-      }
-    }, PING_INTERVAL_MS)
+    this.pingTimer = setInterval(() => this.probe(PONG_TIMEOUT_MS, false), PING_INTERVAL_MS)
   }
 
   private stopPing(): void {
     if (this.pingTimer) clearInterval(this.pingTimer)
     this.pingTimer = null
+    if (this.probeTimer) clearTimeout(this.probeTimer)
+    this.probeTimer = null
   }
 
   private failPending(err: Error): void {

@@ -44,6 +44,7 @@ import type { DeviceSocket } from './device-socket.js'
 import { RelayClient, type RelayState } from './relay-client.js'
 import { CONTROL_PAGE } from './control-page.js'
 import { GatewayClient } from './gateway-client.js'
+import { applyEventToSnapshots } from './snapshot-state.js'
 import { Store, type DeviceRecord } from './store.js'
 
 const GATEWAY_CURSOR_KEY = 'gateway.lastSeqBySession'
@@ -70,6 +71,7 @@ export class Bridge implements ConnectionHost {
   private sessionKeys = new Set<string>()
   private gatewayCursor: Record<string, number> = {}
   private pruneTimer: NodeJS.Timeout | null = null
+  private deviceTimer: NodeJS.Timeout | null = null
   private relay: RelayClient | null = null
   private relayInfo: RelayInfo | null = null
   readonly logLines: string[] = []
@@ -133,6 +135,11 @@ export class Bridge implements ConnectionHost {
       this.relay.start()
     }
 
+    // The CLI revokes and grants from another process, straight into the DB.
+    this.deviceTimer = setInterval(() => {
+      for (const c of [...this.connections]) c.recheckDevice()
+    }, 5000)
+
     this.pruneTimer = setInterval(
       () => {
         this.store.purgeExpiredPairings()
@@ -145,6 +152,7 @@ export class Bridge implements ConnectionHost {
 
   async stop(): Promise<void> {
     if (this.pruneTimer) clearInterval(this.pruneTimer)
+    if (this.deviceTimer) clearInterval(this.deviceTimer)
     for (const c of this.connections) c.close('bridge shutting down')
     this.relay?.stop()
     this.gateway?.stop()
@@ -252,6 +260,20 @@ export class Bridge implements ConnectionHost {
 
   private onGatewayEvent(name: string, data: unknown, seq?: number): void {
     const d = (data ?? {}) as Record<string, unknown>
+
+    // `agent.stream_batch` wraps N complete frames ({ event, data, seq? }), each
+    // with its own seq and session. Unwrap so every inner event is logged,
+    // routed and cursor-tracked under what it actually is.
+    if (name === 'agent.stream_batch') {
+      const batch = Array.isArray(data) ? data : ((d.data as unknown[]) ?? [])
+      for (const raw of batch as Record<string, unknown>[]) {
+        const hasFrame = typeof raw.event === 'string'
+        const innerName = hasFrame ? (raw.event as string) : 'agent.stream'
+        const inner = hasFrame ? raw.data : (raw.data ?? raw)
+        this.onGatewayEvent(innerName, inner, typeof raw.seq === 'number' ? raw.seq : undefined)
+      }
+      return
+    }
     const sessionKey = typeof d.sessionKey === 'string' ? d.sessionKey : null
 
     // Terminal output is handled first and never reaches the generic fan-out.
@@ -274,6 +296,8 @@ export class Bridge implements ConnectionHost {
         this.sessionKeys.add(snap.sessionKey)
       }
     }
+
+    applyEventToSnapshots(this.snapshots, name, d)
 
     if (name === 'status.update') {
       this.absorbStatus(data as StatusUpdate)
@@ -301,18 +325,6 @@ export class Bridge implements ConnectionHost {
         this.gatewayCursor[sessionKey] = seq
         this.store.setMeta(GATEWAY_CURSOR_KEY, this.gatewayCursor)
       }
-    }
-
-    // `agent.stream_batch` is a wrapper around N stream events and carries no
-    // sessionKey of its own. Unwrap it so each inner event is logged and routed
-    // under the session it actually belongs to.
-    if (name === 'agent.stream_batch') {
-      const batch = Array.isArray(data) ? data : ((d.data as unknown[]) ?? [])
-      for (const entry of batch as Record<string, unknown>[]) {
-        const inner = (entry.data ?? entry) as Record<string, unknown>
-        this.onGatewayEvent('agent.stream', inner, undefined)
-      }
-      return
     }
 
     let bridgeSeq: number | undefined
@@ -362,6 +374,11 @@ export class Bridge implements ConnectionHost {
 
   snapshotFor(sessionKey: string): unknown | null {
     return this.snapshots.get(sessionKey) ?? null
+  }
+
+  protectedPaths(): string[] {
+    const p = this.paths
+    return [p.root, p.db, p.identity, p.signingKey, p.settings, p.dorabotRoot, p.gatewayToken, p.gatewaySocket]
   }
 
   knownSessionKeys(): string[] {
@@ -595,6 +612,20 @@ export class Bridge implements ConnectionHost {
     return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
   }
 
+  /** Host must be exactly 127.0.0.1/localhost/[::1] on our port; Origin, if sent, must match too. */
+  isTrustedLocalRequest(req: IncomingMessage): boolean {
+    const port = this.settings.port
+    const hosts = [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]
+    const host = String(req.headers.host ?? '').toLowerCase()
+    if (!hosts.includes(host)) return false
+    const origin = req.headers.origin
+    if (origin !== undefined) {
+      const ok = [`http://127.0.0.1:${port}`, `http://localhost:${port}`, `http://[::1]:${port}`]
+      if (typeof origin !== 'string' || !ok.includes(origin.toLowerCase())) return false
+    }
+    return true
+  }
+
   private onHttpRequest(req: IncomingMessage, res: ServerResponse): void {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
 
@@ -613,6 +644,15 @@ export class Bridge implements ConnectionHost {
       return
     }
 
+    // DNS rebinding: a web page can point its own hostname at 127.0.0.1 and
+    // drive this API from the user's browser. Only accept our literal loopback
+    // Host, and refuse any cross-origin caller.
+    if (!this.isTrustedLocalRequest(req)) {
+      res.writeHead(403, { 'content-type': 'text/plain' })
+      res.end('forbidden')
+      return
+    }
+
     void this.handleLocalRequest(url, req, res)
   }
 
@@ -620,6 +660,11 @@ export class Bridge implements ConnectionHost {
     const json = (status: number, body: unknown): void => {
       res.writeHead(status, { 'content-type': 'application/json' })
       res.end(JSON.stringify(body))
+    }
+
+    if (url.pathname === '/api/state' && req.method !== 'GET') {
+      json(405, { error: 'method not allowed' })
+      return
     }
 
     if (url.pathname === '/api/state') {

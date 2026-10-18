@@ -45,6 +45,8 @@ const RULES: Record<Scope, Rule[]> = {
     'provider.get',
     'provider.detect',
     'provider.codex.models',
+    // Replays the durable session log, so it needs the same scope as reading sessions.
+    'remote.events',
   ],
   chat: [
     'chat.send',
@@ -137,13 +139,12 @@ const RULES: Record<Scope, Rule[]> = {
   admin: [
     'config.get',
     'config.set',
-    'security.*',
     'channels.status',
     'skills.*',
     'agents.*',
     'mcp.*',
     'pulse.setInterval',
-    'fs.*',
+    // No fs.*: reading lives in `files` (no duplicate listing), and fs writes are never exposed.
   ],
 }
 
@@ -183,9 +184,10 @@ export const BRIDGE_METHODS = new Set([
   'remote.scopeRequests',
   'remote.health',
   'remote.events',
-  'bridge.registerPush',
-  'bridge.unregisterPush',
 ])
+
+/** Bridge methods that also require a scope (they are not open to every device). */
+const BRIDGE_SCOPE_GATED = new Set(['remote.events'])
 
 function matches(rule: Rule, method: string): boolean {
   if (rule.endsWith('.*')) return method.startsWith(rule.slice(0, -1))
@@ -202,7 +204,7 @@ export function methodsForScopes(scopes: readonly Scope[]): string[] {
 
 export function isMethodAllowed(method: string, scopes: readonly Scope[]): boolean {
   if (NEVER_FORWARD.has(method)) return false
-  if (BRIDGE_METHODS.has(method)) return true
+  if (BRIDGE_METHODS.has(method) && !BRIDGE_SCOPE_GATED.has(method)) return true
   for (const scope of scopes) {
     for (const rule of RULES[scope] ?? []) {
       if (matches(rule, method)) return true
