@@ -94,7 +94,13 @@ function RenameSheet({
   const canSave = allowed && !offline && name !== null && name !== initial.trim()
 
   return createPortal(
-    <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/55 md:items-center" onClick={onCancel}>
+    // Portalled outside #root, so it does not shrink with the keyboard on its own:
+    // lift the sheet by the keyboard height published in --kb.
+    <div
+      className="fixed inset-0 z-[60] flex items-end justify-center bg-black/55 transition-[padding] duration-[250ms] md:items-center"
+      style={{ paddingBottom: 'var(--kb, 0px)' }}
+      onClick={onCancel}
+    >
       <form
         role="dialog"
         aria-label="Rename session"
