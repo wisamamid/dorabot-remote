@@ -9,6 +9,7 @@
 import type {
   AgentStatus,
   ChatItem,
+  ImageAttachment,
   PendingApproval,
   PendingElicitation,
   PendingQuestion,
@@ -104,6 +105,8 @@ export class SessionAggregator {
   private deferred = new Map<string, Deferred>()
   /** Highest bridge seq applied, for gap-free resume after a dropped socket. */
   private lastSeq = 0
+  /** Photos we sent whose `agent.user_message` echo (which carries only the prompt) has not arrived yet. */
+  private pendingImages = new Map<string, Array<{ prompt: string; images: ImageAttachment[] }>>()
   /** Highest seq applied per session, so a replayed or re-sent event is ignored. */
   private seqByKey = new Map<string, number>()
 
@@ -143,6 +146,29 @@ export class SessionAggregator {
     const next = { ...fn(this.get(sessionKey)), updatedAt: Date.now() }
     this.states.set(sessionKey, next)
     return next
+  }
+
+  /**
+   * Remember the photos sent with `prompt`. The gateway echoes our message as
+   * `agent.user_message` without them, so attach them to that item: now if the echo
+   * already arrived, otherwise when it does.
+   */
+  attachImages(sessionKey: string, prompt: string, images: ImageAttachment[]): void {
+    if (!images.length) return
+    const items = this.get(sessionKey).chatItems
+    for (let i = items.length - 1; i >= 0 && i >= items.length - 8; i--) {
+      const it = items[i]!
+      if (it.type === 'user' && it.content === prompt && !it.images?.length) {
+        this.patch(sessionKey, (s) => ({
+          ...s,
+          chatItems: s.chatItems.map((x, j) => (j === i ? { ...(x as typeof it), images } : x)),
+        }))
+        return
+      }
+    }
+    const queue = this.pendingImages.get(sessionKey) ?? []
+    queue.push({ prompt, images })
+    this.pendingImages.set(sessionKey, queue.slice(-4))
   }
 
   private defer(sessionKey: string): Deferred {
@@ -217,11 +243,15 @@ export class SessionAggregator {
         if (!sk) return null
         const prompt = d.prompt as string | undefined
         if (!prompt) return sk
+        const queue = this.pendingImages.get(sk)
+        const at = queue ? queue.findIndex((p) => p.prompt === prompt) : -1
+        const images = at >= 0 ? queue![at]!.images : undefined
+        if (at >= 0) queue!.splice(at, 1)
         this.patch(sk, (s) => ({
           ...s,
           chatItems: [
             ...s.chatItems,
-            { type: 'user', content: prompt, timestamp: (d.timestamp as number) ?? Date.now() },
+            { type: 'user', content: prompt, ...(images ? { images } : {}), timestamp: (d.timestamp as number) ?? Date.now() },
           ],
         }))
         return sk

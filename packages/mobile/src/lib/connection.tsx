@@ -18,6 +18,7 @@ import {
   type ConnectionState,
   type DeviceSummary,
   type HostSummary,
+  type ImageAttachment,
   type KeyPair,
   type PairResult,
   type RelayInfo,
@@ -94,6 +95,8 @@ interface ConnectionValue {
   renameSession: (sessionId: string, name: string) => Promise<void>
   /** Optimistic per-session model switch; rolls back and throws on failure. */
   setSessionModel: (target: { sessionId: string; sessionKey: string; running: boolean }, model: string) => Promise<{ live: boolean }>
+  /** Show photos we just sent on the matching user bubble (the gateway echo carries only the text). */
+  attachImages: (sessionKey: string, prompt: string, images: ImageAttachment[]) => void
   openSession: (sessionKey: string, sessionId?: string) => Promise<void>
   /** Reload one session's transcript from the gateway (pull to refresh). */
   /** Winning transport while connected, for the status banner. */
@@ -552,6 +555,10 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       refreshSessions: refreshSessionsInternal,
       renameSession: (id, name) => renameSessionLogic({ rpc, setSessions }, id, name),
       setSessionModel: (t, m) => switchModel({ rpc, setSessions }, t, m),
+      attachImages: (k, prompt, images) => {
+        aggRef.current.attachImages(k, prompt, images)
+        bump()
+      },
       openSession: (k, id) => openSession(k, id),
       reloadHistory: (k, id) => openSession(k, id, true),
       getHistoryInfo: (key) => historyInfo.current.get(key) ?? null,
@@ -577,6 +584,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       rpc,
       refreshSessionsInternal,
       openSession,
+      bump,
     ],
   )
 
