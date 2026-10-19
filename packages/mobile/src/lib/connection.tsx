@@ -18,6 +18,7 @@ import {
   type ConnectionState,
   type DeviceSummary,
   type HostSummary,
+  type ImageAttachment,
   type KeyPair,
   type PairResult,
   type RelayInfo,
@@ -38,6 +39,7 @@ import {
 } from 'react'
 import { applySessionEvent, sortSessions } from './sessions-sync.js'
 import { renameSession as renameSessionLogic } from './rename.js'
+import { normalizePins, setPinned as setPinnedLogic, type Pin } from './pins.js'
 import { switchModel } from './models.js'
 import { connLog, flushConnLog, loadConnLog, setConnMeta } from './connlog.js'
 import { haptic, onAppBackground, onAppResume, onNetworkChange, storage } from './platform.js'
@@ -76,6 +78,10 @@ interface ConnectionValue {
   scopes: Scope[]
   sessions: StoredSession[]
   sessionsLoading: boolean
+  /** Pinned sessions, newest pin first. Synced across devices through the bridge. */
+  pins: Pin[]
+  /** Optimistic pin/unpin by session key; rolls back and throws if the bridge refuses. */
+  setPinned: (sessionKey: string, pinned: boolean) => Promise<void>
   /** Bumped on every state change so consumers re-render. */
   revision: number
   attention: Attention[]
@@ -90,6 +96,8 @@ interface ConnectionValue {
   renameSession: (sessionId: string, name: string) => Promise<void>
   /** Optimistic per-session model switch; rolls back and throws on failure. */
   setSessionModel: (target: { sessionId: string; sessionKey: string; running: boolean }, model: string) => Promise<{ live: boolean }>
+  /** Show photos we just sent on the matching user bubble (the gateway echo carries only the text). */
+  attachImages: (sessionKey: string, prompt: string, images: ImageAttachment[]) => void
   openSession: (sessionKey: string, sessionId?: string) => Promise<void>
   /** Reload one session's transcript from the gateway (pull to refresh). */
   /** Winning transport while connected, for the status banner. */
@@ -122,6 +130,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   const [gatewayConnected, setGatewayConnected] = useState(false)
   const [sessions, setSessions] = useState<StoredSession[]>([])
   const [sessionsLoading, setSessionsLoading] = useState(false)
+  const [pins, setPins] = useState<Pin[]>([])
   const [transport, setTransport] = useState<'lan' | 'relay' | null>(null)
   const lastOpened = useRef<{ key: string; id?: string } | null>(null)
   const [revision, setRevision] = useState(0)
@@ -213,6 +222,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
           setDevice(info.device)
           setGatewayConnected(info.gatewayConnected)
           void refreshSessionsInternal()
+          void refreshPinsInternal()
           // Follow every session so an approval on any of them reaches the phone,
           // not just the one currently on screen.
           void client?.subscribe(aggRef.current.keys()).catch(() => {})
@@ -335,6 +345,10 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
         setGatewayConnected((data as { state: string }).state === 'ready')
         return
       }
+      if (event === 'remote.pins_changed') {
+        setPins(normalizePins((data as { pins?: unknown })?.pins))
+        return
+      }
       if (event === 'remote.scopes_changed') {
         const next = (data as { scopes: Scope[] }).scopes
         setDevice((d) => (d ? { ...d, scopes: next } : d))
@@ -394,6 +408,17 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     const c = clientRef.current
     if (!c) throw new Error('Not paired with a Mac yet.')
     return c.rpc<T>(method, params)
+  }, [])
+
+  const refreshPinsInternal = useCallback(async () => {
+    const c = clientRef.current
+    if (!c || c.state !== 'ready') return
+    // Without the sessions scope the bridge refuses; the list simply has no pins.
+    try {
+      setPins(normalizePins(await c.rpc('remote.pins.list')))
+    } catch {
+      // Offline or an older bridge without pins: keep what we have.
+    }
   }, [])
 
   const refreshSessionsInternal = useCallback(async () => {
@@ -501,6 +526,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     await storage.remove(CURSOR_KEY)
     setPairing(null)
     setSessions([])
+    setPins([])
     setHost(null)
     setDevice(null)
     setState('idle')
@@ -518,6 +544,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       scopes: device?.scopes ?? pairing?.scopes ?? [],
       sessions,
       sessionsLoading,
+      pins,
+      setPinned: (key, pinned) => setPinnedLogic({ rpc, setPins }, key, pinned),
       transport,
       revision,
       attention,
@@ -529,6 +557,10 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       refreshSessions: refreshSessionsInternal,
       renameSession: (id, name) => renameSessionLogic({ rpc, setSessions }, id, name),
       setSessionModel: (t, m) => switchModel({ rpc, setSessions }, t, m),
+      attachImages: (k, prompt, images) => {
+        aggRef.current.attachImages(k, prompt, images)
+        bump()
+      },
       openSession: (k, id) => openSession(k, id),
       reloadHistory: (k, id) => openSession(k, id, true),
       getHistoryInfo: (key) => historyInfo.current.get(key) ?? null,
@@ -545,6 +577,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       gatewayConnected,
       sessions,
       sessionsLoading,
+      pins,
       transport,
       revision,
       attention,
@@ -553,6 +586,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       rpc,
       refreshSessionsInternal,
       openSession,
+      bump,
     ],
   )
 

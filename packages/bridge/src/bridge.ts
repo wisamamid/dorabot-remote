@@ -49,6 +49,9 @@ import { GatewayClient } from './gateway-client.js'
 import { applyEventToSnapshots } from './snapshot-state.js'
 import { Store, type DeviceRecord } from './store.js'
 
+const SESSION_KEY_RE = /^[^:\s]+:[^:\s]+:\S+$/
+const MAX_PINS = 200
+
 /** Push treats a device as connected only if it sent a frame this recently. */
 export const LIVE_WINDOW_MS = 45_000
 /** Connections silent this long are closed. */
@@ -385,6 +388,25 @@ export class Bridge implements ConnectionHost {
     return name.startsWith('agent.') && name !== 'agent.status'
   }
 
+  /** Tell every connected device the pin set changed. Pins are device-independent. */
+  private broadcastPins(): void {
+    this.broadcastBridgeEvent('remote.pins_changed', { pins: this.store.listPins() })
+  }
+
+  /** Best effort: forget pins for sessions the gateway no longer lists. Never prunes on an empty or failed listing. */
+  private async prunePins(): Promise<void> {
+    if (!this.gatewayConnected() || this.store.listPins().length === 0) return
+    try {
+      const list = (await this.gateway.rpc('sessions.list')) as Array<{ channel?: string; chatType?: string; chatId?: string }> | undefined
+      if (!Array.isArray(list) || list.length === 0) return
+      const keep = new Set<string>()
+      for (const s of list) if (s.channel && s.chatType && s.chatId) keep.add(`${s.channel}:${s.chatType}:${s.chatId}`)
+      if (keep.size > 0 && this.store.prunePins(keep) > 0) this.broadcastPins()
+    } catch {
+      // gateway hiccup: keep the pins
+    }
+  }
+
   private broadcastBridgeEvent(event: string, data: unknown): void {
     for (const c of this.connections) c.forward(event, data, undefined, null)
   }
@@ -538,6 +560,22 @@ export class Bridge implements ConnectionHost {
         const device = conn.device ? this.store.getDevice(conn.device.id) : null
         if (!device) throw new Error('not authenticated')
         return { registered: Boolean(device.pushToken), notifyOnResult: Boolean(device.pushOnResult) }
+      }
+
+      case 'remote.pins.list': {
+        await this.prunePins()
+        return this.store.listPins()
+      }
+
+      case 'remote.pins.set': {
+        const id = String(params.id ?? '')
+        if (!SESSION_KEY_RE.test(id) || id.length > 300) throw new Error('invalid session id')
+        if (typeof params.pinned !== 'boolean') throw new Error('pinned must be a boolean')
+        if (params.pinned && this.store.listPins().length >= MAX_PINS && !this.store.listPins().some((p) => p.id === id)) {
+          throw new Error(`you can pin at most ${MAX_PINS} sessions`)
+        }
+        if (this.store.setPin(id, params.pinned)) this.broadcastPins()
+        return { pins: this.store.listPins() }
       }
 
       case 'remote.events': {

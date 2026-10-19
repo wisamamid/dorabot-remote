@@ -1,11 +1,18 @@
 import type { StoredSession } from '@dorabot-remote/protocol'
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
+import {
+  MAX_IMAGES,
+  buildChatSendParams,
+  fitImagesToBudget,
+  makeBrowserEncoder,
+} from '../lib/attachments.js'
 import { haptic, watchKeyboard } from '../lib/platform.js'
 import { PullToRefresh } from './PullToRefresh.js'
 import { ChatItemList, StatusLine } from './ChatItems.js'
 import { ApprovalCard, ElicitationCard, QuestionCard } from './Interrupts.js'
 import { ModelPicker } from './ModelPicker.js'
+import { usePinner } from './PinActions.js'
 import { useRename } from './RenameSheet.js'
 import { Button, Dot, Screen, cx } from './ui.js'
 
@@ -28,6 +35,7 @@ export function SessionView({
 }): ReactNode {
   const conn = useConnection()
   const rename = useRename()
+  const pinner = usePinner()
   const state = conn.getSession(sessionKey)
   const scrollRef = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
@@ -35,6 +43,11 @@ export function SessionView({
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [photos, setPhotos] = useState<Array<{ id: number; file: File; url: string }>>([])
+  const photoId = useRef(0)
+  const photosRef = useRef(photos)
+  photosRef.current = photos
+  const fileInput = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     void conn.openSession(sessionKey, session?.id)
@@ -43,11 +56,33 @@ export function SessionView({
   }, [sessionKey, session?.id])
 
   useEffect(() => watchKeyboard(setKeyboard), [])
+  // Release the preview blobs when leaving the conversation.
+  useEffect(() => () => photosRef.current.forEach((p) => URL.revokeObjectURL(p.url)), [])
+
+  function addPhotos(e: ChangeEvent<HTMLInputElement>): void {
+    const picked = Array.from(e.target.files ?? []).filter((f) => f.type.startsWith('image/') || f.type === '')
+    e.target.value = ''
+    if (!picked.length) return
+    const room = MAX_IMAGES - photos.length
+    if (picked.length > room) setError(`You can attach up to ${MAX_IMAGES} photos.`)
+    setPhotos((prev) => [
+      ...prev,
+      ...picked.slice(0, Math.max(0, room)).map((file) => ({ id: ++photoId.current, file, url: URL.createObjectURL(file) })),
+    ])
+  }
+
+  function removePhoto(id: number): void {
+    setPhotos((prev) => {
+      const gone = prev.find((p) => p.id === id)
+      if (gone) URL.revokeObjectURL(gone.url)
+      return prev.filter((p) => p.id !== id)
+    })
+  }
 
   useLayoutEffect(() => {
     const el = scrollRef.current
     if (el && stick.current) el.scrollTop = el.scrollHeight
-  }, [conn.revision, keyboard])
+  }, [conn.revision, keyboard, photos.length])
 
   // The transcript shrinks as the keyboard animates in (see initKeyboardInset),
   // so re-pin to the bottom once the animation has settled.
@@ -70,17 +105,26 @@ export function SessionView({
 
   async function send(): Promise<void> {
     const prompt = draft.trim()
-    if (!prompt || sending) return
+    if ((!prompt && photos.length === 0) || sending) return
     setSending(true)
     setError(null)
     stick.current = true
+    const encoder = makeBrowserEncoder(photos.map((p) => p.file))
     try {
-      await conn.rpc('chat.send', { prompt, sessionKey, chatId: session?.chatId, source: 'remote/mobile' })
+      const build = (images: Array<{ data: string; mediaType: string }>) =>
+        buildChatSendParams({ prompt, images, sessionKey, chatId: session?.chatId })
+      const images = photos.length ? await fitImagesToBudget(photos.length, encoder.encode, build) : []
+      const params = build(images)
+      await conn.rpc('chat.send', params)
+      if (images.length) conn.attachImages(sessionKey, params.prompt as string, images)
       setDraft('')
+      photos.forEach((p) => URL.revokeObjectURL(p.url))
+      setPhotos([])
       await haptic('light')
     } catch (err) {
       setError((err as Error).message)
     } finally {
+      encoder.dispose()
       setSending(false)
     }
   }
@@ -109,6 +153,20 @@ export function SessionView({
       onTitleClick={session ? () => rename.open(session) : undefined}
       right={
         <div className="flex items-center gap-2">
+          {conn.hasScope('sessions') && (
+            <button
+              onClick={() => pinner.toggle(sessionKey)}
+              aria-label={pinner.isPinned(sessionKey) ? 'Unpin session' : 'Pin session'}
+              className={cx(
+                'flex size-9 items-center justify-center rounded-lg active:bg-ink-800',
+                pinner.isPinned(sessionKey) ? 'text-mint-500' : 'text-ink-400',
+              )}
+            >
+              <svg viewBox="0 0 24 24" className="size-[18px]" fill={pinner.isPinned(sessionKey) ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
+                <path d="M16 3l5 5-2 1-3.5 3.5.5 4.5-1.5 1.5-3.5-3.5L6 20l-1-1 4.5-5-3.5-3.5L7.5 9 12 9.5 15.5 6z" />
+              </svg>
+            </button>
+          )}
           <ModelPicker session={session} sessionKey={sessionKey} running={busy} />
           {busy ? (
             <Button variant="ghost" onClick={() => void interrupt()} className="px-3 text-[14px] text-amber-glow">
@@ -191,7 +249,39 @@ export function SessionView({
         <div
           className="safe-bottom shrink-0 border-t border-ink-700 bg-ink-900 px-3 pt-2.5"
         >
+          {photos.length > 0 && (
+            <div className="no-scrollbar mb-2 flex gap-2 overflow-x-auto pt-2">
+              {photos.map((p) => (
+                <div key={p.id} className="relative shrink-0">
+                  <img src={p.url} alt="attachment" className="size-16 rounded-xl object-cover" />
+                  <button
+                    onClick={() => removePhoto(p.id)}
+                    disabled={sending}
+                    aria-label="Remove photo"
+                    className="absolute -right-1.5 -top-1.5 flex size-6 items-center justify-center rounded-full bg-ink-950 text-ink-100 ring-1 ring-ink-600"
+                  >
+                    <svg viewBox="0 0 24 24" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round">
+                      <path d="M6 6l12 12M18 6L6 18" />
+                    </svg>
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="flex items-end gap-2">
+            <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={addPhotos} />
+            <button
+              onClick={() => fileInput.current?.click()}
+              disabled={conn.state !== 'ready' || sending || photos.length >= MAX_IMAGES || !conn.hasScope('chat')}
+              aria-label="Attach photos"
+              className="flex size-11 shrink-0 items-center justify-center rounded-full bg-ink-800 text-ink-300 active:bg-ink-700 disabled:opacity-40"
+            >
+              <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="4" width="18" height="16" rx="3" />
+                <circle cx="9" cy="10" r="1.8" />
+                <path d="M21 16l-5-5-8 8" />
+              </svg>
+            </button>
             <textarea
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
@@ -211,10 +301,10 @@ export function SessionView({
             />
             <button
               onClick={() => void send()}
-              disabled={!draft.trim() || sending || conn.state !== 'ready'}
+              disabled={(!draft.trim() && photos.length === 0) || sending || conn.state !== 'ready'}
               className={cx(
                 'flex size-11 shrink-0 items-center justify-center rounded-full transition-colors',
-                draft.trim() && conn.state === 'ready' ? 'bg-mint-500 text-ink-950' : 'bg-ink-700 text-ink-500',
+                (draft.trim() || photos.length > 0) && conn.state === 'ready' ? 'bg-mint-500 text-ink-950' : 'bg-ink-700 text-ink-500',
               )}
             >
               <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2.2">
@@ -224,6 +314,7 @@ export function SessionView({
           </div>
         </div>
       </div>
+      {pinner.toast}
     </Screen>
   )
 }

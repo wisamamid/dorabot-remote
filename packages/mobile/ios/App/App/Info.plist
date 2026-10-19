@@ -51,9 +51,11 @@
 		<string>_dorabot-remote._tcp</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>Scan the pairing code shown on your Mac to link this phone.</string>
+	<string>Scan the pairing code shown on your Mac to link this phone, or take a photo to send to dorabot.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Unlock DoraBot Remote and confirm approvals with Face ID.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Choose photos to send to dorabot in a chat.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>DoraBot Remote connects directly to your Mac on your local network.</string>
 	<key>UIApplicationSceneManifest</key>

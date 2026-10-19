@@ -1,7 +1,9 @@
 import type { StoredSession } from '@dorabot-remote/protocol'
 import { useState, type ReactNode } from 'react'
 import { keyOf, useConnection } from '../lib/connection.js'
+import { partitionPinned } from '../lib/pins.js'
 import { haptic } from '../lib/platform.js'
+import { ActionSheet, usePinner } from './PinActions.js'
 import { PullToRefresh } from './PullToRefresh.js'
 import { useRename } from './RenameSheet.js'
 import { SwipeRow } from './SwipeRow.js'
@@ -23,6 +25,8 @@ export function SessionList({
 }): ReactNode {
   const conn = useConnection()
   const rename = useRename()
+  const pinner = usePinner()
+  const [menu, setMenu] = useState<StoredSession | null>(null)
   const [composing, setComposing] = useState(false)
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
@@ -42,6 +46,68 @@ export function SessionList({
     if (ar !== br) return br - ar
     return (b.session.updatedAt ?? '').localeCompare(a.session.updatedAt ?? '')
   })
+
+  const { pinned, rest } = partitionPinned(rows, conn.pins)
+  const canPin = conn.hasScope('sessions')
+
+  function renderRow({ session, key }: { session: StoredSession; key: string }): ReactNode {
+    const attn = waiting.get(key)
+    const isPinned = pinner.isPinned(key)
+    return (
+      <SwipeRow
+        key={key}
+        actions={[
+          ...(canPin ? [{ label: isPinned ? 'Unpin' : 'Pin', onPress: () => pinner.toggle(key) }] : []),
+          { label: 'Rename', onPress: () => rename.open(session), tone: 'muted' as const },
+        ]}
+        onLongPress={() => {
+          void haptic('medium')
+          setMenu(session)
+        }}
+      >
+        <button
+          onClick={() => {
+            void haptic('light')
+            onOpen(session, key)
+          }}
+          className={cx(
+            'w-full rounded-card border px-3.5 py-3 text-left transition-colors active:bg-ink-800',
+            attn ? 'border-amber-glow/40 bg-amber-dim' : 'border-ink-700 bg-ink-850 hover:bg-ink-800',
+            key === selectedKey && !attn && 'border-mint-500/50 bg-ink-800',
+          )}
+        >
+          <div className="flex items-center gap-2">
+            {isPinned && <PinGlyph />}
+            {session.activeRun && <span className="size-1.5 shrink-0 rounded-full bg-mint-500 breathe" />}
+            <span className="min-w-0 flex-1 truncate text-[15px] font-medium">
+              {session.name || session.senderName || labelFor(key)}
+            </span>
+            <span className="shrink-0 text-[12.5px] text-ink-500">{timeAgo(session.updatedAt)}</span>
+          </div>
+          {attn ? (
+            <div className="mt-1 text-[13.5px] font-medium text-amber-glow">
+              {attn.kind === 'approval'
+                ? 'Waiting for your approval'
+                : attn.kind === 'question'
+                  ? 'Asking you a question'
+                  : 'Needs details'}
+            </div>
+          ) : (
+            session.preview && (
+              <div className="mt-0.5 line-clamp-2 text-[13.5px] leading-snug text-ink-400">
+                {session.preview}
+              </div>
+            )
+          )}
+          <div className="mt-1 flex items-center gap-2 text-[13px] text-ink-500">
+            <span className="font-mono">{session.channel ?? 'desktop'}</span>
+            <span>·</span>
+            <span>{session.messageCount} messages</span>
+          </div>
+        </button>
+      </SwipeRow>
+    )
+  }
 
   async function startNew(): Promise<void> {
     const prompt = draft.trim()
@@ -115,60 +181,10 @@ export function SessionList({
             />
           ) : (
             <div className="space-y-1.5">
-              {rows.map(({ session, key }) => {
-                const attn = waiting.get(key)
-                return (
-                  <SwipeRow
-                    key={key}
-                    actionLabel="Rename"
-                    onAction={() => rename.open(session)}
-                    onLongPress={() => {
-                      void haptic('medium')
-                      rename.open(session)
-                    }}
-                  >
-                  <button
-                    onClick={() => {
-                      void haptic('light')
-                      onOpen(session, key)
-                    }}
-                    className={cx(
-                      'w-full rounded-card border px-3.5 py-3 text-left transition-colors active:bg-ink-800',
-                      attn ? 'border-amber-glow/40 bg-amber-dim' : 'border-ink-700 bg-ink-850 hover:bg-ink-800',
-                      key === selectedKey && !attn && 'border-mint-500/50 bg-ink-800',
-                    )}
-                  >
-                    <div className="flex items-center gap-2">
-                      {session.activeRun && <span className="size-1.5 shrink-0 rounded-full bg-mint-500 breathe" />}
-                      <span className="min-w-0 flex-1 truncate text-[15px] font-medium">
-                        {session.name || session.senderName || labelFor(key)}
-                      </span>
-                      <span className="shrink-0 text-[12.5px] text-ink-500">{timeAgo(session.updatedAt)}</span>
-                    </div>
-                    {attn ? (
-                      <div className="mt-1 text-[13.5px] font-medium text-amber-glow">
-                        {attn.kind === 'approval'
-                          ? 'Waiting for your approval'
-                          : attn.kind === 'question'
-                            ? 'Asking you a question'
-                            : 'Needs details'}
-                      </div>
-                    ) : (
-                      session.preview && (
-                        <div className="mt-0.5 line-clamp-2 text-[13.5px] leading-snug text-ink-400">
-                          {session.preview}
-                        </div>
-                      )
-                    )}
-                    <div className="mt-1 flex items-center gap-2 text-[13px] text-ink-500">
-                      <span className="font-mono">{session.channel ?? 'desktop'}</span>
-                      <span>·</span>
-                      <span>{session.messageCount} messages</span>
-                    </div>
-                  </button>
-                  </SwipeRow>
-                )
-              })}
+              {pinned.length > 0 && <SectionLabel>Pinned</SectionLabel>}
+              {pinned.map(renderRow)}
+              {pinned.length > 0 && rest.length > 0 && <SectionLabel>Sessions</SectionLabel>}
+              {rest.map(renderRow)}
             </div>
           )}
         </PullToRefresh>
@@ -206,7 +222,32 @@ export function SessionList({
           )}
         </div>
       </div>
+      {pinner.toast}
+      {menu && (
+        <ActionSheet
+          title={menu.name || menu.senderName || 'Session'}
+          onClose={() => setMenu(null)}
+          actions={[
+            ...(canPin && keyOf(menu)
+              ? [{ label: pinner.isPinned(keyOf(menu)!) ? 'Unpin' : 'Pin to top', onPress: () => pinner.toggle(keyOf(menu)!) }]
+              : []),
+            { label: 'Rename', onPress: () => rename.open(menu) },
+          ]}
+        />
+      )}
     </Screen>
+  )
+}
+
+function SectionLabel({ children }: { children: ReactNode }): ReactNode {
+  return <div className="px-1 pt-1.5 text-[12px] font-semibold uppercase tracking-wide text-ink-500">{children}</div>
+}
+
+function PinGlyph(): ReactNode {
+  return (
+    <svg viewBox="0 0 24 24" className="size-3.5 shrink-0 text-mint-500" fill="currentColor" aria-label="pinned">
+      <path d="M16 3l5 5-2 1-3.5 3.5.5 4.5-1.5 1.5-3.5-3.5L6 20l-1-1 4.5-5-3.5-3.5L7.5 9 12 9.5 15.5 6z" />
+    </svg>
   )
 }
 

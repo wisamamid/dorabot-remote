@@ -35,6 +35,11 @@ export interface ScopeRequest {
   status: 'pending' | 'granted' | 'denied'
 }
 
+export interface PinRecord {
+  id: string
+  pinnedAt: number
+}
+
 export interface StoredEvent {
   seq: number
   event: string
@@ -105,6 +110,11 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS scope_requests_status ON scope_requests (status);
 
+      CREATE TABLE IF NOT EXISTS pins (
+        id        TEXT PRIMARY KEY,
+        pinned_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -141,6 +151,36 @@ export class Store {
     this.db
       .prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
       .run(key, JSON.stringify(value))
+  }
+
+  // -------------------------------------------------------------------------
+  // Pinned sessions (shared by every paired device; dorabot itself has no pins)
+  // -------------------------------------------------------------------------
+
+  /** Pins, most recently pinned first. `id` is the session key (`channel:chatType:chatId`). */
+  listPins(): PinRecord[] {
+    const rows = this.db.prepare('SELECT id, pinned_at FROM pins ORDER BY pinned_at DESC, id ASC').all() as Array<{
+      id: string
+      pinned_at: number
+    }>
+    return rows.map((r) => ({ id: r.id, pinnedAt: Number(r.pinned_at) }))
+  }
+
+  /** Returns true when the set of pins changed. Re-pinning keeps the original pinnedAt. */
+  setPin(id: string, pinned: boolean): boolean {
+    if (pinned) {
+      return this.db.prepare('INSERT OR IGNORE INTO pins (id, pinned_at) VALUES (?, ?)').run(id, Date.now()).changes > 0
+    }
+    return this.db.prepare('DELETE FROM pins WHERE id = ?').run(id).changes > 0
+  }
+
+  /** Drop pins whose id is not in `keep`. Returns how many were removed. */
+  prunePins(keep: ReadonlySet<string>): number {
+    let removed = 0
+    for (const p of this.listPins()) {
+      if (!keep.has(p.id) && this.setPin(p.id, false)) removed++
+    }
+    return removed
   }
 
   // -------------------------------------------------------------------------
