@@ -11,12 +11,15 @@ import { EventEmitter } from 'node:events'
 import {
   MuxKind,
   RELAY_CLOSE,
+  RELAY_HB_REQUEST,
+  RELAY_HB_RESPONSE,
   RELAY_MAX_FRAME_BYTES,
   decodeMux,
   decodeMuxClose,
   encodeMux,
   encodeMuxClose,
   encodeMuxText,
+  relayDeviceUrl,
   relayHostUrl,
   relayIdFromPublicKey,
   signChallenge,
@@ -38,6 +41,13 @@ export const STABLE_MS = 5000
 export const PING_INTERVAL_MS = 30_000
 export const PONG_TIMEOUT_MS = 10_000
 export const AUTH_TIMEOUT_MS = 10_000
+/** Application heartbeat answered by the Room itself; ws pings are answered by the edge and prove less. */
+export const HEARTBEAT_INTERVAL_MS = 15_000
+export const HEARTBEAT_TIMEOUT_MS = 10_000
+export const HEARTBEAT_MAX_MISSES = 2
+/** The bridge dials its own relay URL as a phone would and expects the open to reach the host link. */
+export const SELFTEST_INTERVAL_MS = 5 * 60_000
+export const SELFTEST_TIMEOUT_MS = 5000
 
 const WS_OPEN = 1
 const WS_CLOSED = 3
@@ -119,6 +129,12 @@ export interface RelayClientOptions {
   onDeviceSocket: (sock: VirtualSocket, remoteLabel: string) => void
   /** Test seams. */
   random?: () => number
+  heartbeatIntervalMs?: number
+  heartbeatTimeoutMs?: number
+  /** False disables the periodic and post-connect self-test. */
+  selfTest?: boolean
+  selfTestIntervalMs?: number
+  selfTestTimeoutMs?: number
   createSocket?: (url: string) => WebSocket
 }
 
@@ -139,6 +155,14 @@ export class RelayClient extends EventEmitter {
   private pongTimer: NodeJS.Timeout | null = null
   private authTimer: NodeJS.Timeout | null = null
   private stableTimer: NodeJS.Timeout | null = null
+  private hbTimer: NodeJS.Timeout | null = null
+  private hbDeadline: NodeJS.Timeout | null = null
+  private hbMisses = 0
+  private selfTestTimer: NodeJS.Timeout | null = null
+  private pendingSelfTest: { n: string; probe: WebSocket | null; timer: NodeJS.Timeout; ws: WebSocket } | null = null
+  /** Counters, for tests and diagnostics. */
+  selfTestsPassed = 0
+  opensReceived = 0
   private authed = false
   /** Set by a close code that wants a long wait before the next try. */
   private slowRetry = false
@@ -184,13 +208,16 @@ export class RelayClient extends EventEmitter {
   }
 
   private clearTimers(): void {
-    for (const t of [this.reconnectTimer, this.pingTimer, this.pongTimer, this.authTimer, this.stableTimer]) {
+    for (const t of [this.reconnectTimer, this.pingTimer, this.pongTimer, this.authTimer, this.stableTimer, this.hbTimer, this.hbDeadline, this.selfTestTimer]) {
       if (t) {
         clearTimeout(t)
         clearInterval(t)
       }
     }
     this.reconnectTimer = this.pingTimer = this.pongTimer = this.authTimer = this.stableTimer = null
+    this.hbTimer = this.hbDeadline = this.selfTestTimer = null
+    this.hbMisses = 0
+    this.abortSelfTest()
   }
 
   // -------------------------------------------------------------------------
@@ -237,6 +264,13 @@ export class RelayClient extends EventEmitter {
       } catch {
         return
       }
+      if (frame?.t === 'hb_ack') {
+        // The Room answered from inside the Durable Object: the path to it is alive.
+        if (this.hbDeadline) clearTimeout(this.hbDeadline)
+        this.hbDeadline = null
+        this.hbMisses = 0
+        return
+      }
       if (frame?.t === 'challenge' && typeof frame.n === 'string' && !this.authed) {
         ws.send(JSON.stringify({ t: 'auth', ...signChallenge(this.opts.signingKey, this.relayId, frame.n) }))
       } else if (frame?.t === 'ok' && !this.authed) {
@@ -246,9 +280,13 @@ export class RelayClient extends EventEmitter {
     }
     if (!this.authed) return
     const frame = decodeMux(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength))
-    if (!frame) return
+    if (!frame) {
+      this.opts.log('relay: dropped an undecodable mux frame')
+      return
+    }
     switch (frame.kind) {
       case MuxKind.open: {
+        this.opensReceived++
         const stale = this.sockets.get(frame.connId)
         if (stale) {
           this.sockets.delete(frame.connId)
@@ -305,6 +343,110 @@ export class RelayClient extends EventEmitter {
         ws.terminate()
       }
     }, PING_INTERVAL_MS)
+    this.startHeartbeat(ws)
+    if (this.opts.selfTest !== false) {
+      // Right after every (re)connect, then periodically.
+      this.scheduleSelfTest(ws, 0)
+    }
+  }
+
+  private startHeartbeat(ws: WebSocket): void {
+    const interval = this.opts.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS
+    const timeout = this.opts.heartbeatTimeoutMs ?? HEARTBEAT_TIMEOUT_MS
+    const beat = (): void => {
+      if (ws !== this.ws || ws.readyState !== WS_OPEN) return
+      // An unanswered beat is already being timed; do not stack deadlines.
+      if (!this.hbDeadline) {
+        this.hbDeadline = setTimeout(() => {
+          this.hbDeadline = null
+          this.hbMisses++
+          if (this.hbMisses >= HEARTBEAT_MAX_MISSES) {
+            this.opts.log(`relay: heartbeat missed ${this.hbMisses} times, the room is not answering; dropping the link and reconnecting`)
+            ws.terminate()
+          }
+        }, timeout)
+      }
+      try {
+        ws.send(RELAY_HB_REQUEST)
+      } catch {
+        ws.terminate()
+      }
+    }
+    beat()
+    this.hbTimer = setInterval(beat, interval)
+  }
+
+  // -------------------------------------------------------------------------
+  // Self-test: dial our own device URL and make sure the room's open reaches us
+  // -------------------------------------------------------------------------
+
+  private scheduleSelfTest(ws: WebSocket, delay: number): void {
+    if (this.selfTestTimer) clearTimeout(this.selfTestTimer)
+    this.selfTestTimer = setTimeout(() => {
+      this.selfTestTimer = null
+      if (ws !== this.ws) return
+      this.runSelfTest(ws)
+      this.scheduleSelfTest(ws, this.opts.selfTestIntervalMs ?? SELFTEST_INTERVAL_MS)
+    }, delay)
+  }
+
+  private runSelfTest(ws: WebSocket): void {
+    if (this.pendingSelfTest || ws.readyState !== WS_OPEN) return
+    const n = Math.random().toString(36).slice(2) + Date.now().toString(36)
+    const timeoutMs = this.opts.selfTestTimeoutMs ?? SELFTEST_TIMEOUT_MS
+    const started = Date.now()
+    let probe: WebSocket | null = null
+    const fail = (why: string): void => {
+      this.abortSelfTest()
+      if (ws !== this.ws) return
+      this.opts.log(`relay self-test failed: ${why} (after ${Date.now() - started}ms); reconnecting the host link`)
+      ws.terminate()
+    }
+    const timer = setTimeout(() => fail('the room never delivered our probe to the host link'), timeoutMs)
+    this.pendingSelfTest = { n, probe: null, timer, ws }
+    try {
+      const url = relayDeviceUrl({ u: this.opts.url, i: this.relayId })
+      probe = this.opts.createSocket ? this.opts.createSocket(url) : new WebSocket(url, { handshakeTimeout: timeoutMs })
+    } catch (err) {
+      return fail(`could not open probe: ${(err as Error).message}`)
+    }
+    this.pendingSelfTest.probe = probe
+    probe.on('open', () => {
+      try {
+        probe!.send(JSON.stringify({ t: 'selftest', n }))
+      } catch {
+        // The timer reports it.
+      }
+    })
+    probe.on('error', () => {})
+    probe.on('close', (code: number, reason: Buffer) => {
+      // Closed before the host saw it: the room rejected us (e.g. 4404 host_offline).
+      if (this.pendingSelfTest?.n === n) fail(`probe closed by the relay (${code}${reason.length ? ` ${reason.toString()}` : ''})`)
+    })
+  }
+
+  private abortSelfTest(): void {
+    const p = this.pendingSelfTest
+    if (!p) return
+    this.pendingSelfTest = null
+    clearTimeout(p.timer)
+    if (p.probe) {
+      p.probe.removeAllListeners('close')
+      try {
+        p.probe.terminate()
+      } catch {
+        // Already gone.
+      }
+    }
+  }
+
+  /** The bridge saw a device socket whose first frame is our own probe. True if it was ours. */
+  confirmSelfTest(n: unknown): boolean {
+    const p = this.pendingSelfTest
+    if (!p || typeof n !== 'string' || p.n !== n) return false
+    this.selfTestsPassed++
+    this.abortSelfTest()
+    return true
   }
 
   private onClose(ws: WebSocket, code: number, reason: string): void {

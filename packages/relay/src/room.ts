@@ -13,6 +13,8 @@ import { DurableObject } from 'cloudflare:workers'
 import {
   MuxKind,
   RELAY_CLOSE,
+  RELAY_HB_REQUEST,
+  RELAY_HB_RESPONSE,
   decodeMux,
   decodeMuxClose,
   encodeMux,
@@ -23,12 +25,14 @@ import {
 import { LIMITS, SlidingWindow, TokenBucket } from './limits.js'
 import type { Env } from './index.js'
 
-type HostAtt = { role: 'host'; rid: string; n: string; authed: boolean; t0: number }
+type HostAtt = { role: 'host'; rid: string; n: string; authed: boolean; t0: number; /** auth time; liveness floor until the first heartbeat. */ seen?: number }
 /** `dropped` marks a device the room closed because its host went away; no one needs telling. */
 type DevAtt = { role: 'dev'; connId: number; rid?: string; t0?: number; dropped?: boolean }
 type Att = HostAtt | DevAtt
 
 const OPEN = 1
+/** A host that has not heartbeat (bridge sends every 15s) for this long is a zombie link. */
+export const HOST_STALE_MS = 45_000
 
 /** Close codes outside 1000 and 3000-4999 throw when sent, so clamp whatever a peer asks for. */
 function safeCode(code: number): number {
@@ -59,6 +63,18 @@ function rejectSoon(ws: WebSocket, code: number, reason: string): void {
 export class Room extends DurableObject<Env> {
   private buckets = new Map<number, TokenBucket>()
   private pushWindow = new SlidingWindow(LIMITS.pushPerMinute, LIMITS.pushWindowMs)
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env)
+    // Answered by the runtime without waking a hibernated object; it also stamps
+    // getWebSocketAutoResponseTimestamp, which is how host liveness is judged.
+    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(RELAY_HB_REQUEST, RELAY_HB_RESPONSE))
+  }
+
+  private staleMs(): number {
+    const v = Number(this.env.HOST_STALE_MS)
+    return Number.isFinite(v) && v > 0 ? v : HOST_STALE_MS
+  }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
@@ -125,12 +141,45 @@ export class Room extends DurableObject<Env> {
     host.send(encodeMux(MuxKind.open, connId))
   }
 
+  /** Last sign of life from an authed host: its latest heartbeat, or its auth time if it has not sent one yet. */
+  private lastAlive(w: WebSocket, att: HostAtt): number {
+    const hb = this.ctx.getWebSocketAutoResponseTimestamp(w)?.getTime() ?? 0
+    return Math.max(hb, att.seen ?? att.t0)
+  }
+
+  /**
+   * The host to talk to: OPEN, authed, and demonstrably alive. A socket the runtime
+   * still calls OPEN but that has stopped heartbeating is a zombie; sending a device
+   * `open` into it is the silent hang this guards against, so it is skipped and
+   * closed. With several live hosts the most recently alive wins and the rest are replaced.
+   */
   private authedHost(exclude?: WebSocket): WebSocket | null {
+    const now = Date.now()
+    const limit = this.staleMs()
+    let best: { w: WebSocket; alive: number } | null = null
+    const live: Array<{ w: WebSocket; alive: number }> = []
     for (const w of this.ctx.getWebSockets('host')) {
       if (w === exclude || w.readyState !== OPEN) continue
-      if ((w.deserializeAttachment() as HostAtt | null)?.authed) return w
+      const att = w.deserializeAttachment() as HostAtt | null
+      if (!att?.authed) continue
+      const alive = this.lastAlive(w, att)
+      if (now - alive > limit) {
+        rlog('host_stale', att.rid, { silentMs: now - alive })
+        tryClose(w, RELAY_CLOSE.hostOffline, 'host_stale')
+        continue
+      }
+      const entry = { w, alive }
+      live.push(entry)
+      if (!best || alive > best.alive) best = entry
     }
-    return null
+    for (const l of live) {
+      if (l !== best) {
+        const att = l.w.deserializeAttachment() as HostAtt
+        rlog('host_stale', att.rid, { reason: 'superseded' })
+        tryClose(l.w, RELAY_CLOSE.replaced, 'replaced')
+      }
+    }
+    return best?.w ?? null
   }
 
   /** Devices that finished joining, i.e. have a connId. */
@@ -195,7 +244,7 @@ export class Room extends DurableObject<Env> {
         if ((old.deserializeAttachment() as HostAtt | null)?.authed) tryClose(old, RELAY_CLOSE.replaced, 'replaced')
       }
       this.closeAllDevices(RELAY_CLOSE.hostOffline, 'host_replaced')
-      ws.serializeAttachment({ ...att, authed: true, n: '' } satisfies HostAtt)
+      ws.serializeAttachment({ ...att, authed: true, n: '', seen: Date.now() } satisfies HostAtt)
       ws.send(JSON.stringify({ t: 'ok' }))
       return
     }

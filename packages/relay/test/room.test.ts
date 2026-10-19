@@ -260,3 +260,81 @@ function headerFor(key: ReturnType<typeof generateSigningKey>, raw: string): Rec
   const { pk, sig } = signBytes(key, new TextEncoder().encode(raw))
   return { 'x-dr-pk': pk, 'x-dr-sig': sig }
 }
+
+describe('host liveness', () => {
+  it('answers the application heartbeat itself and does not forward it', async () => {
+    const { id, peer: h } = await host()
+    h.send('{"t":"hb"}')
+    const r = await h.nextWhere((m) => !m.isBinary)
+    expect(r.data).toBe('{"t":"hb_ack"}')
+    // A device is still opened normally: the heartbeat stamped liveness, nothing else changed.
+    const d = await device(id.relayId)
+    await expectOpen(h)
+    d.close()
+  })
+
+  it('keeps a host alive that heartbeats, and drops nothing for one that is merely idle < threshold', async () => {
+    const { id, peer: h } = await host()
+    await new Promise((r) => setTimeout(r, 1500))
+    const d = await device(id.relayId)
+    await expectOpen(h)
+    d.close()
+  })
+})
+
+describe('stale host (short threshold)', () => {
+  let short: DevServer
+  const sp: Peer[] = []
+  const strack = (p: Peer): Peer => {
+    sp.push(p)
+    return p
+  }
+  beforeAll(async () => {
+    short = await startDevServer(['--var', 'HOST_STALE_MS:2500'])
+  })
+  afterAll(async () => {
+    for (const p of sp) p.close()
+    await short?.stop()
+  })
+
+  it('rejects a device 4404 when the host has stopped heartbeating, and logs host_stale', async () => {
+    const id = newIdentity()
+    const h = strack(await connectHost(short.ws, id))
+    h.send('{"t":"hb"}')
+    await h.nextWhere((m) => !m.isBinary)
+    await new Promise((r) => setTimeout(r, 3500))
+    const d = strack(new Peer(`${short.ws}/d/${id.relayId}`))
+    await d.opened()
+    expect(await d.waitClosed()).toEqual({ code: 4404, reason: 'host_offline' })
+    // The zombie host is closed so the bridge reconnects.
+    expect((await h.waitClosed()).reason).toBe('host_stale')
+  }, 20_000)
+
+  it('serves a host again once it heartbeats, and prefers it over a stale one', async () => {
+    const id = newIdentity()
+    const h1 = strack(await connectHost(short.ws, id))
+    await new Promise((r) => setTimeout(r, 3000))
+    // h1 is silent past the threshold; a fresh host takes over.
+    const h2 = strack(await connectHost(short.ws, id))
+    h2.send('{"t":"hb"}')
+    await h2.nextWhere((m) => !m.isBinary)
+    const d = strack(new Peer(`${short.ws}/d/${id.relayId}`))
+    await d.opened()
+    await expectOpen(h2)
+    expect(h1.closed ?? (await h1.waitClosed()).code).toBeTruthy()
+    d.close()
+  }, 20_000)
+
+  it('a heartbeating host stays serviceable well past the threshold', async () => {
+    const id = newIdentity()
+    const h = strack(await connectHost(short.ws, id))
+    for (let i = 0; i < 5; i++) {
+      h.send('{"t":"hb"}')
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+    const d = strack(new Peer(`${short.ws}/d/${id.relayId}`))
+    await d.opened()
+    await expectOpen(h)
+    d.close()
+  }, 20_000)
+})

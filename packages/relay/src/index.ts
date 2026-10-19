@@ -11,6 +11,8 @@ export interface Env {
   APNS_KEY_ID?: string
   APNS_TEAM_ID?: string
   APNS_TOPIC?: string
+  /** Test seam: how long a host may go without a heartbeat before it is stale. Default 45s. */
+  HOST_STALE_MS?: string
 }
 
 export { Room }

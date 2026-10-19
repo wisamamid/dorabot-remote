@@ -39,6 +39,13 @@ export const RELAY_CLOSE = {
 } as const
 
 export const RELAY_MAX_FRAME_BYTES = 1024 * 1024
+/**
+ * Application-level heartbeat on the host link. The Room answers it from inside the
+ * Durable Object (setWebSocketAutoResponse), which proves the Room-to-bridge path in
+ * a way a protocol-level ping, answered by Cloudflare's edge, does not.
+ */
+export const RELAY_HB_REQUEST = '{"t":"hb"}'
+export const RELAY_HB_RESPONSE = '{"t":"hb_ack"}'
 export const RELAY_MAX_DEVICES = 32
 /** The phone gives LAN candidates this long to answer before it also tries the relay. */
 export const RELAY_HEAD_START_MS = 1200

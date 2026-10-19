@@ -65,6 +65,7 @@ class FakeSocket implements SocketLike {
     if (typeof data === 'string') {
       const f = JSON.parse(data) as { t: string; ephPk?: string; hdr?: string }
       if (f.t === 'hello') {
+        if (this.host.silent(this.url, this.host.sockets.indexOf(this))) return
         if (this.host.refuse) {
           this.pushText({ t: 'err', code: this.host.refuse, message: `refused: ${this.host.refuse}` })
           return
@@ -107,6 +108,8 @@ class FakeHost {
   mute = false
   refuse: string | null = null
   hang: (url: string) => boolean = () => false
+  /** Opens fine but never answers `hello` (a relay wired to a host link that is not delivering). */
+  silent: (url: string, index: number) => boolean = () => false
   relayInfo: { u: string; i: string } | null = null
   factory = (url: string): SocketLike => {
     const s = new FakeSocket(this, url)
@@ -418,6 +421,54 @@ describe('relay on cellular', () => {
     const before = host.sockets.length
     await settle(25_000)
     expect(host.sockets.length).toBeGreaterThan(before)
+    c.disconnect()
+  })
+
+  it('a relay socket that opens but never answers hello is closed after 5s and retried at once', async () => {
+    const host = new FakeHost()
+    let silentOnce = true
+    host.silent = (url) => {
+      if (url.startsWith('wss://') && silentOnce) {
+        silentOnce = false
+        return true
+      }
+      return false
+    }
+    const logs: string[] = []
+    const c = make(host, { addresses: [], relay: RELAY, log: (m) => logs.push(m) })
+    c.connect()
+    await settle(4500)
+    expect(c.state).toBe('handshaking')
+    await settle(1000)
+    expect(c.state).toBe('ready')
+    expect(host.sockets.length).toBe(2)
+    expect(host.sockets[0]!.closed).toBe(true)
+    expect(logs.some((l) => l.includes('no handshake response in 5000ms, retrying once'))).toBe(true)
+    c.disconnect()
+  })
+
+  it('gives up the race (then backs off) when the single fast retry is silent too', async () => {
+    const host = new FakeHost()
+    host.silent = (url) => url.startsWith('wss://')
+    const logs: string[] = []
+    const c = make(host, { addresses: [], relay: RELAY, log: (m) => logs.push(m) })
+    c.connect()
+    await settle(11_000)
+    expect(host.sockets.length).toBe(2)
+    expect(logs.some((l) => l.includes('race failed') && l.includes('no handshake response'))).toBe(true)
+    expect(logs.some((l) => l.includes('reconnecting in'))).toBe(true)
+    c.disconnect()
+  })
+
+  it('a relay answering hello in time never trips the watchdog', async () => {
+    const host = new FakeHost()
+    const logs: string[] = []
+    const c = make(host, { addresses: [], relay: RELAY, log: (m) => logs.push(m) })
+    c.connect()
+    await settle(8000)
+    expect(c.state).toBe('ready')
+    expect(host.sockets.length).toBe(1)
+    expect(logs.some((l) => l.includes('no handshake response'))).toBe(false)
     c.disconnect()
   })
 
