@@ -3,6 +3,7 @@ import { useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
 import { haptic, platformName } from '../lib/platform.js'
 import { usePush } from '../lib/push-context.js'
+import { ConnectionLogScreen } from './ConnectionLogScreen.js'
 import { Button, Card, Dot, Screen, cx } from './ui.js'
 
 /**
@@ -16,6 +17,7 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
   const [confirmForget, setConfirmForget] = useState(false)
   const [requesting, setRequesting] = useState<Scope | null>(null)
   const [note, setNote] = useState<string | null>(null)
+  const [showLog, setShowLog] = useState(false)
 
   const scopes = conn.device?.scopes ?? conn.pairing?.scopes ?? []
 
@@ -32,6 +34,8 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
       setRequesting(null)
     }
   }
+
+  if (showLog) return <ConnectionLogScreen onBack={() => setShowLog(false)} />
 
   return (
     <Screen title="Settings" onBack={onBack}>
@@ -58,6 +62,17 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
             Check the key fingerprint matches the one shown on the Mac. If it ever changes, stop and re-pair.
           </p>
         </Card>
+
+        <button
+          onClick={() => setShowLog(true)}
+          className="flex w-full items-center justify-between rounded-2xl border border-ink-700 bg-ink-800 px-4 py-3 text-left active:bg-ink-700"
+        >
+          <span>
+            <span className="block text-[15px] font-medium">Connection log</span>
+            <span className="block text-[13px] text-ink-400">What this phone tried when connecting</span>
+          </span>
+          <span className="text-ink-400">›</span>
+        </button>
 
         <section className="space-y-2">
           <h2 className="px-1 text-[13px] font-semibold uppercase tracking-wider text-ink-400">This device</h2>

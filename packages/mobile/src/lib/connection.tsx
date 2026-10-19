@@ -20,6 +20,7 @@ import {
   type HostSummary,
   type KeyPair,
   type PairResult,
+  type RelayInfo,
   type Scope,
   type SessionMessage,
   type SessionState,
@@ -38,6 +39,7 @@ import {
 import { applySessionEvent, sortSessions } from './sessions-sync.js'
 import { renameSession as renameSessionLogic } from './rename.js'
 import { switchModel } from './models.js'
+import { connLog, flushConnLog, loadConnLog, setConnMeta } from './connlog.js'
 import { haptic, onAppBackground, onAppResume, onNetworkChange, storage } from './platform.js'
 
 const PAIRING_KEY = 'dorabot-remote.pairing.v1'
@@ -49,6 +51,8 @@ export interface StoredPairing {
   hostName: string
   hostPublicKey: string
   addresses: string[]
+  /** Blind relay, persisted so a cold start off the LAN can still reach the Mac. */
+  relay?: RelayInfo
   identity: { publicKey: string; privateKey: string }
   scopes: Scope[]
   pairedAt: number
@@ -123,6 +127,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   const [attention, setAttention] = useState<Attention[]>([])
 
   const clientRef = useRef<RemoteClient | null>(null)
+  const pairingRef = useRef<StoredPairing | null>(null)
+  pairingRef.current = pairing
+  const netTypeRef = useRef<string>('unknown')
   const aggRef = useRef(new SessionAggregator())
   const loadedHistory = useRef(new Set<string>())
   const historyInfo = useRef(new Map<string, { shown: number; total: number }>())
@@ -131,12 +138,15 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   // ---- restore ------------------------------------------------------------
 
   useEffect(() => {
+    void loadConnLog()
     void (async () => {
       try {
         const raw = await storage.get(PAIRING_KEY)
         if (raw) {
           try {
-            setPairing(JSON.parse(raw) as StoredPairing)
+            const p = JSON.parse(raw) as StoredPairing
+            setPairing(p)
+            connLog('app', `pairing restored: ${p.addresses.length} lan candidate(s), relay ${p.relay ? `${p.relay.u} id=${p.relay.i.slice(0, 6)}` : 'NOT stored'}`)
           } catch {
             await storage.remove(PAIRING_KEY).catch(() => {})
           }
@@ -172,14 +182,31 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
         deviceId: pairing.deviceId,
         hostPublicKey: fromB64(null, pairing.hostPublicKey),
         addresses: pairing.addresses,
+        relay: pairing.relay ?? null,
         createSocket,
         lastSeq: cursor,
         clientVersion: '0.1.0',
+        log: (m) => connLog('client', m),
         onState: (s, detail) => {
+          connLog('state', detail ? `${s} (${detail})` : s)
           setState(s)
           setStateDetail(detail)
         },
-        onTransport: (t) => setTransport(t),
+        onTransport: (t) => {
+          connLog('transport', t ?? 'none')
+          setConnMeta({ transport: t })
+          setTransport(t)
+        },
+        onRelay: (relay) => {
+          // The effect is keyed on identity fields only, so this does not rebuild the client.
+          const cur = pairingRef.current
+          if (!cur) return
+          const next = { ...cur, relay }
+          pairingRef.current = next
+          setPairing(next)
+          setConnMeta({ relayUrl: relay.u, relayId: relay.i.slice(0, 6) })
+          void storage.set(PAIRING_KEY, JSON.stringify(next)).catch((e) => connLog('client', `could not persist relay: ${(e as Error).message}`))
+        },
         onReady: (info) => {
           setHost(info.host)
           setDevice(info.device)
@@ -197,6 +224,12 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
         },
       })
       clientRef.current = client
+      client.setNetworkType(netTypeRef.current)
+      setConnMeta({
+        lan: pairing.addresses,
+        relayUrl: pairing.relay?.u,
+        relayId: pairing.relay?.i.slice(0, 6),
+      })
       client.connect()
     })()
 
@@ -205,8 +238,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       client?.disconnect()
       clientRef.current = null
     }
+    // Keyed on the paired identity, not the record: scope or relay updates must not rebuild the client.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pairing])
+  }, [pairing?.deviceId, pairing?.pairedAt, pairing?.hostPublicKey])
 
   // Coming back from the background: nudge a resync rather than waiting for the
   // next backoff tick.
@@ -219,24 +253,36 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       const c = clientRef.current
       if (!c || c.state === 'revoked') return
       backgrounded.current = true
+      connLog('app', 'background: closing connection')
       c.disconnect()
+      void flushConnLog()
     })
   }, [])
 
   // Wi-Fi to cellular (or back): the old socket is bound to a dead interface, so
   // replace it now rather than waiting for the ping timeout.
   useEffect(() => {
-    return onNetworkChange(() => {
-      const c = clientRef.current
-      if (!c || c.state === 'revoked') return
-      backgrounded.current = false
-      c.forceReconnect()
-    })
+    return onNetworkChange(
+      () => {
+        const c = clientRef.current
+        if (!c || c.state === 'revoked') return
+        backgrounded.current = false
+        connLog('net', 'network changed: forcing reconnect')
+        c.forceReconnect()
+      },
+      (status, prev) => {
+        netTypeRef.current = status.connectionType
+        clientRef.current?.setNetworkType(status.connectionType)
+        setConnMeta({ netType: status.connectionType, netConnected: status.connected })
+        connLog('net', `${status.connectionType} ${status.connected ? 'connected' : 'offline'}${prev ? ` (was ${prev.connectionType} ${prev.connected ? 'connected' : 'offline'})` : ''}`)
+      },
+    )
   }, [])
 
   useEffect(() => {
     return onAppResume(() => {
       const c = clientRef.current
+      connLog('app', `foreground (client ${c ? c.state : 'none'}, net ${netTypeRef.current})`)
       if (!c) return
       if (backgrounded.current) {
         // Intentional disconnect: reconnect straight away, skipping any backoff.
@@ -421,6 +467,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       hostName: result.hostName,
       hostPublicKey: toB64(null, result.hostPublicKey),
       addresses: result.addresses,
+      relay: result.relay,
       identity: identityToB64(null, result.identity),
       scopes: result.scopes,
       pairedAt: Date.now(),
