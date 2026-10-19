@@ -3,9 +3,6 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Sidecar daemon that lets a paired phone talk to your local dorabot gateway. No changes to dorabot itself.",
-  "bin": {
-    "dorabot-remote": "./dist/cli.js"
-  },
   "main": "./dist/index.js",
   "files": [
     "dist"

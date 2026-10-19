@@ -40,6 +40,7 @@ import { applySessionEvent, sortSessions } from './sessions-sync.js'
 import { renameSession as renameSessionLogic } from './rename.js'
 import { switchModel } from './models.js'
 import { connLog, flushConnLog, loadConnLog, setConnMeta } from './connlog.js'
+import { createDemoClient, type ClientLike } from './demo.js'
 import { haptic, onAppBackground, onAppResume, onNetworkChange, storage } from './platform.js'
 
 const PAIRING_KEY = 'dorabot-remote.pairing.v1'
@@ -98,6 +99,10 @@ interface ConnectionValue {
   /** Set when the bridge returned only the newest part of a long history. */
   getHistoryInfo: (sessionKey: string) => { shown: number; total: number } | null
   clearAttention: (sessionKey: string) => void
+  /** Demo mode: a fake Mac inside the app for App Review. Never touches pairing storage. */
+  demo: boolean
+  enterDemo: () => void
+  exitDemo: () => void
 }
 
 const Ctx = createContext<ConnectionValue | null>(null)
@@ -125,8 +130,11 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   const lastOpened = useRef<{ key: string; id?: string } | null>(null)
   const [revision, setRevision] = useState(0)
   const [attention, setAttention] = useState<Attention[]>([])
+  const [demo, setDemo] = useState(false)
+  const demoRef = useRef(false)
+  demoRef.current = demo
 
-  const clientRef = useRef<RemoteClient | null>(null)
+  const clientRef = useRef<ClientLike | null>(null)
   const pairingRef = useRef<StoredPairing | null>(null)
   pairingRef.current = pairing
   const netTypeRef = useRef<string>('unknown')
@@ -241,6 +249,49 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     // Keyed on the paired identity, not the record: scope or relay updates must not rebuild the client.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pairing?.deviceId, pairing?.pairedAt, pairing?.hostPublicKey])
+
+  // ---- demo ---------------------------------------------------------------
+
+  // Runs against an in-app fake Mac. Deliberately separate from the effect above:
+  // no storage reads or writes, no sockets, no push.
+  useEffect(() => {
+    if (!demo) return
+    aggRef.current = new SessionAggregator()
+    const client = createDemoClient({
+      onState: (s) => {
+        setState(s)
+        setStateDetail(undefined)
+      },
+      onReady: (info) => {
+        setHost(info.host)
+        setDevice(info.device)
+        setGatewayConnected(info.gatewayConnected)
+        void refreshSessionsInternal()
+        void client.subscribe([])
+      },
+      onEvent: (event, data, seq, sessionKey) => handleEvent(event, data, seq, sessionKey),
+    })
+    clientRef.current = client
+    client.connect()
+    return () => {
+      client.disconnect()
+      if (clientRef.current === client) clientRef.current = null
+      aggRef.current = new SessionAggregator()
+      loadedHistory.current.clear()
+      historyInfo.current.clear()
+      setSessions([])
+      setAttention([])
+      setHost(null)
+      setDevice(null)
+      setState('idle')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [demo])
+
+  const enterDemo = useCallback(() => {
+    if (!pairingRef.current) setDemo(true)
+  }, [])
+  const exitDemo = useCallback(() => setDemo(false), [])
 
   // Coming back from the background: nudge a resync rather than waiting for the
   // next backoff tick.
@@ -479,6 +530,11 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   }, [])
 
   const forget = useCallback(async () => {
+    // In the demo there is nothing real to forget; never reach the pairing storage below.
+    if (demoRef.current) {
+      setDemo(false)
+      return
+    }
     // Tell the Mac to stop notifying this phone before the key is gone. Best effort:
     // offline, or without the approvals scope, the Mac's token is dropped on revoke
     // or by APNs once the app is deleted.
@@ -532,6 +588,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       getHistoryInfo: (key) => historyInfo.current.get(key) ?? null,
       getSession: (key) => (aggRef.current.keys().includes(key) ? aggRef.current.get(key) : emptySessionState(key)),
       clearAttention: (key) => setAttention((prev) => prev.filter((a) => a.sessionKey !== key)),
+      demo,
+      enterDemo,
+      exitDemo,
     }),
     [
       ready,
@@ -551,6 +610,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       rpc,
       refreshSessionsInternal,
       openSession,
+      demo,
+      enterDemo,
+      exitDemo,
     ],
   )
 
