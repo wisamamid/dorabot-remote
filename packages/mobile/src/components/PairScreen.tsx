@@ -14,7 +14,7 @@ const createSocket = (url: string) => new WebSocket(url) as never
  * the clear.
  */
 export function PairScreen(): ReactNode {
-  const { savePairing } = useConnection()
+  const { savePairing, enterDemo } = useConnection()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [manual, setManual] = useState(false)
@@ -149,6 +149,10 @@ export function PairScreen(): ReactNode {
           </Button>
         )}
       </div>
+
+      <button onClick={enterDemo} className="text-center text-[14px] font-medium text-mint-500 underline">
+        Try a demo (no Mac needed)
+      </button>
 
       <p className="text-center text-[13px] leading-relaxed text-ink-500">
         Your phone talks straight to your Mac on your network. Away from home it goes through a relay that only ever sees encrypted data.

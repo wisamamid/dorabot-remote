@@ -1,0 +1,42 @@
+{
+  "name": "dorabot-remote",
+  "version": "0.1.0",
+  "description": "One-command bridge that lets your phone control your own dorabot, end-to-end encrypted. Companion app: DoraBot Remote.",
+  "keywords": [
+    "dorabot",
+    "remote",
+    "bridge",
+    "e2ee",
+    "tailscale"
+  ],
+  "license": "MIT",
+  "author": "Wisam Amid",
+  "homepage": "https://github.com/wisamamid/dorabot-remote#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wisamamid/dorabot-remote.git",
+    "directory": "packages/cli"
+  },
+  "type": "module",
+  "bin": {
+    "dorabot-remote": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "node build.mjs --check",
+    "test": "vitest run --passWithNoTests",
+    "prepack": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}

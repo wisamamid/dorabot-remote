@@ -18,6 +18,7 @@ import {
   type ConnectionState,
   type DeviceSummary,
   type HostSummary,
+  type ImageAttachment,
   type KeyPair,
   type PairResult,
   type RelayInfo,
@@ -38,9 +39,12 @@ import {
 } from 'react'
 import { applySessionEvent, sortSessions } from './sessions-sync.js'
 import { renameSession as renameSessionLogic } from './rename.js'
+import { normalizePins, setPinned as setPinnedLogic, type Pin } from './pins.js'
 import { switchModel } from './models.js'
 import { connLog, flushConnLog, loadConnLog, setConnMeta } from './connlog.js'
+import { createDemoClient, type ClientLike } from './demo.js'
 import { haptic, onAppBackground, onAppResume, onNetworkChange, storage } from './platform.js'
+import { clearPushKey } from './push-key.js'
 
 const PAIRING_KEY = 'dorabot-remote.pairing.v1'
 const CURSOR_KEY = 'dorabot-remote.cursor.v1'
@@ -75,6 +79,10 @@ interface ConnectionValue {
   scopes: Scope[]
   sessions: StoredSession[]
   sessionsLoading: boolean
+  /** Pinned sessions, newest pin first. Synced across devices through the bridge. */
+  pins: Pin[]
+  /** Optimistic pin/unpin by session key; rolls back and throws if the bridge refuses. */
+  setPinned: (sessionKey: string, pinned: boolean) => Promise<void>
   /** Bumped on every state change so consumers re-render. */
   revision: number
   attention: Attention[]
@@ -89,6 +97,8 @@ interface ConnectionValue {
   renameSession: (sessionId: string, name: string) => Promise<void>
   /** Optimistic per-session model switch; rolls back and throws on failure. */
   setSessionModel: (target: { sessionId: string; sessionKey: string; running: boolean }, model: string) => Promise<{ live: boolean }>
+  /** Show photos we just sent on the matching user bubble (the gateway echo carries only the text). */
+  attachImages: (sessionKey: string, prompt: string, images: ImageAttachment[]) => void
   openSession: (sessionKey: string, sessionId?: string) => Promise<void>
   /** Reload one session's transcript from the gateway (pull to refresh). */
   /** Winning transport while connected, for the status banner. */
@@ -98,6 +108,10 @@ interface ConnectionValue {
   /** Set when the bridge returned only the newest part of a long history. */
   getHistoryInfo: (sessionKey: string) => { shown: number; total: number } | null
   clearAttention: (sessionKey: string) => void
+  /** Demo mode: a fake Mac inside the app for App Review. Never touches pairing storage. */
+  demo: boolean
+  enterDemo: () => void
+  exitDemo: () => void
 }
 
 const Ctx = createContext<ConnectionValue | null>(null)
@@ -121,12 +135,16 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   const [gatewayConnected, setGatewayConnected] = useState(false)
   const [sessions, setSessions] = useState<StoredSession[]>([])
   const [sessionsLoading, setSessionsLoading] = useState(false)
+  const [pins, setPins] = useState<Pin[]>([])
   const [transport, setTransport] = useState<'lan' | 'relay' | null>(null)
   const lastOpened = useRef<{ key: string; id?: string } | null>(null)
   const [revision, setRevision] = useState(0)
   const [attention, setAttention] = useState<Attention[]>([])
+  const [demo, setDemo] = useState(false)
+  const demoRef = useRef(false)
+  demoRef.current = demo
 
-  const clientRef = useRef<RemoteClient | null>(null)
+  const clientRef = useRef<ClientLike | null>(null)
   const pairingRef = useRef<StoredPairing | null>(null)
   pairingRef.current = pairing
   const netTypeRef = useRef<string>('unknown')
@@ -212,6 +230,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
           setDevice(info.device)
           setGatewayConnected(info.gatewayConnected)
           void refreshSessionsInternal()
+          void refreshPinsInternal()
           // Follow every session so an approval on any of them reaches the phone,
           // not just the one currently on screen.
           void client?.subscribe(aggRef.current.keys()).catch(() => {})
@@ -241,6 +260,51 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     // Keyed on the paired identity, not the record: scope or relay updates must not rebuild the client.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pairing?.deviceId, pairing?.pairedAt, pairing?.hostPublicKey])
+
+  // ---- demo ---------------------------------------------------------------
+
+  // Runs against an in-app fake Mac. Deliberately separate from the effect above:
+  // no storage reads or writes, no sockets, no push.
+  useEffect(() => {
+    if (!demo) return
+    aggRef.current = new SessionAggregator()
+    const client = createDemoClient({
+      onState: (s) => {
+        setState(s)
+        setStateDetail(undefined)
+      },
+      onReady: (info) => {
+        setHost(info.host)
+        setDevice(info.device)
+        setGatewayConnected(info.gatewayConnected)
+        void refreshSessionsInternal()
+        void refreshPinsInternal()
+        void client.subscribe([])
+      },
+      onEvent: (event, data, seq, sessionKey) => handleEvent(event, data, seq, sessionKey),
+    })
+    clientRef.current = client
+    client.connect()
+    return () => {
+      client.disconnect()
+      if (clientRef.current === client) clientRef.current = null
+      aggRef.current = new SessionAggregator()
+      loadedHistory.current.clear()
+      historyInfo.current.clear()
+      setSessions([])
+      setPins([])
+      setAttention([])
+      setHost(null)
+      setDevice(null)
+      setState('idle')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [demo])
+
+  const enterDemo = useCallback(() => {
+    if (!pairingRef.current) setDemo(true)
+  }, [])
+  const exitDemo = useCallback(() => setDemo(false), [])
 
   // Coming back from the background: nudge a resync rather than waiting for the
   // next backoff tick.
@@ -334,6 +398,10 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
         setGatewayConnected((data as { state: string }).state === 'ready')
         return
       }
+      if (event === 'remote.pins_changed') {
+        setPins(normalizePins((data as { pins?: unknown })?.pins))
+        return
+      }
       if (event === 'remote.scopes_changed') {
         const next = (data as { scopes: Scope[] }).scopes
         setDevice((d) => (d ? { ...d, scopes: next } : d))
@@ -393,6 +461,17 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     const c = clientRef.current
     if (!c) throw new Error('Not paired with a Mac yet.')
     return c.rpc<T>(method, params)
+  }, [])
+
+  const refreshPinsInternal = useCallback(async () => {
+    const c = clientRef.current
+    if (!c || c.state !== 'ready') return
+    // Without the sessions scope the bridge refuses; the list simply has no pins.
+    try {
+      setPins(normalizePins(await c.rpc('remote.pins.list')))
+    } catch {
+      // Offline or an older bridge without pins: keep what we have.
+    }
   }, [])
 
   const refreshSessionsInternal = useCallback(async () => {
@@ -479,6 +558,11 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   }, [])
 
   const forget = useCallback(async () => {
+    // In the demo there is nothing real to forget; never reach the pairing storage below.
+    if (demoRef.current) {
+      setDemo(false)
+      return
+    }
     // Tell the Mac to stop notifying this phone before the key is gone. Best effort:
     // offline, or without the approvals scope, the Mac's token is dropped on revoke
     // or by APNs once the app is deleted.
@@ -490,6 +574,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       ])
     }
     await storage.remove('dorabot-remote.push.sent.v1').catch(() => {})
+    void clearPushKey()
     clientRef.current?.disconnect()
     clientRef.current = null
     aggRef.current = new SessionAggregator()
@@ -499,6 +584,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     await storage.remove(CURSOR_KEY)
     setPairing(null)
     setSessions([])
+    setPins([])
     setHost(null)
     setDevice(null)
     setState('idle')
@@ -516,6 +602,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       scopes: device?.scopes ?? pairing?.scopes ?? [],
       sessions,
       sessionsLoading,
+      pins,
+      setPinned: (key, pinned) => setPinnedLogic({ rpc, setPins }, key, pinned),
       transport,
       revision,
       attention,
@@ -527,11 +615,18 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       refreshSessions: refreshSessionsInternal,
       renameSession: (id, name) => renameSessionLogic({ rpc, setSessions }, id, name),
       setSessionModel: (t, m) => switchModel({ rpc, setSessions }, t, m),
+      attachImages: (k, prompt, images) => {
+        aggRef.current.attachImages(k, prompt, images)
+        bump()
+      },
       openSession: (k, id) => openSession(k, id),
       reloadHistory: (k, id) => openSession(k, id, true),
       getHistoryInfo: (key) => historyInfo.current.get(key) ?? null,
       getSession: (key) => (aggRef.current.keys().includes(key) ? aggRef.current.get(key) : emptySessionState(key)),
       clearAttention: (key) => setAttention((prev) => prev.filter((a) => a.sessionKey !== key)),
+      demo,
+      enterDemo,
+      exitDemo,
     }),
     [
       ready,
@@ -543,6 +638,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       gatewayConnected,
       sessions,
       sessionsLoading,
+      pins,
       transport,
       revision,
       attention,
@@ -551,6 +647,10 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       rpc,
       refreshSessionsInternal,
       openSession,
+      bump,
+      demo,
+      enterDemo,
+      exitDemo,
     ],
   )
 

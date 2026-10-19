@@ -21,6 +21,8 @@ export interface DeviceRecord {
   pushEnv?: 'production' | 'sandbox'
   /** Also push when a run finishes or fails. Off by default. */
   pushOnResult?: boolean
+  /** base64 32-byte key the phone generated; encrypts push content. Never logged or sent anywhere but used locally. */
+  pushKey?: string | null
 }
 
 export interface ScopeRequest {
@@ -31,6 +33,11 @@ export interface ScopeRequest {
   reason: string
   createdAt: number
   status: 'pending' | 'granted' | 'denied'
+}
+
+export interface PinRecord {
+  id: string
+  pinnedAt: number
 }
 
 export interface StoredEvent {
@@ -103,6 +110,11 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS scope_requests_status ON scope_requests (status);
 
+      CREATE TABLE IF NOT EXISTS pins (
+        id        TEXT PRIMARY KEY,
+        pinned_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -113,6 +125,7 @@ export class Store {
     if (!cols.includes('push_token')) this.db.exec('ALTER TABLE devices ADD COLUMN push_token TEXT')
     if (!cols.includes('push_platform')) this.db.exec('ALTER TABLE devices ADD COLUMN push_platform TEXT')
     if (!cols.includes('push_env')) this.db.exec("ALTER TABLE devices ADD COLUMN push_env TEXT NOT NULL DEFAULT 'production'")
+    if (!cols.includes('push_key')) this.db.exec('ALTER TABLE devices ADD COLUMN push_key TEXT')
     if (!cols.includes('push_on_result')) this.db.exec('ALTER TABLE devices ADD COLUMN push_on_result INTEGER NOT NULL DEFAULT 0')
   }
 
@@ -138,6 +151,36 @@ export class Store {
     this.db
       .prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
       .run(key, JSON.stringify(value))
+  }
+
+  // -------------------------------------------------------------------------
+  // Pinned sessions (shared by every paired device; dorabot itself has no pins)
+  // -------------------------------------------------------------------------
+
+  /** Pins, most recently pinned first. `id` is the session key (`channel:chatType:chatId`). */
+  listPins(): PinRecord[] {
+    const rows = this.db.prepare('SELECT id, pinned_at FROM pins ORDER BY pinned_at DESC, id ASC').all() as Array<{
+      id: string
+      pinned_at: number
+    }>
+    return rows.map((r) => ({ id: r.id, pinnedAt: Number(r.pinned_at) }))
+  }
+
+  /** Returns true when the set of pins changed. Re-pinning keeps the original pinnedAt. */
+  setPin(id: string, pinned: boolean): boolean {
+    if (pinned) {
+      return this.db.prepare('INSERT OR IGNORE INTO pins (id, pinned_at) VALUES (?, ?)').run(id, Date.now()).changes > 0
+    }
+    return this.db.prepare('DELETE FROM pins WHERE id = ?').run(id).changes > 0
+  }
+
+  /** Drop pins whose id is not in `keep`. Returns how many were removed. */
+  prunePins(keep: ReadonlySet<string>): number {
+    let removed = 0
+    for (const p of this.listPins()) {
+      if (!keep.has(p.id) && this.setPin(p.id, false)) removed++
+    }
+    return removed
   }
 
   // -------------------------------------------------------------------------
@@ -221,6 +264,7 @@ export class Store {
       pushPlatform: (row.push_platform as 'ios' | 'android' | null) ?? null,
       pushEnv: row.push_env === 'sandbox' ? 'sandbox' : 'production',
       pushOnResult: Boolean(row.push_on_result),
+      pushKey: (row.push_key as string | null) ?? null,
     }
   }
 
@@ -239,7 +283,7 @@ export class Store {
 
   /** Revoking also drops the push token: a revoked device must never be notified. */
   setRevoked(id: string, revoked: boolean): boolean {
-    if (revoked) this.db.prepare('UPDATE devices SET push_token = NULL, push_platform = NULL WHERE id = ?').run(id)
+    if (revoked) this.db.prepare('UPDATE devices SET push_token = NULL, push_platform = NULL, push_key = NULL WHERE id = ?').run(id)
     return this.db.prepare('UPDATE devices SET revoked = ? WHERE id = ?').run(revoked ? 1 : 0, id).changes > 0n
   }
 
@@ -247,17 +291,24 @@ export class Store {
     return this.db.prepare('UPDATE devices SET scopes = ? WHERE id = ?').run(JSON.stringify(scopes), id).changes > 0
   }
 
-  setPushToken(id: string, token: string | null, platform: 'ios' | 'android' | null, env: 'production' | 'sandbox' = 'production'): boolean {
+  /** Every (re-)registration replaces the key, so passing none drops the old one (rotation); clearing the token drops it too. */
+  setPushToken(
+    id: string,
+    token: string | null,
+    platform: 'ios' | 'android' | null,
+    env: 'production' | 'sandbox' = 'production',
+    pushKey: string | null = null,
+  ): boolean {
     return (
       this.db
-        .prepare('UPDATE devices SET push_token = ?, push_platform = ?, push_env = ? WHERE id = ?')
-        .run(token, platform, env, id).changes > 0
+        .prepare('UPDATE devices SET push_token = ?, push_platform = ?, push_env = ?, push_key = ? WHERE id = ?')
+        .run(token, platform, env, token ? pushKey : null, id).changes > 0
     )
   }
 
   /** Remove a token only if it is still the one we sent with (a newer registration may have replaced it). */
   clearPushTokenIf(id: string, token: string): boolean {
-    return this.db.prepare('UPDATE devices SET push_token = NULL, push_platform = NULL WHERE id = ? AND push_token = ?').run(id, token).changes > 0
+    return this.db.prepare('UPDATE devices SET push_token = NULL, push_platform = NULL, push_key = NULL WHERE id = ? AND push_token = ?').run(id, token).changes > 0
   }
 
   setPushOnResult(id: string, on: boolean): boolean {

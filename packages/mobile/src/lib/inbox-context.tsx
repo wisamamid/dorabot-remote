@@ -112,7 +112,7 @@ export function InboxProvider({ children }: { children: ReactNode }): ReactNode 
   // Switching Macs must not leave the previous Mac's prompts on screen.
   useEffect(() => {
     dispatch({ type: 'clear' })
-  }, [conn.pairing?.hostId])
+  }, [conn.pairing?.hostId, conn.demo])
 
   // ---- deadlines ----------------------------------------------------------
 

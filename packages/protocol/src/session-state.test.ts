@@ -59,3 +59,25 @@ describe('mergeHistory', () => {
     expect(mergeHistory([user('h')], [user('x')])).toEqual([user('h'), user('x')])
   })
 })
+
+describe('attachImages', () => {
+  const img = [{ data: 'QUJD', mediaType: 'image/jpeg' }]
+  const lastUser = (agg: SessionAggregator) => agg.get('s').chatItems.filter((i) => i.type === 'user').at(-1) as { images?: unknown[] }
+
+  it('attaches to the echoed user message when the echo comes after', () => {
+    const agg = new SessionAggregator()
+    agg.attachImages('s', 'look', img)
+    agg.apply('agent.user_message', { sessionKey: 's', prompt: 'look' }, 1, 's')
+    expect(lastUser(agg).images).toEqual(img)
+    // consumed: a later identical prompt from elsewhere has no photos
+    agg.apply('agent.user_message', { sessionKey: 's', prompt: 'look' }, 2, 's')
+    expect(lastUser(agg).images).toBeUndefined()
+  })
+
+  it('attaches to an echo that already arrived', () => {
+    const agg = new SessionAggregator()
+    agg.apply('agent.user_message', { sessionKey: 's', prompt: 'look' }, 1, 's')
+    agg.attachImages('s', 'look', img)
+    expect(lastUser(agg).images).toEqual(img)
+  })
+})

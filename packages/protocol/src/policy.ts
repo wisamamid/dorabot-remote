@@ -45,6 +45,9 @@ const RULES: Record<Scope, Rule[]> = {
     'provider.codex.models',
     // Replays the durable session log, so it needs the same scope as reading sessions.
     'remote.events',
+    // Pins are shared across devices and live on the bridge, not the gateway.
+    'remote.pins.list',
+    'remote.pins.set',
   ],
   chat: [
     'chat.send',
@@ -194,10 +197,12 @@ export const BRIDGE_METHODS = new Set([
   'remote.unregisterPush',
   'remote.setPushPrefs',
   'remote.pushPrefs',
+  'remote.pins.list',
+  'remote.pins.set',
 ])
 
 /** Bridge methods that also require a scope (they are not open to every device). */
-const BRIDGE_SCOPE_GATED = new Set(['remote.events', 'remote.registerPush', 'remote.unregisterPush', 'remote.setPushPrefs', 'remote.pushPrefs'])
+const BRIDGE_SCOPE_GATED = new Set(['remote.events', 'remote.registerPush', 'remote.unregisterPush', 'remote.setPushPrefs', 'remote.pushPrefs', 'remote.pins.list', 'remote.pins.set'])
 
 function matches(rule: Rule, method: string): boolean {
   if (rule.endsWith('.*')) return method.startsWith(rule.slice(0, -1))

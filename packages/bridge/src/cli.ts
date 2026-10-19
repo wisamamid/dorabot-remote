@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { SCOPES, type Scope, fingerprint, fromB64, generateIdentity, toB64 } from '@dorabot-remote/protocol'
@@ -9,11 +9,14 @@ import { BRIDGE_VERSION, loadIdentity, loadSettings, resolvePaths, saveSettings 
 import { Bridge } from './bridge.js'
 import { Store } from './store.js'
 import * as launchd from './launchd.js'
+import { SetupError, isFirstRun, runSetup, runUninstall } from './setup.js'
 
 const USAGE = `dorabot-remote ${BRIDGE_VERSION}
 
   Pair your phone with the dorabot running on this machine.
 
+  setup                       One-command install: run at login, then show the pairing QR
+  update                      Re-run setup with this version (npx dorabot-remote@latest update)
   start                       Run the bridge (also opens the pairing page)
   pair                        Print a pairing QR in the terminal
   devices                     List paired devices
@@ -23,7 +26,8 @@ const USAGE = `dorabot-remote ${BRIDGE_VERSION}
   addresses                   Show the addresses a phone can reach this Mac on
   config                      Show or change settings
   install                     Run the bridge at login as a launchd agent (macOS)
-  uninstall                   Stop and remove the launchd agent
+  uninstall                   Stop and remove the launchd agent and installed app
+                              (keeps keys and devices; --purge deletes those too)
   status                      Show whether the launchd agent is running
 
 Options
@@ -32,6 +36,8 @@ Options
   --advertise <addr>  Extra address to put in the QR, e.g. a Tailscale name
   --scopes <a,b,c>    Permissions to grant at pairing time
   --open              Open the control page in a browser on start
+  --yes               Do not ask questions (setup)
+  --purge             With uninstall: also delete keys and paired devices
 
 Permissions: ${SCOPES.join(', ')}
 `
@@ -45,6 +51,9 @@ async function main(): Promise<void> {
       advertise: { type: 'string', multiple: true },
       scopes: { type: 'string' },
       open: { type: 'boolean' },
+      yes: { type: 'boolean', short: 'y' },
+      purge: { type: 'boolean' },
+      uninstall: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
       version: { type: 'boolean', short: 'v' },
     },
@@ -60,6 +69,13 @@ async function main(): Promise<void> {
   }
 
   const paths = resolvePaths()
+  const firstRun = positionals.length === 0 && isFirstRun(paths, launchd)
+  if (firstRun && process.stdout.isTTY) {
+    process.stdout.write(
+      `dorabot-remote ${BRIDGE_VERSION}\n\n  First run. To install the bridge and pair your phone, run:\n\n    npx dorabot-remote setup\n\n  (or "dorabot-remote start" to run it in the foreground.)\n`,
+    )
+    return
+  }
   const settings = loadSettings(paths)
   let dirty = false
   if (values.port) {
@@ -107,11 +123,19 @@ async function main(): Promise<void> {
     case 'addresses':
       cmdAddresses()
       return
+    case 'setup':
+    case 'update':
+      if (values.uninstall) {
+        await runUninstall({ paths, launchd, log: say }, values.purge === true)
+        return
+      }
+      await cmdSetup(command === 'update', values.yes === true)
+      return
     case 'install':
       cmdInstall()
       return
     case 'uninstall':
-      process.stdout.write(launchd.uninstall() ? 'Removed the launchd agent.\n' : 'The launchd agent was not installed.\n')
+      await runUninstall({ paths, launchd, log: say }, values.purge === true)
       return
     case 'status':
       cmdStatus()
@@ -122,6 +146,55 @@ async function main(): Promise<void> {
     default:
       process.stderr.write(`Unknown command "${command}".\n\n${USAGE}`)
       process.exitCode = 1
+  }
+
+  function say(line: string): void {
+    process.stdout.write(`${line}\n`)
+  }
+
+  async function cmdSetup(isUpdate: boolean, yes: boolean): Promise<void> {
+    const env: Record<string, string> = {}
+    for (const key of ['DORABOT_REMOTE_HOME', 'DORABOT_HOME']) {
+      const v = process.env[key]
+      if (v) env[key] = v
+    }
+    const interactive = !yes && process.stdin.isTTY === true && process.stdout.isTTY === true
+    try {
+      await runSetup({
+        paths,
+        version: BRIDGE_VERSION,
+        sourceDir: dirname(fileURLToPath(import.meta.url)),
+        nodePath: process.execPath,
+        nodeVersion: process.versions.node,
+        platform: process.platform,
+        port: settings.port,
+        launchd,
+        env,
+        log: say,
+        health: async () => (await fetch(`http://127.0.0.1:${settings.port}/api/state`)).ok,
+        pair: () => cmdPair(undefined),
+        skipPair: isUpdate,
+        openUrl: (url) => {
+          void import('node:child_process').then(({ spawn }) => spawn('open', [url], { stdio: 'ignore', detached: true }).unref())
+        },
+        confirm: interactive
+          ? async (q) => {
+              const { createInterface } = await import('node:readline/promises')
+              const rl = createInterface({ input: process.stdin, output: process.stdout })
+              const a = (await rl.question(`${q} [Y/n] `)).trim().toLowerCase()
+              rl.close()
+              return a === '' || a === 'y' || a === 'yes'
+            }
+          : undefined,
+      })
+    } catch (err) {
+      if (err instanceof SetupError) {
+        process.stderr.write(`\n${err.message}\n`)
+        process.exitCode = 1
+        return
+      }
+      throw err
+    }
   }
 
   async function cmdStart(open: boolean): Promise<void> {

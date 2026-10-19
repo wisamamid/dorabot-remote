@@ -2,11 +2,13 @@
  * Push triggers. When something needs a human (a question, an approval) and a
  * phone is not connected to see it live, ask the relay to wake that phone.
  *
- * The relay and Apple only ever see a generic kind plus an opaque routing id,
- * never session names, tool names or prompt text. Tokens are never logged.
+ * The relay and Apple only ever see a generic kind, an opaque routing id and (for
+ * devices that registered a push key) an E2E-encrypted blob; never session names,
+ * tool names or prompt text in the clear. Tokens are never logged.
  */
 import { createHash } from 'node:crypto'
 import { signBytes, type SigningKeyPair } from '@dorabot-remote/protocol'
+import { buildPushContent, encryptPushContent, parsePushKey, type PushContent } from './push-content.js'
 import type { DeviceRecord, Store } from './store.js'
 
 export type PushKind = 'question' | 'approval' | 'result' | 'error'
@@ -79,10 +81,11 @@ export class PushNotifier {
       default:
         return []
     }
-    return this.notify(kind, rid.slice(0, 128))
+    const r = rid.slice(0, 128)
+    return this.notify(kind, r, buildPushContent(name, data, r))
   }
 
-  private notify(kind: PushKind, rid: string): Promise<void>[] {
+  private notify(kind: PushKind, rid: string, content: PushContent | null): Promise<void>[] {
     const out: Promise<void>[] = []
     const now = this.now()
     for (const device of this.opts.store.listDevices()) {
@@ -95,7 +98,7 @@ export class PushNotifier {
         if (last !== undefined && now - last < APPROVAL_COALESCE_MS) continue
         this.lastApproval.set(device.id, now)
       }
-      out.push(this.send(device, kind, rid))
+      out.push(this.send(device, kind, rid, content))
     }
     return out
   }
@@ -115,8 +118,20 @@ export class PushNotifier {
     }
   }
 
-  private async send(device: DeviceRecord, kind: PushKind, rid: string): Promise<void> {
+  private encFor(device: DeviceRecord, content: PushContent | null): string | undefined {
+    if (!content || device.pushPlatform !== 'ios') return undefined
+    const key = parsePushKey(device.pushKey)
+    if (!key) return undefined
+    try {
+      return encryptPushContent(content, key)
+    } catch {
+      return undefined
+    }
+  }
+
+  private async send(device: DeviceRecord, kind: PushKind, rid: string, content: PushContent | null): Promise<void> {
     const relay = this.opts.relay!
+    const enc = this.encFor(device, content)
     const raw = new TextEncoder().encode(
       JSON.stringify({
         token: device.pushToken,
@@ -124,6 +139,7 @@ export class PushNotifier {
         kind,
         rid,
         ...(device.pushPlatform === 'ios' ? { env: device.pushEnv ?? 'production' } : {}),
+        ...(enc ? { enc } : {}),
         ts: this.now(),
       }),
     )
@@ -148,6 +164,6 @@ export class PushNotifier {
     } finally {
       clearTimeout(timer)
     }
-    this.opts.log(`push ${kind} -> "${device.name}": ${status}`)
+    this.opts.log(`push ${kind} -> "${device.name}"${enc ? ' (e2e)' : ''}: ${status}`)
   }
 }

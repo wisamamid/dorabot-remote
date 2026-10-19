@@ -1,22 +1,29 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { cx } from './ui.js'
 
-const ACTION_PX = 88
+const ACTION_PX = 80
 const LONG_PRESS_MS = 500
 const SLOP = 8
 
 /**
  * A list row with an iOS-style swipe-left action and a long-press hook. Touch only,
  * so a trackpad or mouse just gets the plain row. The row's own click is swallowed
- * after a long press or swipe so it does not also open the session.
+ * after a long press or swipe so it does not also open the session. Every action
+ * gets one ACTION_PX-wide button, the first being the leftmost.
  */
+export interface SwipeAction {
+  label: string
+  onPress: () => void
+  /** `accent` is the mint button; `muted` a grey one for secondary actions. */
+  tone?: 'accent' | 'muted'
+}
+
 export function SwipeRow({
-  actionLabel,
-  onAction,
+  actions,
   onLongPress,
   children,
 }: {
-  actionLabel: string
-  onAction: () => void
+  actions: SwipeAction[]
   onLongPress: () => void
   children: ReactNode
 }): ReactNode {
@@ -25,6 +32,9 @@ export function SwipeRow({
   const openRef = useRef(false)
   const longRef = useRef(onLongPress)
   longRef.current = onLongPress
+  const width = ACTION_PX * actions.length
+  const widthRef = useRef(width)
+  widthRef.current = width
 
   useEffect(() => {
     const el = ref.current
@@ -49,7 +59,7 @@ export function SwipeRow({
       if (!t || e.touches.length !== 1) return
       sx = t.clientX
       sy = t.clientY
-      base = openRef.current ? -ACTION_PX : 0
+      base = openRef.current ? -widthRef.current : 0
       mode = 'pending'
       swallow = false
       window.clearTimeout(timer)
@@ -75,7 +85,7 @@ export function SwipeRow({
         }
       }
       if (e.cancelable) e.preventDefault()
-      set(Math.max(-ACTION_PX * 1.4, Math.min(0, base + dx)), false)
+      set(Math.max(-widthRef.current * 1.4, Math.min(0, base + dx)), false)
     }
     const end = (e: TouchEvent): void => {
       window.clearTimeout(timer)
@@ -84,10 +94,10 @@ export function SwipeRow({
       if (was !== 'swipe') return
       swallow = true
       const x = (e.changedTouches[0]?.clientX ?? sx) - sx + base
-      if (x < -ACTION_PX / 2) {
+      if (x < -widthRef.current / 2) {
         openRef.current = true
         setOpen(true)
-        set(-ACTION_PX, true)
+        set(-widthRef.current, true)
       } else close()
     }
     const click = (e: MouseEvent): void => {
@@ -118,22 +128,28 @@ export function SwipeRow({
 
   return (
     <div className="relative overflow-hidden rounded-card">
-      <div className="absolute inset-y-0 right-0 flex" style={{ width: ACTION_PX }} aria-hidden={!open}>
-        <button
-          tabIndex={open ? 0 : -1}
-          onClick={() => {
-            onAction()
-            openRef.current = false
-            setOpen(false)
-            if (ref.current) {
-              ref.current.style.transition = 'transform 200ms'
-              ref.current.style.transform = ''
-            }
-          }}
-          className="flex-1 bg-mint-600 text-[14px] font-semibold text-ink-950"
-        >
-          {actionLabel}
-        </button>
+      <div className="absolute inset-y-0 right-0 flex" style={{ width }} aria-hidden={!open}>
+        {actions.map((a) => (
+          <button
+            key={a.label}
+            tabIndex={open ? 0 : -1}
+            onClick={() => {
+              a.onPress()
+              openRef.current = false
+              setOpen(false)
+              if (ref.current) {
+                ref.current.style.transition = 'transform 200ms'
+                ref.current.style.transform = ''
+              }
+            }}
+            className={cx(
+              'flex-1 text-[14px] font-semibold',
+              a.tone === 'muted' ? 'bg-ink-600 text-ink-100' : 'bg-mint-600 text-ink-950',
+            )}
+          >
+            {a.label}
+          </button>
+        ))}
       </div>
       <div ref={ref} className="relative bg-ink-900">
         {children}

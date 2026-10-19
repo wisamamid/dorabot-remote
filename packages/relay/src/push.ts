@@ -18,8 +18,13 @@ export interface PushBody {
   rid?: string
   /** iOS only: which APNs environment the token belongs to. Defaults to production. */
   env?: 'production' | 'sandbox'
+  /** iOS only: opaque E2E-encrypted content (base64) for the Notification Service Extension. Never decrypted here. */
+  enc?: string
   ts: number
 }
+
+export const MAX_ENC_CHARS = 3000
+const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/
 export interface ServiceAccount {
   client_email: string
   private_key: string
@@ -35,14 +40,23 @@ export function parsePushBody(raw: string): PushBody | null {
     return null
   }
   if (!v || typeof v !== 'object') return null
-  const { token, platform, kind, rid, ts, env } = v
+  const { token, platform, kind, rid, ts, env, enc } = v
   if (typeof token !== 'string' || token.length < 8 || token.length > 4096) return null
   if (platform !== 'ios' && platform !== 'android') return null
   if (typeof kind !== 'string' || !(PUSH_KINDS as readonly string[]).includes(kind)) return null
   if (rid !== undefined && (typeof rid !== 'string' || rid.length === 0 || rid.length > 128)) return null
   if (typeof ts !== 'number' || !Number.isFinite(ts)) return null
   if (env !== undefined && env !== 'production' && env !== 'sandbox') return null
-  return { token, platform, kind: kind as PushKind, rid: rid as string | undefined, ts, ...(env ? { env } : {}) }
+  if (enc !== undefined && (typeof enc !== 'string' || enc.length === 0 || enc.length > MAX_ENC_CHARS || !B64_RE.test(enc))) return null
+  return {
+    token,
+    platform,
+    kind: kind as PushKind,
+    rid: rid as string | undefined,
+    ts,
+    ...(env ? { env } : {}),
+    ...(enc ? { enc: enc as string } : {}),
+  }
 }
 
 // ---------------------------------------------------------------------------

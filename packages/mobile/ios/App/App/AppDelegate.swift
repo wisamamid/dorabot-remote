@@ -1,5 +1,6 @@
 import UIKit
 import Capacitor
+import UserNotifications
 
 @UIApplicationMain
 class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -7,8 +8,22 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        // Override point for customization after application launch.
+        registerNotificationCategories()
         return true
+    }
+
+    /// Category ids match what the relay puts in `aps.category`. The JS side receives
+    /// the chosen action id ("APPROVE" / "DENY" / "ANSWER") with the notification data.
+    /// All actions open the app; approve/deny also require the phone to be unlocked.
+    private func registerNotificationCategories() {
+        let approve = UNNotificationAction(identifier: "APPROVE", title: "Approve", options: [.foreground, .authenticationRequired])
+        let deny = UNNotificationAction(identifier: "DENY", title: "Deny", options: [.foreground, .authenticationRequired, .destructive])
+        let answer = UNNotificationAction(identifier: "ANSWER", title: "Answer", options: [.foreground])
+        UNUserNotificationCenter.current().setNotificationCategories([
+            UNNotificationCategory(identifier: "APPROVAL", actions: [approve, deny], intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: "QUESTION", actions: [answer], intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: "ACTIVITY", actions: [], intentIdentifiers: [], options: []),
+        ])
     }
 
     func applicationWillResignActive(_ application: UIApplication) {
