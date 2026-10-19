@@ -5,6 +5,8 @@ import { haptic, platformName } from '../lib/platform.js'
 import { useAppLock } from '../lib/app-lock.js'
 import { usePush } from '../lib/push-context.js'
 import { ConnectionLogScreen } from './ConnectionLogScreen.js'
+import { MacsSection } from './MacsSection.js'
+import { displayName } from '../lib/hosts.js'
 import { Button, Card, Dot, Screen, cx } from './ui.js'
 
 /**
@@ -42,10 +44,12 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
   return (
     <Screen title="Settings" onBack={onBack}>
       <div className="scroll h-full space-y-6 px-4 py-4">
+        {!conn.demo && <MacsSection />}
+
         <Card className="space-y-3">
           <div className="flex items-center justify-between">
             <div className="min-w-0">
-              <div className="text-[16px] font-medium">{conn.host?.name ?? conn.pairing?.hostName ?? 'Not paired'}</div>
+              <div className="text-[16px] font-medium">{conn.pairing ? displayName(conn.pairing) : (conn.host?.name ?? 'Not paired')}</div>
               <div className="font-mono text-[12.5px] text-ink-400">
                 {conn.host?.fingerprint || 'unknown key'}
               </div>
@@ -198,8 +202,9 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
           {confirmForget ? (
             <Card tone="danger" className="space-y-3">
               <p className="text-[14px] leading-relaxed">
-                This deletes the key on this phone. You will need to scan a new code to connect again. It does not
-                revoke the device on the Mac.
+                This stops notifications from this Mac and deletes its key and saved data on this phone. You will need
+                to scan a new code to connect to it again. It does not revoke the device on the Mac. Your other Macs
+                stay paired.
               </p>
               <div className="flex gap-2">
                 <Button variant="ghost" onClick={() => setConfirmForget(false)} className="flex-1">
@@ -212,7 +217,7 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
             </Card>
           ) : (
             <Button variant="default" onClick={() => setConfirmForget(true)} className="w-full text-rose-glow">
-              Unpair this phone
+              Unpair this Mac
             </Button>
           )}
         </section>

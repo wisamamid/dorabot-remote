@@ -131,6 +131,7 @@ describe('PushNotifier with a push key', () => {
   it('pushKeyId is the first 8 hex of sha256(hostId)', () => {
     // sha256("host-abc") fixed vector, shared with the mobile and Swift implementations.
     expect(pushKeyId('host-abc')).toBe(createHash('sha256').update('host-abc').digest('hex').slice(0, 8))
+    expect(pushKeyId('host-abc')).toBe('dcf4a872')
     expect(pushKeyId('a')).toBe('ca978112')
   })
 

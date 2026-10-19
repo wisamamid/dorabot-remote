@@ -2,6 +2,7 @@ import type { StoredSession } from '@dorabot-remote/protocol'
 import { useState, type ReactNode } from 'react'
 import { keyOf, useConnection } from '../lib/connection.js'
 import { partitionPinned } from '../lib/pins.js'
+import { displayName } from '../lib/hosts.js'
 import { haptic } from '../lib/platform.js'
 import { ActionSheet, usePinner } from './PinActions.js'
 import { PullToRefresh } from './PullToRefresh.js'
@@ -28,6 +29,7 @@ export function SessionList({
   const pinner = usePinner()
   const [menu, setMenu] = useState<StoredSession | null>(null)
   const [composing, setComposing] = useState(false)
+  const [switcher, setSwitcher] = useState(false)
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
 
@@ -127,6 +129,7 @@ export function SessionList({
     setSending(false)
   }
 
+  const multi = conn.pairings.length > 1
   const statusTone =
     conn.state === 'ready' ? (conn.gatewayConnected ? 'good' : 'warn') : conn.state === 'disconnected' ? 'bad' : 'warn'
   const statusLabel =
@@ -142,10 +145,22 @@ export function SessionList({
     <Screen
       title="dorabot"
       subtitle={
-        <span className="flex items-center gap-1.5">
-          <Dot tone={statusTone} />
-          {statusLabel}
-        </span>
+        multi && conn.pairing ? (
+          // More than one Mac: the active Mac's name is a quick switcher.
+          <button onClick={() => setSwitcher(true)} aria-label="Switch Mac" className="-my-1 flex max-w-full items-center gap-1.5 py-1 text-left active:opacity-70">
+            <Dot tone={statusTone} />
+            <span className="truncate">{displayName(conn.pairing)}</span>
+            {conn.state !== 'ready' && <span className="shrink-0 text-ink-400">· {statusLabel}</span>}
+            <svg viewBox="0 0 24 24" className="size-3.5 shrink-0 text-ink-400" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M6 9l6 6 6-6" />
+            </svg>
+          </button>
+        ) : (
+          <span className="flex items-center gap-1.5">
+            <Dot tone={statusTone} />
+            {statusLabel}
+          </span>
+        )
       }
       right={
         <button onClick={onSettings} className="-mr-2 flex size-9 items-center justify-center rounded-lg text-ink-300 active:bg-ink-800">
@@ -223,6 +238,19 @@ export function SessionList({
         </div>
       </div>
       {pinner.toast}
+      {switcher && (
+        <ActionSheet
+          title="Switch Mac"
+          onClose={() => setSwitcher(false)}
+          actions={[
+            ...conn.pairings.map((p) => ({
+              label: `${p.hostId === conn.activeHostId ? '✓ ' : ''}${displayName(p)}`,
+              onPress: () => conn.switchTo(p.hostId),
+            })),
+            { label: 'Manage Macs', onPress: onSettings },
+          ]}
+        />
+      )}
       {menu && (
         <ActionSheet
           title={menu.name || menu.senderName || 'Session'}

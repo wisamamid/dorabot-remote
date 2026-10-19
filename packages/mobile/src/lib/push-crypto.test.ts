@@ -24,6 +24,10 @@ describe('decryptPushEnc', () => {
     })
   })
 
+  it('reads the Mac the push came from', () => {
+    expect(decryptPushEnc(seal({ kind: 'approval', rid: 'r', title: 't', body: 'b', hostId: 'h9', hostName: 'Studio' }), KEY)).toMatchObject({ hostId: 'h9', hostName: 'Studio' })
+  })
+
   it('round-trips and tolerates a missing session key', () => {
     expect(decryptPushEnc(seal({ kind: 'question', rid: 'q', title: 't', body: 'b' }), KEY)).toEqual({ kind: 'question', rid: 'q', title: 't', body: 'b' })
   })

@@ -2,7 +2,7 @@
  * Decrypt the `enc` blob the bridge puts in a push (same bytes the iOS
  * Notification Service Extension opens). Format: base64( nonce[12] || ciphertext
  * || tag[16] ), ChaCha20-Poly1305 IETF with a 32-byte key. Plaintext is JSON:
- * {kind, rid, sessionKey?, title, body}. Pure; no plugin access.
+ * {kind, rid, sessionKey?, title, body, hostId?, hostName?}. Pure; no plugin access.
  */
 import { chacha20poly1305 } from '@noble/ciphers/chacha.js'
 
@@ -12,6 +12,9 @@ export interface PushContent {
   sessionKey?: string
   title: string
   body: string
+  /** Which Mac sent it (bridge D2+). Older bridges omit these. */
+  hostId?: string
+  hostName?: string
 }
 
 const NONCE_BYTES = 12
@@ -50,6 +53,8 @@ export function decryptPushEnc(enc: string, keyB64: string): PushContent | null 
       ...(typeof v.sessionKey === 'string' && v.sessionKey ? { sessionKey: v.sessionKey } : {}),
       title: String(v.title ?? ''),
       body: String(v.body ?? ''),
+      ...(typeof v.hostId === 'string' && v.hostId ? { hostId: v.hostId } : {}),
+      ...(typeof v.hostName === 'string' && v.hostName ? { hostName: v.hostName } : {}),
     }
   } catch {
     return null
