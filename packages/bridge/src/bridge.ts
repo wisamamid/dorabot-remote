@@ -118,6 +118,7 @@ export class Bridge implements ConnectionHost {
         store: this.store,
         relay: { url: this.relayInfo.u, id: this.relayInfo.i },
         signingKey: key,
+        host: { id: this.settings.hostId, name: this.settings.hostName },
         isConnected: (id) => this.isDeviceLive(id),
         log: (m) => this.log(m),
       })

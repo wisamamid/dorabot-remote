@@ -7,10 +7,10 @@
  *
  * Format: base64( nonce[12] || ciphertext || tag[16] ) using ChaCha20-Poly1305
  * (IETF, RFC 8439), a 32-byte key and a fresh random nonce per push. The
- * plaintext is UTF-8 JSON: {kind, rid, sessionKey?, title, body}.
+ * plaintext is UTF-8 JSON: {kind, rid, sessionKey?, title, body, hostId?, hostName?}.
  */
 import { chacha20poly1305 } from '@noble/ciphers/chacha.js'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 
 export type ContentKind = 'question' | 'approval'
 
@@ -20,6 +20,9 @@ export interface PushContent {
   sessionKey?: string
   title: string
   body: string
+  /** Which Mac this is from, so a phone paired with several can switch to the right one on tap. */
+  hostId?: string
+  hostName?: string
 }
 
 export const PUSH_KEY_BYTES = 32
@@ -37,6 +40,11 @@ export function parsePushKey(b64: unknown): Uint8Array | null {
   if (typeof b64 !== 'string' || !B64_KEY_RE.test(b64)) return null
   const raw = Buffer.from(b64, 'base64')
   return raw.length === PUSH_KEY_BYTES ? new Uint8Array(raw) : null
+}
+
+/** Unencrypted short key id sent next to `enc`: first 8 hex of sha256(hostId). The phone computes the same from its pairing. */
+export function pushKeyId(hostId: string): string {
+  return createHash('sha256').update(hostId).digest('hex').slice(0, 8)
 }
 
 const oneLine = (s: unknown): string => (typeof s === 'string' ? s : '').replace(/\s+/g, ' ').trim()
@@ -96,10 +104,14 @@ function questionContent(d: Record<string, unknown>): { title: string; body: str
 }
 
 /** Build the readable content for a gateway event, or null if it is not one we describe. */
-export function buildPushContent(name: string, data: unknown, rid: string): PushContent | null {
+export function buildPushContent(name: string, data: unknown, rid: string, host?: { id: string; name: string }): PushContent | null {
   const d = (data ?? {}) as Record<string, unknown>
   const sessionKey = typeof d.sessionKey === 'string' && d.sessionKey ? d.sessionKey : undefined
-  const base = { rid, ...(sessionKey ? { sessionKey } : {}) }
+  const base = {
+    rid,
+    ...(sessionKey ? { sessionKey } : {}),
+    ...(host?.id ? { hostId: host.id.slice(0, 64), hostName: truncate(oneLine(host.name), MAX_TITLE) } : {}),
+  }
   switch (name) {
     case 'agent.ask_user':
       return { kind: 'question', ...base, ...questionContent(d) }

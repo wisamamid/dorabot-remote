@@ -67,7 +67,7 @@ const collapseId = (rid: string): string => rid.slice(0, 64)
 
 const CATEGORY = { question: 'QUESTION', approval: 'APPROVAL', result: 'ACTIVITY', error: 'ACTIVITY' } as const
 
-export function buildApnsPayload(kind: keyof typeof TEXT, rid?: string, enc?: string): Record<string, unknown> {
+export function buildApnsPayload(kind: keyof typeof TEXT, rid?: string, enc?: string, kid?: string): Record<string, unknown> {
   const text = TEXT[kind]
   if (enc) {
     // The title/body here are placeholders; the Notification Service Extension swaps
@@ -85,6 +85,7 @@ export function buildApnsPayload(kind: keyof typeof TEXT, rid?: string, enc?: st
       k: kind,
       ...(rid ? { rid } : {}),
       enc,
+      ...(kid ? { kid } : {}),
     }
   }
   return {
@@ -122,7 +123,7 @@ export async function sendApns(body: PushBody, cfg: ApnsConfig, fetchFn: typeof 
   const res = await fetchFn(`https://${host}/3/device/${encodeURIComponent(body.token)}`, {
     method: 'POST',
     headers: apnsHeaders(body.kind, body.rid, jwt, cfg.topic, Math.floor(now / 1000)),
-    body: JSON.stringify(buildApnsPayload(body.kind, body.rid, body.enc)),
+    body: JSON.stringify(buildApnsPayload(body.kind, body.rid, body.enc, body.kid)),
   })
   if (res.ok) return { status: 200, body: { ok: true } }
   let reason = ''

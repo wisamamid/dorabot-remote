@@ -20,11 +20,15 @@ export interface PushBody {
   env?: 'production' | 'sandbox'
   /** iOS only: opaque E2E-encrypted content (base64) for the Notification Service Extension. Never decrypted here. */
   enc?: string
+  /** iOS only: short key id (which stored push key opens `enc`), so the NSE can pick the right Mac's key. Not secret. */
+  kid?: string
   ts: number
 }
 
 export const MAX_ENC_CHARS = 3000
 const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/
+export const MAX_KID_CHARS = 16
+const KID_RE = /^[A-Za-z0-9_-]+$/
 export interface ServiceAccount {
   client_email: string
   private_key: string
@@ -40,7 +44,7 @@ export function parsePushBody(raw: string): PushBody | null {
     return null
   }
   if (!v || typeof v !== 'object') return null
-  const { token, platform, kind, rid, ts, env, enc } = v
+  const { token, platform, kind, rid, ts, env, enc, kid } = v
   if (typeof token !== 'string' || token.length < 8 || token.length > 4096) return null
   if (platform !== 'ios' && platform !== 'android') return null
   if (typeof kind !== 'string' || !(PUSH_KINDS as readonly string[]).includes(kind)) return null
@@ -48,6 +52,7 @@ export function parsePushBody(raw: string): PushBody | null {
   if (typeof ts !== 'number' || !Number.isFinite(ts)) return null
   if (env !== undefined && env !== 'production' && env !== 'sandbox') return null
   if (enc !== undefined && (typeof enc !== 'string' || enc.length === 0 || enc.length > MAX_ENC_CHARS || !B64_RE.test(enc))) return null
+  if (kid !== undefined && (typeof kid !== 'string' || kid.length === 0 || kid.length > MAX_KID_CHARS || !KID_RE.test(kid))) return null
   return {
     token,
     platform,
@@ -56,6 +61,7 @@ export function parsePushBody(raw: string): PushBody | null {
     ts,
     ...(env ? { env } : {}),
     ...(enc ? { enc: enc as string } : {}),
+    ...(kid ? { kid: kid as string } : {}),
   }
 }
 
