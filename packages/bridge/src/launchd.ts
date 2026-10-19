@@ -84,13 +84,13 @@ export function isLoaded(): boolean {
 }
 
 /** Write the plist and (re)load it. Safe to run repeatedly. */
-export function install(args: { cliPath: string; root: string; env?: Record<string, string> }): string {
+export function install(args: { cliPath: string; root: string; env?: Record<string, string>; nodePath?: string }): string {
   if (process.platform !== 'darwin') throw new Error('The launchd agent is macOS only.')
   const file = plistPath()
   const logDir = join(args.root, 'logs')
   mkdirSync(logDir, { recursive: true, mode: 0o700 })
   mkdirSync(dirname(file), { recursive: true })
-  writeFileSync(file, renderPlist({ nodePath: process.execPath, cliPath: args.cliPath, logDir, env: args.env }), { mode: 0o644 })
+  writeFileSync(file, renderPlist({ nodePath: args.nodePath ?? process.execPath, cliPath: args.cliPath, logDir, env: args.env }), { mode: 0o644 })
 
   if (isLoaded()) launchctl(['bootout', service()])
   const res = launchctl(['bootstrap', domain(), file])

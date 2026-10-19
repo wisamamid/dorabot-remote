@@ -151,7 +151,7 @@ function Shell(): ReactNode {
     )
   }
 
-  if (!conn.pairing) return <PairScreen />
+  if (!conn.pairing && !conn.demo) return <PairScreen />
 
   const openSession = (session: StoredSession | null, sessionKey: string): void => {
     setOpen({ session, sessionKey })
@@ -214,6 +214,14 @@ function Shell(): ReactNode {
           <Button variant="primary" onClick={() => void conn.forget()} className="shrink-0 px-3 text-[14px]">
             Pair again
           </Button>
+        </div>
+      )}
+      {conn.demo && (
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-ink-700 bg-amber-dim px-4 py-2">
+          <p className="text-[13.5px] font-medium leading-snug text-amber-glow">Demo mode: sample data, no Mac connected</p>
+          <button onClick={conn.exitDemo} className="shrink-0 rounded-md px-2 py-1 text-[13.5px] font-semibold text-amber-glow underline">
+            Exit demo
+          </button>
         </div>
       )}
       <StatusBanner />

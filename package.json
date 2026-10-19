@@ -1,5 +1,5 @@
 {
-  "name": "dorabot-remote",
+  "name": "dorabot-remote-monorepo",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -8,6 +8,7 @@
   "workspaces": [
     "packages/protocol",
     "packages/bridge",
+    "packages/cli",
     "packages/relay",
     "packages/mobile"
   ],
