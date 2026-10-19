@@ -124,11 +124,20 @@ export class DeviceConnection {
   private cleanup(): void {
     if (this.closed) return
     this.closed = true
+    if (!this.authed && !this.failedWith) {
+      this.host.log?.(`device socket from ${this.remoteAddress} closed before auth${this.device ? ` (${this.device.name})` : ''}`)
+    }
     if (this.handshakeTimer) clearTimeout(this.handshakeTimer)
     this.host.onClosed(this)
   }
 
+  private failedWith: string | null = null
+
   private fail(code: string, message: string): void {
+    if (!this.authed) {
+      this.failedWith = code
+      this.host.log?.(`device socket from ${this.remoteAddress} failed before auth: ${code} (${message})`)
+    }
     try {
       this.ws.send(JSON.stringify({ t: 'err', code, message }))
     } catch {

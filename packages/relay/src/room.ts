@@ -25,7 +25,7 @@ import type { Env } from './index.js'
 
 type HostAtt = { role: 'host'; rid: string; n: string; authed: boolean; t0: number }
 /** `dropped` marks a device the room closed because its host went away; no one needs telling. */
-type DevAtt = { role: 'dev'; connId: number; dropped?: boolean }
+type DevAtt = { role: 'dev'; connId: number; rid?: string; t0?: number; dropped?: boolean }
 type Att = HostAtt | DevAtt
 
 const OPEN = 1
@@ -33,6 +33,11 @@ const OPEN = 1
 /** Close codes outside 1000 and 3000-4999 throw when sent, so clamp whatever a peer asks for. */
 function safeCode(code: number): number {
   return code === 1000 || (code >= 3000 && code <= 4999) || code === 1009 ? code : 1000
+}
+
+/** One JSON line per event for Workers Logs. relayId is truncated; never log IPs, payloads or keys. */
+function rlog(ev: string, rid: string, extra: Record<string, unknown> = {}): void {
+  console.log(JSON.stringify({ ev, rid: rid.slice(0, 6), ...extra }))
 }
 
 function tryClose(ws: WebSocket, code: number, reason: string): void {
@@ -68,7 +73,7 @@ export class Room extends DurableObject<Env> {
 
     const { 0: client, 1: server } = new WebSocketPair()
     if (route === 'h') this.acceptHost(server, relayId)
-    else this.acceptDevice(server)
+    else this.acceptDevice(server, relayId)
     return new Response(null, { status: 101, webSocket: client })
   }
 
@@ -78,9 +83,11 @@ export class Room extends DurableObject<Env> {
 
   private acceptHost(ws: WebSocket, relayId: string): void {
     this.ctx.acceptWebSocket(ws, ['host'])
+    rlog('host_connect', relayId)
     const pending = this.ctx.getWebSockets('host').filter((w) => !(w.deserializeAttachment() as HostAtt | null)?.authed)
     // The fresh socket has no attachment yet, so it is counted as pending above.
     if (pending.length > LIMITS.maxPendingHosts) {
+      rlog('host_rejected', relayId, { reason: 'too_many_pending' })
       rejectSoon(ws, RELAY_CLOSE.rateLimited, 'too_many_pending')
       return
     }
@@ -93,15 +100,17 @@ export class Room extends DurableObject<Env> {
     })
   }
 
-  private acceptDevice(ws: WebSocket): void {
+  private acceptDevice(ws: WebSocket, relayId: string): void {
     this.ctx.acceptWebSocket(ws)
     const host = this.authedHost()
     if (!host) {
+      rlog('device_rejected', relayId, { reason: 'host_offline' })
       rejectSoon(ws, RELAY_CLOSE.hostOffline, 'host_offline')
       return
     }
     const devices = this.devices()
     if (devices.length >= LIMITS.maxDevices) {
+      rlog('device_rejected', relayId, { reason: 'too_many_devices' })
       rejectSoon(ws, RELAY_CLOSE.rateLimited, 'too_many_devices')
       return
     }
@@ -110,7 +119,8 @@ export class Room extends DurableObject<Env> {
     do {
       connId = crypto.getRandomValues(new Uint32Array(1))[0]!
     } while (connId === 0 || used.has(connId))
-    ws.serializeAttachment({ role: 'dev', connId } satisfies DevAtt)
+    ws.serializeAttachment({ role: 'dev', connId, rid: relayId, t0: Date.now() } satisfies DevAtt)
+    rlog('device_accepted', relayId, { conn: connId, devices: devices.length + 1 })
     this.buckets.set(connId, new TokenBucket(LIMITS.deviceFrames, LIMITS.deviceWindowMs))
     host.send(encodeMux(MuxKind.open, connId))
   }
@@ -154,6 +164,7 @@ export class Room extends DurableObject<Env> {
     }
     const size = typeof message === 'string' ? new TextEncoder().encode(message).length : message.byteLength
     if (size > LIMITS.maxFrameBytes) {
+      rlog(att.role === 'host' ? 'host_rejected' : 'device_rejected', att.role === 'host' ? att.rid : (att.rid ?? ''), { reason: 'too_big', role: att.role, bytes: size })
       tryClose(ws, RELAY_CLOSE.tooBig, 'too_big')
       return
     }
@@ -172,9 +183,11 @@ export class Room extends DurableObject<Env> {
         }
       }
       if (frame?.t !== 'auth' || !frame.pk || !frame.sig || !verifyChallenge(att.rid, att.n, frame.pk, frame.sig)) {
+        rlog('host_auth_fail', att.rid)
         tryClose(ws, RELAY_CLOSE.unauthorized, 'unauthorized')
         return
       }
+      rlog('host_auth_ok', att.rid)
       // A newer host wins. The old one's devices were multiplexed on state the new
       // host does not have, so they are dropped and reconnect.
       for (const old of this.ctx.getWebSockets('host')) {
@@ -214,6 +227,7 @@ export class Room extends DurableObject<Env> {
   private onDeviceMessage(ws: WebSocket, att: DevAtt, message: string | ArrayBuffer): void {
     const host = this.authedHost()
     if (!host) {
+      rlog('device_rejected', att.rid ?? '', { reason: 'host_offline', conn: att.connId })
       tryClose(ws, RELAY_CLOSE.hostOffline, 'host_offline')
       return
     }
@@ -224,6 +238,7 @@ export class Room extends DurableObject<Env> {
       this.buckets.set(att.connId, bucket)
     }
     if (!bucket.take()) {
+      rlog('device_rejected', att.rid ?? '', { reason: 'rate_limited', conn: att.connId })
       tryClose(ws, RELAY_CLOSE.rateLimited, 'rate_limited')
       return
     }
@@ -253,11 +268,13 @@ export class Room extends DurableObject<Env> {
     const att = ws.deserializeAttachment() as Att | null
     if (!att) return
     if (att.role === 'dev') {
+      rlog('device_close', att.rid ?? '', { conn: att.connId, code, reason: reason.slice(0, 40), ms: att.t0 ? Date.now() - att.t0 : undefined, dropped: att.dropped || undefined })
       this.buckets.delete(att.connId)
       if (att.dropped) return
       this.authedHost(ws)?.send(encodeMuxClose(att.connId, code, reason))
       return
     }
+    rlog('host_close', att.rid, { code, reason: reason.slice(0, 40), authed: att.authed })
     // If another authed host already took over, the devices were handled then.
     if (att.authed && !this.authedHost(ws)) this.closeAllDevices(RELAY_CLOSE.hostOffline, 'host_offline')
   }
@@ -269,8 +286,10 @@ export class Room extends DurableObject<Env> {
       const att = w.deserializeAttachment() as HostAtt | null
       if (!att || att.authed) continue
       const deadline = att.t0 + LIMITS.hostAuthTimeoutMs
-      if (deadline <= now + 50) tryClose(w, RELAY_CLOSE.unauthorized, 'auth_timeout')
-      else next = next === null ? deadline : Math.min(next, deadline)
+      if (deadline <= now + 50) {
+        rlog('host_auth_fail', att.rid, { reason: 'auth_timeout' })
+        tryClose(w, RELAY_CLOSE.unauthorized, 'auth_timeout')
+      } else next = next === null ? deadline : Math.min(next, deadline)
     }
     if (next !== null) await this.ctx.storage.setAlarm(next)
   }

@@ -277,10 +277,16 @@ export function onAppResume(handler: () => void): () => void {
  * Fired when the network interface changes or returns (Wi-Fi off, cellular on,
  * and so on). Uses @capacitor/network natively and the `online` event on the web.
  */
-export function onNetworkChange(handler: () => void): () => void {
-  const online = (): void => handler()
+export function onNetworkChange(handler: () => void, onStatus?: (status: NetStatus, prev: NetStatus | null) => void): () => void {
+  const online = (): void => {
+    onStatus?.({ connected: true, connectionType: 'unknown' }, null)
+    handler()
+  }
   window.addEventListener('online', online)
-  if (!isNative) return () => window.removeEventListener('online', online)
+  if (!isNative) {
+    onStatus?.({ connected: navigator.onLine, connectionType: 'unknown' }, null)
+    return () => window.removeEventListener('online', online)
+  }
   let cleanup: (() => void) | null = null
   let removed = false
   void (async () => {
@@ -289,6 +295,7 @@ export function onNetworkChange(handler: () => void): () => void {
     try {
       const s = await Network.getStatus()
       prev = { connected: s.connected, connectionType: s.connectionType }
+      onStatus?.(prev, null)
     } catch {
       // The first change event seeds it instead.
     }
@@ -296,6 +303,7 @@ export function onNetworkChange(handler: () => void): () => void {
       const next = { connected: s.connected, connectionType: s.connectionType }
       const was = prev
       prev = next
+      onStatus?.(next, was)
       if (shouldReconnect(was, next)) handler()
     })
     if (removed) void sub.remove()

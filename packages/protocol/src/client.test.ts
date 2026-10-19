@@ -25,6 +25,8 @@ class FakeSocket implements SocketLike {
     readonly host: FakeHost,
     readonly url: string,
   ) {
+    // A hung socket (e.g. a private IP on cellular) never opens and never reports closing.
+    if (host.hang(url)) return
     setTimeout(() => {
       if (this.closed) return
       this.readyState = 1
@@ -52,6 +54,7 @@ class FakeSocket implements SocketLike {
   close(): void {
     if (this.closed) return
     this.closed = true
+    if (this.host.hang(this.url)) return
     this.readyState = 3
     setTimeout(() => this.emit('close', { code: 1000, reason: '' }), 0)
   }
@@ -86,7 +89,7 @@ class FakeSocket implements SocketLike {
       this.push({
         t: 'ready',
         device: { id: 'd', name: 'phone', scopes: ['chat'] },
-        host: { id: 'h', name: 'Mac' },
+        host: { id: 'h', name: 'Mac', ...(this.host.relayInfo ? { relay: this.host.relayInfo } : {}) },
         allowed: [],
         seq: 0,
         gatewayConnected: true,
@@ -103,6 +106,8 @@ class FakeHost {
   sockets: FakeSocket[] = []
   mute = false
   refuse: string | null = null
+  hang: (url: string) => boolean = () => false
+  relayInfo: { u: string; i: string } | null = null
   factory = (url: string): SocketLike => {
     const s = new FakeSocket(this, url)
     this.sockets.push(s)
@@ -357,6 +362,78 @@ describe('listeners and scopes', () => {
     host.sockets[0]!.push({ t: 'event', event: 'remote.scopes_changed', data: { scopes: ['chat', 'git'] }, seq: 1 } as Envelope)
     await settle(10)
     expect(c.can('git.status')).toBe(true)
+    c.disconnect()
+  })
+})
+
+const RELAY = { u: 'wss://relay.test', i: 'AAAAAAAAAAAAAAAAAAAAAA' }
+
+describe('relay on cellular', () => {
+  it('LAN attempts that hang forever still let the relay win', async () => {
+    const host = new FakeHost()
+    host.hang = (url) => url.startsWith('ws://')
+    const logs: string[] = []
+    const c = make(host, { addresses: ['192.168.1.5:1', 'mac.local:1'], relay: RELAY, log: (m) => logs.push(m) })
+    c.connect()
+    await settle(1300) // relay head start
+    await settle(200)
+    expect(c.state).toBe('ready')
+    expect(c.transport).toBe('relay')
+    expect(logs.some((l) => l.includes('attempt lan 192.168.1.5:1 start'))).toBe(true)
+    expect(logs.some((l) => l.includes('race won by relay'))).toBe(true)
+    c.disconnect()
+  })
+
+  it('starts the relay at once when the network is cellular', async () => {
+    const host = new FakeHost()
+    host.hang = (url) => url.startsWith('ws://')
+    const c = make(host, { addresses: ['192.168.1.5:1'], relay: RELAY })
+    c.setNetworkType('cellular')
+    c.connect()
+    await settle(100)
+    expect(c.state).toBe('ready')
+    expect(c.transport).toBe('relay')
+    c.disconnect()
+  })
+
+  it('cold start with only stored relay info and no LAN addresses connects via relay', async () => {
+    const host = new FakeHost()
+    const c = make(host, { addresses: [], relay: RELAY })
+    c.connect()
+    await settle(100)
+    expect(c.state).toBe('ready')
+    expect(c.transport).toBe('relay')
+    c.disconnect()
+  })
+
+  it('a failed full race logs why and retries with backoff', async () => {
+    const host = new FakeHost()
+    host.hang = () => true
+    const logs: string[] = []
+    const c = make(host, { addresses: ['10.0.0.9:1'], relay: RELAY, log: (m) => logs.push(m) })
+    c.connect()
+    await settle(12_000)
+    expect(logs.some((l) => l.includes('race failed') && l.includes('lan 10.0.0.9:1: timed out') && l.includes('relay'))).toBe(true)
+    expect(logs.some((l) => l.includes('reconnecting in'))).toBe(true)
+    const before = host.sockets.length
+    await settle(25_000)
+    expect(host.sockets.length).toBeGreaterThan(before)
+    c.disconnect()
+  })
+
+  it('a relay refreshed from hostSummary is reported for persistence, once', async () => {
+    const host = new FakeHost()
+    host.relayInfo = RELAY
+    const seen: unknown[] = []
+    const c = make(host, { onRelay: (r) => seen.push(r) })
+    c.connect()
+    await settle()
+    expect(seen).toEqual([RELAY])
+    expect(c.relay).toEqual(RELAY)
+    c.disconnect()
+    c.connect()
+    await settle()
+    expect(seen.length).toBe(1)
     c.disconnect()
   })
 })

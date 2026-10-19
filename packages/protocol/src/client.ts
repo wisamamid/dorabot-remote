@@ -51,6 +51,8 @@ export interface RemoteClientOptions {
   relay?: RelayInfo | null
   /** Fired when the winning transport changes, for a LAN/relay badge. */
   onTransport?: (transport: Transport | null) => void
+  /** Fired when the host reports a relay that differs from the one we hold, so the caller can persist it. */
+  onRelay?: (relay: RelayInfo) => void
   createSocket: SocketFactory
   /** Highest bridge seq already applied, for gap-free resume. */
   lastSeq?: number
@@ -78,6 +80,14 @@ export interface PairResult {
 }
 
 const CONNECT_TIMEOUT_MS = 6000
+/**
+ * Per-attempt budgets for the live-connection race. A LAN candidate that is
+ * unreachable (private IP or .local name while on cellular, or iOS local-network
+ * permission stalls) must not be waited on; the relay needs longer because it
+ * crosses the internet and may wake a Durable Object.
+ */
+export const LAN_ATTEMPT_TIMEOUT_MS = 3000
+export const RELAY_ATTEMPT_TIMEOUT_MS = 10_000
 const PING_INTERVAL_MS = 10_000
 /** A ping with no inbound frame at all within this long means the socket is half-open. */
 const PONG_TIMEOUT_MS = 5_000
@@ -305,11 +315,18 @@ export class RemoteClient {
   private stopped = false
   /** One-shot: the next race starts the relay at once (network just changed, LAN is unlikely). */
   private skipLanHeadStart = false
+  /** Phone is on cellular: LAN candidates are unlikely, so the relay never waits for them. */
+  private cellular = false
   private subscriptions = new Set<string>()
 
   constructor(private readonly opts: RemoteClientOptions) {
     this.lastSeq = opts.lastSeq ?? 0
     this.relay = opts.relay ?? null
+  }
+
+  /** Tell the client what kind of network the phone is on. Cellular starts the relay without a LAN head start. */
+  setNetworkType(type: string): void {
+    this.cellular = type === 'cellular'
   }
 
   private setTransport(t: Transport | null): void {
@@ -335,6 +352,10 @@ export class RemoteClient {
     } catch (err) {
       this.log(`${what} listener threw: ${(err as Error).message}`)
     }
+  }
+
+  private describeTarget(address: string, transport: Transport): string {
+    return transport === 'relay' && this.relay ? `${address} id=${this.relay.i.slice(0, 6)}` : address
   }
 
   private closeQuietly(socket: SocketLike | null | undefined): void {
@@ -476,6 +497,10 @@ export class RemoteClient {
 
     let settled = false
     const attempts: SocketLike[] = []
+    /** Attempts that have not yet failed. Tracked here rather than via readyState so a socket that never reports closing cannot stall the race. */
+    const live = new Set<SocketLike>()
+    const failures: string[] = []
+    const raceStart = Date.now()
     const stale = (): boolean => gen !== this.generation
     // The relay starts late so that LAN wins whenever it is reachable, which keeps
     // traffic off the internet and latency low. If every LAN attempt has already
@@ -504,12 +529,13 @@ export class RemoteClient {
       if (transport === 'lan') this.activeAddress = address
       this.setTransport(transport)
       this.attempt = 0
+      this.log(`race won by ${transport} ${this.describeTarget(address, transport)} after ${Date.now() - raceStart}ms`)
       this.sendEnvelope({ t: 'auth', lastSeq: this.lastSeq, clientVersion: this.opts.clientVersion })
     }
 
     const lose = (reason: string): void => {
       if (settled || stale()) return
-      if (!attempts.every((s) => s.readyState === 3 /* CLOSED */)) return
+      if (live.size > 0) return
       if (startRelay) {
         startRelay()
         return
@@ -517,32 +543,55 @@ export class RemoteClient {
       settled = true
       this.racing = false
       this.raceSockets.clear()
-      this.scheduleReconnect(reason)
+      const why = failures.length > 0 ? failures.join('; ') : reason
+      this.log(`race failed after ${Date.now() - raceStart}ms: ${why}`)
+      this.scheduleReconnect(why)
     }
 
     const race = (url: string, address: string, transport: Transport): void => {
+      const target = this.describeTarget(address, transport)
+      const t0 = Date.now()
       let socket: SocketLike
       try {
         socket = this.opts.createSocket(url)
       } catch (err) {
-        this.log(`cannot open ${address}: ${(err as Error).message}`)
+        this.log(`attempt ${transport} ${target} cannot start: ${(err as Error).message}`)
+        failures.push(`${transport} ${address}: ${(err as Error).message}`)
         return
       }
+      this.log(`attempt ${transport} ${target} start`)
       attempts.push(socket)
+      live.add(socket)
       this.raceSockets.add(socket)
 
       const ephemeral = generateIdentity()
       let channel: SecureChannel | null = null
+      let failed = false
+      const fail = (why: string): void => {
+        if (failed) return
+        failed = true
+        live.delete(socket)
+        // A loser closed by the winner or a cancelled race is not a failure worth recording.
+        if (!settled && !stale()) {
+          this.log(`attempt ${transport} ${target} failed: ${why} after ${Date.now() - t0}ms`)
+          failures.push(`${transport} ${address}: ${why}`)
+        }
+      }
       const timer = setTimeout(() => {
+        fail('timed out')
+        this.raceSockets.delete(socket)
         try {
           socket.close()
         } catch {
           // Already closing.
         }
-      }, CONNECT_TIMEOUT_MS)
+        // A hung socket may never report closing, so settle the race from here.
+        lose('timed out')
+      }, transport === 'lan' ? LAN_ATTEMPT_TIMEOUT_MS : RELAY_ATTEMPT_TIMEOUT_MS)
 
       bind(socket, {
         open: () => {
+          this.log(`attempt ${transport} ${target} open after ${Date.now() - t0}ms`)
           this.setState('handshaking')
           socket.send(
             JSON.stringify({
@@ -559,7 +608,7 @@ export class RemoteClient {
               const frame = JSON.parse(toText(data)) as Record<string, unknown>
               if (frame.t === 'err') {
                 clearTimeout(timer)
-                this.log(`host refused: ${String(frame.message)}`)
+                this.log(`attempt ${transport} ${target} host refused: ${String(frame.code ?? '')} ${String(frame.message)}`)
                 if (!stale() && typeof frame.code === 'string' && TERMINAL_ERROR_CODES.has(frame.code)) {
                   // Retrying can never fix this; stop and say so.
                   this.stopped = true
@@ -586,6 +635,7 @@ export class RemoteClient {
               }
               if (frame.t === 'hdr' && channel) {
                 clearTimeout(timer)
+                this.log(`attempt ${transport} ${target} handshake ok after ${Date.now() - t0}ms`)
                 channel.startReceive(fromB64(null, String(frame.hdr)))
                 win(socket, address, transport, channel, {
                   id: String(frame.hostId ?? ''),
@@ -614,21 +664,29 @@ export class RemoteClient {
         close: (code, reason) => {
           clearTimeout(timer)
           this.raceSockets.delete(socket)
+          const why = `closed ${code ?? '?'}${reason ? ` ${reason}` : ''}`
           if (this.socketLost(socket, reason)) {
-            this.scheduleReconnect(reason || `closed ${code ?? ''}`)
+            this.log(`${transport} ${target} connection lost: ${why}`)
+            this.scheduleReconnect(reason || why)
             return
           }
+          fail(why)
           lose(reason || 'unreachable')
         },
         error: () => {
           clearTimeout(timer)
+          // A close normally follows; if it never does, the race must still settle.
+          fail('socket error')
           lose('socket error')
         },
       })
     }
 
-    for (const address of addresses) race(`ws://${address}/connect`, address, 'lan')
+    this.log(`race start: ${addresses.length} lan candidate(s)${relay ? `, relay ${relay.u} id=${relay.i.slice(0, 6)}` : ', no relay known'}${this.cellular ? ', cellular' : ''}`)
+    if (!relay && addresses.length > 0) this.log('warning: no relay info held, only LAN candidates can be tried')
 
+    // The relay is armed before any LAN socket is created so that a synchronous
+    // throw from the LAN attempts can never leave it unstarted.
     if (relay) {
       const url = relayDeviceUrl(relay)
       startRelay = () => {
@@ -639,10 +697,24 @@ export class RemoteClient {
         // A relay socket that could not even be created leaves nothing to wait on.
         lose('unreachable')
       }
-      const fast = this.skipLanHeadStart
+    }
+
+    for (const address of addresses) {
+      try {
+        race(`ws://${address}/connect`, address, 'lan')
+      } catch (err) {
+        this.log(`attempt lan ${address} threw: ${(err as Error).message}`)
+        failures.push(`lan ${address}: ${(err as Error).message}`)
+      }
+    }
+
+    if (relay) {
+      const fast = this.skipLanHeadStart || this.cellular
       this.skipLanHeadStart = false
-      if (addresses.length === 0 || fast) startRelay()
+      if (addresses.length === 0 || fast || live.size === 0) startRelay?.()
       else relayTimer = setTimeout(() => startRelay?.(), RELAY_HEAD_START_MS)
+    } else if (live.size === 0) {
+      lose('unreachable')
     }
   }
 
@@ -655,7 +727,15 @@ export class RemoteClient {
         this.gatewayConnected = env.gatewayConnected
         // An already-paired phone learns the relay the first time it reaches the
         // host over LAN, with no re-pairing.
-        if (env.host.relay) this.relay = env.host.relay
+        if (env.host.relay) {
+          const changed = !this.relay || this.relay.u !== env.host.relay.u || this.relay.i !== env.host.relay.i
+          this.relay = env.host.relay
+          if (changed) {
+            this.log(`relay learned from host: ${env.host.relay.u} id=${env.host.relay.i.slice(0, 6)}`)
+            const r = env.host.relay
+            this.safe(() => this.opts.onRelay?.(r), 'onRelay')
+          }
+        }
         this.setState('ready')
         this.startPing()
         this.safe(() => this.opts.onReady?.(env), 'onReady')
@@ -705,6 +785,7 @@ export class RemoteClient {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id)
+        this.log(`rpc timeout: ${method} after ${timeoutMs}ms (state ${this.state}, transport ${this.transport ?? 'none'})`)
         reject(new Error(`timed out: ${method}`))
       }, timeoutMs)
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer })

@@ -649,10 +649,18 @@ export class Bridge implements ConnectionHost {
    */
   private routeRelaySocket(sock: DeviceSocket, remote: string): void {
     let routed = false
+    const openedAt = Date.now()
     const timer = setTimeout(() => {
-      if (!routed) sock.close(4400, 'no first frame')
+      if (!routed) {
+        this.log(`relay: device socket opened but sent no first frame in 15s, closing`)
+        sock.close(4400, 'no first frame')
+      }
     }, 15_000)
-    sock.on('close', () => clearTimeout(timer))
+    sock.on('close', (code?: unknown, reason?: unknown) => {
+      clearTimeout(timer)
+      // A phone that reached the relay but vanished before saying hello.
+      if (!routed) this.log(`relay: device socket closed before its first frame after ${Date.now() - openedAt}ms (code ${String(code ?? '?')}${reason ? ` ${String(reason)}` : ''})`)
+    })
     sock.on('message', (raw: Buffer, isBinary: boolean) => {
       if (routed) return
       routed = true
