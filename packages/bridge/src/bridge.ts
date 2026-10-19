@@ -666,10 +666,21 @@ export class Bridge implements ConnectionHost {
       routed = true
       clearTimeout(timer)
       let t: unknown
+      let n: unknown
       try {
-        if (!isBinary) t = (JSON.parse(raw.toString()) as { t?: unknown }).t
+        if (!isBinary) {
+          const f = JSON.parse(raw.toString()) as { t?: unknown; n?: unknown }
+          t = f.t
+          n = f.n
+        }
       } catch {
         // Falls through to the unknown-frame close.
+      }
+      if (t === 'selftest') {
+        // Our own probe through the relay: proof that opens reach us. Never routed.
+        this.relay?.confirmSelfTest(n)
+        sock.close(1000, 'selftest')
+        return
       }
       if (t !== 'pair' && t !== 'hello') {
         this.log(`relay: unexpected first frame, closing`)

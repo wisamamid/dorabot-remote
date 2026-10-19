@@ -61,6 +61,7 @@ describe('RelayClient handshake', () => {
       log: (m) => logs.push(m),
       onDeviceSocket: () => {},
       random: () => 0,
+      selfTest: false,
       ...opts,
     })
     clients.push(client)
@@ -155,6 +156,94 @@ class StubWs extends EventEmitter {
   }
 }
 
+describe('relay liveness', () => {
+  let relay: FakeRelay
+  const clients: RelayClient[] = []
+  afterEach(async () => {
+    for (const c of clients.splice(0)) c.stop()
+    await relay?.stop()
+  })
+
+  async function make(opts: Partial<ConstructorParameters<typeof RelayClient>[0]> = {}) {
+    relay = new FakeRelay()
+    await relay.start()
+    const logs: string[] = []
+    // Stand-in for Bridge.routeRelaySocket: confirm probes, ignore the rest.
+    const client: RelayClient = new RelayClient({
+      url: relay.url,
+      signingKey: generateSigningKey(),
+      log: (m) => logs.push(m),
+      onDeviceSocket: (sock) =>
+        sock.once('message', (raw: Buffer) => {
+          try {
+            const f = JSON.parse(raw.toString()) as { t?: string; n?: string }
+            if (f.t === 'selftest') client.confirmSelfTest(f.n)
+          } catch {
+            // Not a probe.
+          }
+          sock.close(1000, 'selftest')
+        }),
+      random: () => 0,
+      createSocket,
+      ...opts,
+    })
+    clients.push(client)
+    return { client, logs }
+  }
+
+  it('sends heartbeats and stays up while the room answers them', async () => {
+    const { client, logs } = await make({ heartbeatIntervalMs: 100, heartbeatTimeoutMs: 80, selfTest: false })
+    client.start()
+    await until(() => relay.heartbeats >= 4, 5000, 'heartbeats')
+    expect(client.state).toBe('online')
+    expect(relay.hostAttempts).toBe(1)
+    expect(logs.some((l) => l.includes('heartbeat missed'))).toBe(false)
+  })
+
+  it('drops and reconnects after 2 missing heartbeat answers, logging one line', async () => {
+    const { client, logs } = await make({ heartbeatIntervalMs: 100, heartbeatTimeoutMs: 80, selfTest: false })
+    relay.answerHeartbeat = false
+    client.start()
+    await until(() => relay.hostAttempts >= 2, 5000, 'reconnect')
+    expect(logs.filter((l) => l.includes('heartbeat missed')).length).toBeGreaterThanOrEqual(1)
+    expect(logs.find((l) => l.includes('heartbeat missed'))).toContain('2 times')
+    // Recovers once the room answers again.
+    relay.answerHeartbeat = true
+    await until(() => client.state === 'online', 8000, 'online again')
+  })
+
+  it('self-test passes against a healthy room and uses one short-lived probe', async () => {
+    const { client, logs } = await make({ selfTestTimeoutMs: 2000, selfTestIntervalMs: 60_000 })
+    client.start()
+    await until(() => client.selfTestsPassed === 1, 5000, 'self-test')
+    expect(relay.devicesAccepted).toBe(1)
+    expect(client.connectedDevices).toBe(0)
+    expect(logs.some((l) => l.includes('self-test failed'))).toBe(false)
+  })
+
+  it('self-test repeats on its interval', async () => {
+    const { client } = await make({ selfTestTimeoutMs: 2000, selfTestIntervalMs: 200 })
+    client.start()
+    await until(() => client.selfTestsPassed >= 3, 6000, 'repeat self-tests')
+    expect(relay.hostAttempts).toBe(1)
+  })
+
+  it('BLACK HOLE: the room answers heartbeats and pings but delivers nothing; self-test detects it and reconnects', async () => {
+    const { client, logs } = await make({ selfTestTimeoutMs: 400, selfTestIntervalMs: 60_000, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 80 })
+    relay.blackHole = true
+    client.start()
+    await until(() => logs.some((l) => l.includes('relay self-test failed')), 5000, 'self-test failure')
+    // Heartbeats alone would never have noticed.
+    expect(logs.some((l) => l.includes('heartbeat missed'))).toBe(false)
+    await until(() => relay.hostAttempts >= 2, 8000, 'forced reconnect')
+    expect(client.selfTestsPassed).toBe(0)
+    // The room heals; the next link passes its post-connect self-test.
+    relay.blackHole = false
+    await until(() => client.selfTestsPassed >= 1, 10_000, 'self-test passes after recovery')
+    expect(client.state).toBe('online')
+  }, 30_000)
+})
+
 describe('reconnect backoff', () => {
   afterEach(() => vi.useRealTimers())
 
@@ -168,6 +257,7 @@ describe('reconnect backoff', () => {
       log: () => {},
       onDeviceSocket: () => {},
       random: () => 1,
+      selfTest: false,
       createSocket: () => {
         attempts++
         times.push(Date.now())
@@ -380,6 +470,16 @@ describe('bridge through the relay', () => {
     const closed = new Promise<number>((r) => ws.on('close', (c) => r(c)))
     ws.send(JSON.stringify({ t: 'nonsense' }))
     expect(await closed).toBe(4400)
+  })
+
+  it('answers a selftest probe without routing it and logs nothing odd', async () => {
+    const before = relay.devicesAccepted
+    const client = (rig.bridge as unknown as { relay: RelayClient }).relay
+    const passed = client.selfTestsPassed
+    ;(client as unknown as { runSelfTest(ws: unknown): void }).runSelfTest((client as unknown as { ws: unknown }).ws)
+    await until(() => client.selfTestsPassed === passed + 1, 5000, 'bridge self-test through routeRelaySocket')
+    expect(relay.devicesAccepted).toBe(before + 1)
+    expect(conns().size).toBe(0)
   })
 
   it('paces a 50 MB replay without the host socket buffer passing the high-water mark', async () => {

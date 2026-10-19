@@ -7,6 +7,8 @@ import { createServer, type Server } from 'node:http'
 import {
   MuxKind,
   RELAY_CLOSE,
+  RELAY_HB_REQUEST,
+  RELAY_HB_RESPONSE,
   decodeMux,
   decodeMuxClose,
   encodeMux,
@@ -41,6 +43,15 @@ export class FakeRelay {
   expectRelayId: string | null = null
   /** Close each host socket right after auth succeeds. */
   flap = false
+  /** Answer the host's application heartbeat. False reproduces a room that is up at the ws level but silent. */
+  answerHeartbeat = true
+  /**
+   * The production outage: the room accepts devices (and still answers heartbeats and
+   * protocol pings) but never delivers anything to the host link.
+   */
+  blackHole = false
+  heartbeats = 0
+  devicesAccepted = 0
 
   get url(): string {
     return `ws://127.0.0.1:${this.port}`
@@ -102,7 +113,13 @@ export class FakeRelay {
         return
       }
       this.maxHostFrame = Math.max(this.maxHostFrame, raw.length)
-      if (!isBinary) return
+      if (!isBinary) {
+        if (raw.toString() === RELAY_HB_REQUEST) {
+          this.heartbeats++
+          if (this.answerHeartbeat) ws.send(RELAY_HB_RESPONSE)
+        }
+        return
+      }
       const frame = decodeMux(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength))
       if (!frame) return
       const target = this.devices.get(frame.connId)
@@ -130,15 +147,17 @@ export class FakeRelay {
     if (!host) return void ws.close(RELAY_CLOSE.hostOffline, 'host_offline')
     const connId = this.nextConn++
     this.devices.set(connId, ws)
-    host.ws.send(encodeMux(MuxKind.open, connId))
+    this.devicesAccepted++
+    if (!this.blackHole) host.ws.send(encodeMux(MuxKind.open, connId))
     ws.on('message', (raw: Buffer, isBinary: boolean) => {
+      if (this.blackHole) return
       const h = this.authedHost
       if (!h) return void ws.close(RELAY_CLOSE.hostOffline, 'host_offline')
       h.ws.send(encodeMux(isBinary ? MuxKind.binary : MuxKind.text, connId, raw))
     })
     ws.on('close', (code, reason) => {
       this.devices.delete(connId)
-      this.authedHost?.ws.send(encodeMuxClose(connId, code, reason.toString()))
+      if (!this.blackHole) this.authedHost?.ws.send(encodeMuxClose(connId, code, reason.toString()))
     })
     ws.on('error', () => {})
   }

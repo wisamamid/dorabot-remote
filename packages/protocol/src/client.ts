@@ -88,6 +88,12 @@ const CONNECT_TIMEOUT_MS = 6000
  */
 export const LAN_ATTEMPT_TIMEOUT_MS = 3000
 export const RELAY_ATTEMPT_TIMEOUT_MS = 10_000
+/**
+ * A relay socket that opens but gets no answer to `hello` this fast is probably wired
+ * to a host link that is not delivering. Close it and retry once at once rather than
+ * wait out the full attempt budget.
+ */
+export const RELAY_HANDSHAKE_WATCHDOG_MS = 5000
 const PING_INTERVAL_MS = 10_000
 /** A ping with no inbound frame at all within this long means the socket is half-open. */
 const PONG_TIMEOUT_MS = 5_000
@@ -548,7 +554,7 @@ export class RemoteClient {
       this.scheduleReconnect(why)
     }
 
-    const race = (url: string, address: string, transport: Transport): void => {
+    const race = (url: string, address: string, transport: Transport, retried = false): void => {
       const target = this.describeTarget(address, transport)
       const t0 = Date.now()
       let socket: SocketLike
@@ -577,7 +583,13 @@ export class RemoteClient {
           failures.push(`${transport} ${address}: ${why}`)
         }
       }
+      let handshakeWatch: ReturnType<typeof setTimeout> | null = null
+      const stopWatch = (): void => {
+        if (handshakeWatch) clearTimeout(handshakeWatch)
+        handshakeWatch = null
+      }
       const timer = setTimeout(() => {
+        stopWatch()
         fail('timed out')
         this.raceSockets.delete(socket)
         try {
@@ -593,6 +605,23 @@ export class RemoteClient {
         open: () => {
           this.log(`attempt ${transport} ${target} open after ${Date.now() - t0}ms`)
           this.setState('handshaking')
+          if (transport === 'relay') {
+            handshakeWatch = setTimeout(() => {
+              handshakeWatch = null
+              if (failed || settled || stale()) return
+              this.log(`attempt ${transport} ${target} opened but no handshake response in ${RELAY_HANDSHAKE_WATCHDOG_MS}ms${retried ? '' : ', retrying once'}`)
+              clearTimeout(timer)
+              fail('no handshake response')
+              this.raceSockets.delete(socket)
+              try {
+                socket.close()
+              } catch {
+                // Already closing.
+              }
+              if (!retried) race(url, address, transport, true)
+              else lose('no handshake response')
+            }, RELAY_HANDSHAKE_WATCHDOG_MS)
+          }
           socket.send(
             JSON.stringify({
               t: 'hello',
@@ -606,6 +635,7 @@ export class RemoteClient {
           try {
             if (!isBinary) {
               const frame = JSON.parse(toText(data)) as Record<string, unknown>
+              stopWatch()
               if (frame.t === 'err') {
                 clearTimeout(timer)
                 this.log(`attempt ${transport} ${target} host refused: ${String(frame.code ?? '')} ${String(frame.message)}`)
@@ -663,6 +693,7 @@ export class RemoteClient {
         },
         close: (code, reason) => {
           clearTimeout(timer)
+          stopWatch()
           this.raceSockets.delete(socket)
           const why = `closed ${code ?? '?'}${reason ? ` ${reason}` : ''}`
           if (this.socketLost(socket, reason)) {
@@ -675,6 +706,7 @@ export class RemoteClient {
         },
         error: () => {
           clearTimeout(timer)
+          stopWatch()
           // A close normally follows; if it never does, the race must still settle.
           fail('socket error')
           lose('socket error')
