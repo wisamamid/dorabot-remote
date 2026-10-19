@@ -6,6 +6,7 @@ import { PullToRefresh } from './PullToRefresh.js'
 import { ChatItemList, StatusLine } from './ChatItems.js'
 import { ApprovalCard, ElicitationCard, QuestionCard } from './Interrupts.js'
 import { ModelPicker } from './ModelPicker.js'
+import { usePinner } from './PinActions.js'
 import { useRename } from './RenameSheet.js'
 import { Button, Dot, Screen, cx } from './ui.js'
 
@@ -28,6 +29,7 @@ export function SessionView({
 }): ReactNode {
   const conn = useConnection()
   const rename = useRename()
+  const pinner = usePinner()
   const state = conn.getSession(sessionKey)
   const scrollRef = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
@@ -109,6 +111,20 @@ export function SessionView({
       onTitleClick={session ? () => rename.open(session) : undefined}
       right={
         <div className="flex items-center gap-2">
+          {conn.hasScope('sessions') && (
+            <button
+              onClick={() => pinner.toggle(sessionKey)}
+              aria-label={pinner.isPinned(sessionKey) ? 'Unpin session' : 'Pin session'}
+              className={cx(
+                'flex size-9 items-center justify-center rounded-lg active:bg-ink-800',
+                pinner.isPinned(sessionKey) ? 'text-mint-500' : 'text-ink-400',
+              )}
+            >
+              <svg viewBox="0 0 24 24" className="size-[18px]" fill={pinner.isPinned(sessionKey) ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
+                <path d="M16 3l5 5-2 1-3.5 3.5.5 4.5-1.5 1.5-3.5-3.5L6 20l-1-1 4.5-5-3.5-3.5L7.5 9 12 9.5 15.5 6z" />
+              </svg>
+            </button>
+          )}
           <ModelPicker session={session} sessionKey={sessionKey} running={busy} />
           {busy ? (
             <Button variant="ghost" onClick={() => void interrupt()} className="px-3 text-[14px] text-amber-glow">
@@ -224,6 +240,7 @@ export function SessionView({
           </div>
         </div>
       </div>
+      {pinner.toast}
     </Screen>
   )
 }

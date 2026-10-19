@@ -93,6 +93,14 @@ describe('bridge method gating', () => {
     expect(isMethodAllowed('remote.events', ['sessions'])).toBe(true)
     expect(isMethodAllowed('remote.health', [])).toBe(true)
   })
+  it('gates remote.pins.* on the sessions scope', async () => {
+    const { isMethodAllowed, methodsForScopes } = await import('./policy.js')
+    for (const m of ['remote.pins.list', 'remote.pins.set']) {
+      expect(isMethodAllowed(m, ['sessions'])).toBe(true)
+      expect(isMethodAllowed(m, ['chat', 'work', 'approvals', 'files'])).toBe(false)
+      expect(methodsForScopes(['sessions'])).toContain(m)
+    }
+  })
   it('does not expose unimplemented push methods or admin write fs / security.*', async () => {
     const { isMethodAllowed } = await import('./policy.js')
     expect(isMethodAllowed('bridge.registerPush', ['admin'])).toBe(false)
