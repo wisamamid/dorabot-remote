@@ -25,7 +25,7 @@ The app pairs with a small program (the bridge) you install on your Mac using No
 
 **Security**
 
-All traffic between your phone and Mac is encrypted end-to-end using X25519 key agreement and XChaCha20-Poly1305. Your pairing key is stored in the iOS Keychain and never transmitted over the network. You can revoke any device instantly from your Mac.
+All traffic between your phone and Mac is encrypted end-to-end using X25519 key agreement and XChaCha20-Poly1305. Each device generates its own key pair; private keys never leave the device that created them. You can revoke any device instantly from your Mac.
 
 **Your data stays yours**
 
@@ -133,7 +133,7 @@ The app is fully functional for test purposes. We have included demo content so 
 
 **Privacy**
 
-This app requires no user account or signup. It pairs with a user's own Mac using a one-time QR code. All traffic is end-to-end encrypted (X25519, XChaCha20-Poly1305). We do not collect user data, analytics, or prompts. See the full privacy policy at https://wisamamid.github.io/dorabot-remote/privacy/
+This app requires no user account or signup. It pairs with a user's own Mac using a one-time QR code (single use, expires after 5 minutes). All traffic is end-to-end encrypted (X25519, XChaCha20-Poly1305). We do not collect user data, analytics, or prompts. See the full privacy policy at https://wisamamid.github.io/dorabot-remote/privacy/
 
 ---
 

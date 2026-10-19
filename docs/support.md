@@ -72,11 +72,10 @@ To remove the bridge from your Mac:
 dorabot-remote uninstall
 ```
 
-This removes the daemon and its launchd agent (if you installed it with `dorabot-remote install`). Your pairing records are stored in `~/.dorabot-remote/` and will be deleted when you delete that folder.
+This stops the bridge and removes it, but keeps its keys and paired devices so you can reinstall later. Add `--purge` to delete those too:
 
-To completely clean up:
 ```
-rm -rf ~/.dorabot-remote
+dorabot-remote uninstall --purge
 ```
 
 ## Send a Connection Log

@@ -15,7 +15,7 @@ DoraBot Remote is published by Xische FZ-LLC, a company based in the United Arab
 
 DoraBot Remote is a companion app for iOS that pairs with a small program (the bridge) running on your own Mac. The app lets you control your dorabot agent from your phone: send prompts, read responses, answer questions, and approve tool calls.
 
-The app is designed to give you control over your own data. Your prompts, code, files, and conversations stay on your Mac and your phone. They never go to our servers.
+The app is designed to give you control over your own data. Your prompts, code, files and conversations stay on your Mac and your phone. When you are away from your home network they travel through our relay, end-to-end encrypted, so the relay can forward them but cannot read them, and it does not store them.
 
 ## Data We Do Not Collect
 
@@ -46,7 +46,7 @@ This data is not stored and is used only to route your traffic.
 
 ### Push Notifications
 
-When your Mac needs to tell your phone that a question or approval is waiting, it sends a push notification through Apple Push Notification service (APNS). Your Mac encrypts the notification content with your phone's pairing key before sending it. APNS and the relay see only a generic notification title; they cannot read the content.
+When your Mac needs to tell your phone that a question or approval is waiting, it sends a push notification through Apple Push Notification service (APNS). Your Mac encrypts the notification content with your phone's pairing key before sending it. APNS and the relay see only a generic notification title; they cannot read the content. The notification text for questions and approvals is encrypted on your Mac with a key that only your phone holds; your phone decrypts it on-device to show it on the lock screen. The relay and Apple only see a generic title. iOS settings for "Show Previews" control whether it appears on the lock screen.
 
 Your Mac provides the relay with your device's push token (a unique identifier issued by Apple). The relay uses this token only to deliver notifications and does not store it.
 
@@ -56,16 +56,16 @@ When traffic goes through the relay, Cloudflare (our hosting provider) logs stan
 
 ### Local Data
 
-Your pairing keys and conversation history are stored on your Mac (in SQLite) and on your phone (in encrypted iOS Keychain storage). This data never leaves your devices unless you send it explicitly.
+Sessions and conversation history live on your Mac (dorabot and the bridge's local database). The phone keeps its pairing keys in the iOS Keychain, and keeps a local cache of recent session data and app settings in the app's own storage on the device, which is removed when you uninstall the app.
 
 ## Encryption
 
-All traffic between your phone and Mac is encrypted end-to-end using X25519 key agreement and XChaCha20-Poly1305 authenticated encryption. The pairing key is derived from a one-time QR code and never transmitted over the network; only the derived keys are used.
+All traffic between your phone and Mac is encrypted end-to-end using X25519 key agreement and XChaCha20-Poly1305 authenticated encryption. Each device generates its own key pair. The one-time QR code (single use, expires after 5 minutes) carries your Mac's public key and a pairing code; during pairing only public keys are exchanged, sealed to your Mac's key. Private keys never leave the device that created them.
 
 - Your phone stores its pairing key in the iOS Keychain with maximum security constraints (readable only after first device unlock, never synced to iCloud or restored to another device).
 - Biometric (Face ID) unlock of the app is handled entirely by iOS; we never see biometric data.
 
-If you revoke a device from your Mac or uninstall the app, the pairing keys are deleted.
+Revoking a device on your Mac immediately blocks it (its push token and notification key are removed); removing the device deletes its record from the Mac. Uninstalling the app deletes the keys stored on the phone.
 
 ## Third Parties
 
@@ -102,7 +102,7 @@ You can turn off push notifications in the app's settings. Without push notifica
 
 ### Uninstall
 
-Uninstalling the app from your phone deletes all local data (pairing keys, conversation history). Uninstalling the bridge from your Mac removes the pairing records and shuts down the daemon.
+`dorabot-remote uninstall` stops the bridge and removes it, but keeps its keys and paired devices so you can reinstall later; add `--purge` to delete those too.
 
 ## Children
 
