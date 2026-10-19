@@ -15,8 +15,11 @@ import { useSplit } from './lib/layout.js'
 import { ConnectionProvider, useConnection } from './lib/connection.js'
 import { InboxProvider, useInbox } from './lib/inbox-context.js'
 import { bannerFor } from './lib/status-banner.js'
-import { setStatusBarDark } from './lib/platform.js'
-import { clearDeliveredNotifications, onPushNavigate } from './lib/push.js'
+import { haptic, setStatusBarDark } from './lib/platform.js'
+import { AppLockProvider, useAppLock } from './lib/app-lock.js'
+import { clearDeliveredNotifications, onPushNavigate, pruneDeliveredNotifications } from './lib/push.js'
+import { routePushAction, runDecision, type PushRoute } from './lib/push-actions.js'
+import { createPortal } from 'react-dom'
 import { PushProvider } from './lib/push-context.js'
 
 type TabName = 'sessions' | 'inbox' | 'work' | 'code' | 'more'
@@ -28,15 +31,17 @@ export default function App(): ReactNode {
     void setStatusBarDark()
   }, [])
   return (
-    <ConnectionProvider>
-      <PushProvider>
-        <InboxProvider>
-          <RenameProvider>
-            <Shell />
-          </RenameProvider>
-        </InboxProvider>
-      </PushProvider>
-    </ConnectionProvider>
+    <AppLockProvider>
+      <ConnectionProvider>
+        <PushProvider>
+          <InboxProvider>
+            <RenameProvider>
+              <Shell />
+            </RenameProvider>
+          </InboxProvider>
+        </PushProvider>
+      </ConnectionProvider>
+    </AppLockProvider>
   )
 }
 
@@ -61,21 +66,67 @@ function Shell(): ReactNode {
   const [open, setOpen] = useState<Open>(null)
   // A tapped notification carries only a routing id; wait for the matching inbox item.
   const [pendingRid, setPendingRid] = useState<string | null>(null)
+  const lock = useAppLock()
+  const [decision, setDecision] = useState<Extract<PushRoute, { type: 'decide' }> | null>(null)
+  const [toast, setToast] = useState<{ text: string; ok: boolean } | null>(null)
   const paired = Boolean(conn.pairing)
   const split = useSplit()
 
   useEffect(() => {
     if (!paired) return
     return onPushNavigate((nav) => {
+      const route = routePushAction(nav)
       setTab('inbox')
       setOpen(null)
+      if (route.type === 'decide') {
+        // Face ID is asked inside runDecision; the delivered notification is cleared by the prune below.
+        setDecision(route)
+        return
+      }
       void clearDeliveredNotifications()
-      if (nav.rid) {
-        setPendingRid(nav.rid)
-        setTimeout(() => setPendingRid((r) => (r === nav.rid ? null : r)), 15_000)
+      if (route.sessionKey) {
+        const key = route.sessionKey
+        const s = connRef.current.sessions.find((x) => x.channel && x.chatType && x.chatId && `${x.channel}:${x.chatType}:${x.chatId}` === key)
+        setTab('sessions')
+        setOpen({ session: s ?? null, sessionKey: key })
+      } else if (route.rid) {
+        const rid = route.rid
+        setPendingRid(rid)
+        setTimeout(() => setPendingRid((r) => (r === rid ? null : r)), 15_000)
       }
     })
   }, [paired])
+
+  // Approve / Deny from a notification: confirm with Face ID right away, then act once connected.
+  const connRef = useRef(conn)
+  connRef.current = conn
+  const verifyOnce = useRef<Promise<'ok' | 'cancelled' | 'unavailable' | 'failed'> | null>(null)
+  useEffect(() => {
+    if (!decision) return
+    verifyOnce.current ??= lock.verify(decision.decision === 'approve' ? 'Approve this request' : 'Deny this request')
+  }, [decision, lock])
+  useEffect(() => {
+    if (!decision || conn.state !== 'ready') return
+    const route = decision
+    const verify = verifyOnce.current ?? lock.verify('Confirm')
+    setDecision(null)
+    verifyOnce.current = null
+    void runDecision(route, { verify: () => verify, rpc: (m, p) => connRef.current.rpc(m, p) }).then((out) => {
+      setToast({ text: out.message, ok: out.status === 'done' || out.status === 'already_resolved' })
+      void haptic(out.status === 'done' ? 'success' : 'warning')
+    })
+  }, [decision, conn.state, lock])
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 4000)
+    return () => clearTimeout(t)
+  }, [toast])
+
+  // Drop delivered notifications for requests that are already settled.
+  useEffect(() => {
+    if (!inbox.settled) return
+    void pruneDeliveredNotifications(new Set(inbox.items.map((i) => i.id.slice(i.id.indexOf(':') + 1))))
+  }, [inbox.settled, inbox.items])
 
   useEffect(() => {
     if (!pendingRid) return
@@ -192,6 +243,20 @@ function Shell(): ReactNode {
       {!split && !open && (
         <nav className="kb-hide safe-bottom flex shrink-0 border-t border-ink-700 bg-ink-900 px-1 pt-1.5">{tabs(false)}</nav>
       )}
+      {toast &&
+        createPortal(
+          <div
+            role="status"
+            onClick={() => setToast(null)}
+            className={cx(
+              'fixed inset-x-4 top-[max(env(safe-area-inset-top),12px)] z-[80] mx-auto max-w-md rounded-xl px-4 py-3 text-[14px] shadow-lg',
+              toast.ok ? 'bg-mint-900 text-mint-500' : 'bg-rose-dim text-rose-glow',
+            )}
+          >
+            {toast.text}
+          </div>,
+          document.body,
+        )}
     </div>
   )
 }

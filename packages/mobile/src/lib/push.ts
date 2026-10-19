@@ -8,6 +8,11 @@
  * module inside the function that needs it.
  */
 import { isNative, platformName } from './platform.js'
+import { staleDelivered, type PushNav } from './push-actions.js'
+import { decryptPushEnc } from './push-crypto.js'
+import { getPushKey } from './push-key.js'
+
+export type { PushNav }
 
 export type PushPermission = 'prompt' | 'granted' | 'denied' | 'unsupported'
 
@@ -60,11 +65,6 @@ export async function registerIfGranted(): Promise<PushPermission> {
   return p
 }
 
-export interface PushNav {
-  rid?: string
-  kind?: string
-}
-
 let pendingNav: PushNav | null = null
 const navListeners = new Set<(nav: PushNav) => void>()
 
@@ -102,11 +102,23 @@ export function listenPush(onToken: (token: string) => void, onError?: (msg: str
     // and Capacitor shows no system banner unless presentationOptions says so.
     await add(() =>
       PushNotifications.addListener('pushNotificationActionPerformed', (a) => {
-        const data = (a.notification?.data ?? {}) as { rid?: unknown; k?: unknown }
-        emitNav({
+        const data = (a.notification?.data ?? {}) as { rid?: unknown; k?: unknown; enc?: unknown }
+        const nav: PushNav = {
           ...(typeof data.rid === 'string' ? { rid: data.rid } : {}),
           ...(typeof data.k === 'string' ? { kind: data.k } : {}),
-        })
+          ...(typeof a.actionId === 'string' ? { actionId: a.actionId } : {}),
+        }
+        // The encrypted content tells us which session this is about. Best effort.
+        void (async () => {
+          try {
+            const key = typeof data.enc === 'string' ? await Promise.race([getPushKey(), new Promise<null>((r) => setTimeout(() => r(null), 1500))]) : null
+            const content = key && typeof data.enc === 'string' ? decryptPushEnc(data.enc, key) : null
+            if (content?.sessionKey) nav.sessionKey = content.sessionKey
+          } catch {
+            // generic routing still works
+          }
+          emitNav(nav)
+        })()
       }),
     )
   })().catch(() => {})
@@ -122,6 +134,22 @@ export async function clearDeliveredNotifications(): Promise<void> {
   try {
     const { PushNotifications } = await import('@capacitor/push-notifications')
     await PushNotifications.removeAllDeliveredNotifications()
+  } catch {
+    // cosmetic
+  }
+}
+
+/** Remove delivered approval/question notifications whose request is no longer pending. */
+export async function pruneDeliveredNotifications(liveRids: ReadonlySet<string>): Promise<void> {
+  if (!pushSupported) return
+  try {
+    const { PushNotifications } = await import('@capacitor/push-notifications')
+    const { notifications } = await PushNotifications.getDeliveredNotifications()
+    const stale = staleDelivered(
+      notifications.map((n) => ({ id: n.id, data: (n.data ?? {}) as Record<string, unknown> })),
+      liveRids,
+    )
+    if (stale.length) await PushNotifications.removeDeliveredNotifications({ notifications: notifications.filter((n) => stale.some((s) => s.id === n.id)) })
   } catch {
     // cosmetic
   }

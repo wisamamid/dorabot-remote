@@ -6,6 +6,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useConnection } from './connection.js'
 import { APNS_ENV, enablePush, listenPush, pushSupported, registerIfGranted, type PushPermission } from './push.js'
+import { generatePushKey } from './push-crypto.js'
+import { getPushKey, setPushKey } from './push-key.js'
 import { storage } from './platform.js'
 
 const SENT_KEY = 'dorabot-remote.push.sent.v1'
@@ -77,11 +79,17 @@ export function PushProvider({ children }: { children: ReactNode }): ReactNode {
     void (async () => {
       try {
         const last = await storage.get(SENT_KEY).catch(() => null)
-        if (last === stamp) {
+        // Already registered with the Mac, and the content key is still in the keychain.
+        if (last === stamp && (await getPushKey())) {
           setRegistered(true)
           return
         }
-        await conn.rpc('remote.registerPush', { token, platform: 'ios', env: APNS_ENV })
+        // Every registration rotates the content key. The bridge switches to the new key
+        // as soon as it accepts it, so the keychain is updated right after; until then a
+        // push just shows its generic text.
+        const pushKey = generatePushKey()
+        await conn.rpc('remote.registerPush', { token, platform: 'ios', env: APNS_ENV, pushKey })
+        await setPushKey(pushKey)
         await storage.set(SENT_KEY, stamp).catch(() => {})
         if (alive) setRegistered(true)
       } catch {

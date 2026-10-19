@@ -41,6 +41,7 @@ import { renameSession as renameSessionLogic } from './rename.js'
 import { switchModel } from './models.js'
 import { connLog, flushConnLog, loadConnLog, setConnMeta } from './connlog.js'
 import { haptic, onAppBackground, onAppResume, onNetworkChange, storage } from './platform.js'
+import { clearPushKey } from './push-key.js'
 
 const PAIRING_KEY = 'dorabot-remote.pairing.v1'
 const CURSOR_KEY = 'dorabot-remote.cursor.v1'
@@ -490,6 +491,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       ])
     }
     await storage.remove('dorabot-remote.push.sent.v1').catch(() => {})
+    void clearPushKey()
     clientRef.current?.disconnect()
     clientRef.current = null
     aggRef.current = new SessionAggregator()

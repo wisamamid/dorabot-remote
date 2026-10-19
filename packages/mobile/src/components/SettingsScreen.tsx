@@ -2,6 +2,7 @@ import { SCOPE_DESCRIPTIONS, SCOPE_LABELS, SCOPES, type Scope } from '@dorabot-r
 import { useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
 import { haptic, platformName } from '../lib/platform.js'
+import { useAppLock } from '../lib/app-lock.js'
 import { usePush } from '../lib/push-context.js'
 import { ConnectionLogScreen } from './ConnectionLogScreen.js'
 import { Button, Card, Dot, Screen, cx } from './ui.js'
@@ -14,6 +15,7 @@ import { Button, Card, Dot, Screen, cx } from './ui.js'
 export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
   const conn = useConnection()
   const push = usePush()
+  const lock = useAppLock()
   const [confirmForget, setConfirmForget] = useState(false)
   const [requesting, setRequesting] = useState<Scope | null>(null)
   const [note, setNote] = useState<string | null>(null)
@@ -126,8 +128,33 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
                 </label>
               )}
               <p className="text-[12.5px] leading-snug text-ink-500">
-                Notifications never include the question, tool or session. They are sent only when this phone is not
-                connected.
+                Notifications show the real question or tool request, end-to-end encrypted: only this phone can read
+                it. They are sent only when this phone is not connected. Approve and Deny ask for Face ID.
+              </p>
+            </Card>
+          </section>
+        )}
+
+        {lock.supported && (
+          <section className="space-y-2">
+            <h2 className="px-1 text-[13px] font-semibold uppercase tracking-wider text-ink-400">Security</h2>
+            <Card className="space-y-2 text-[13.5px]">
+              <label className="flex items-center justify-between gap-3">
+                <span className="text-[14px]">Require Face ID</span>
+                <input
+                  type="checkbox"
+                  className="size-5 accent-mint-500"
+                  checked={lock.enabled}
+                  onChange={(e) => {
+                    const on = e.target.checked
+                    void lock.setEnabled(on).then((ok) => {
+                      if (!ok) setNote('Could not turn on Face ID. Check that Face ID or a passcode is set up.')
+                    })
+                  }}
+                />
+              </label>
+              <p className="text-[12.5px] leading-snug text-ink-500">
+                Ask for Face ID when the app opens and when you come back after more than a minute.
               </p>
             </Card>
           </section>

@@ -65,8 +65,28 @@ const TEXT = {
 
 const collapseId = (rid: string): string => rid.slice(0, 64)
 
-export function buildApnsPayload(kind: keyof typeof TEXT, rid?: string): Record<string, unknown> {
+const CATEGORY = { question: 'QUESTION', approval: 'APPROVAL', result: 'ACTIVITY', error: 'ACTIVITY' } as const
+
+export function buildApnsPayload(kind: keyof typeof TEXT, rid?: string, enc?: string): Record<string, unknown> {
   const text = TEXT[kind]
+  if (enc) {
+    // The title/body here are placeholders; the Notification Service Extension swaps
+    // in the decrypted text. `enc` is opaque to us. If the NSE cannot decrypt, the
+    // generic text is what the user sees.
+    return {
+      aps: {
+        alert: { title: text.title, body: text.body },
+        sound: 'default',
+        'mutable-content': 1,
+        category: CATEGORY[kind],
+        'thread-id': kind,
+        'interruption-level': kind === 'question' ? 'time-sensitive' : 'active',
+      },
+      k: kind,
+      ...(rid ? { rid } : {}),
+      enc,
+    }
+  }
   return {
     aps: {
       alert: { title: text.title, body: text.body },
@@ -102,7 +122,7 @@ export async function sendApns(body: PushBody, cfg: ApnsConfig, fetchFn: typeof 
   const res = await fetchFn(`https://${host}/3/device/${encodeURIComponent(body.token)}`, {
     method: 'POST',
     headers: apnsHeaders(body.kind, body.rid, jwt, cfg.topic, Math.floor(now / 1000)),
-    body: JSON.stringify(buildApnsPayload(body.kind, body.rid)),
+    body: JSON.stringify(buildApnsPayload(body.kind, body.rid, body.enc)),
   })
   if (res.ok) return { status: 200, body: { ok: true } }
   let reason = ''

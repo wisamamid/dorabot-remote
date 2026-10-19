@@ -33,6 +33,8 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>DRKeychainGroup</key>
+	<string>$(AppIdentifierPrefix)com.xische.dorabotremote.shared</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>LSRequiresIPhoneOS</key>
@@ -50,6 +52,8 @@
 	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Scan the pairing code shown on your Mac to link this phone.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Unlock DoraBot Remote and confirm approvals with Face ID.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>DoraBot Remote connects directly to your Mac on your local network.</string>
 	<key>UIApplicationSceneManifest</key>

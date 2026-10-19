@@ -42,6 +42,7 @@ import {
 import { DeviceConnection, type ConnectionHost } from './connection.js'
 import type { DeviceSocket } from './device-socket.js'
 import { PushNotifier, PUSH_TOKEN_RE } from './push.js'
+import { parsePushKey } from './push-content.js'
 import { RelayClient, type RelayState } from './relay-client.js'
 import { CONTROL_PAGE } from './control-page.js'
 import { GatewayClient } from './gateway-client.js'
@@ -511,8 +512,9 @@ export class Bridge implements ConnectionHost {
         if (!PUSH_TOKEN_RE.test(token)) throw new Error('invalid push token')
         if (platform !== 'ios' && platform !== 'android') throw new Error('invalid push platform')
         if (params.env !== undefined && params.env !== 'production' && params.env !== 'sandbox') throw new Error('invalid push env')
-        this.store.setPushToken(device.id, token, platform, env)
-        this.log(`push registered for "${device.name}" (${platform}, ${env})`)
+        if (params.pushKey !== undefined && params.pushKey !== null && !parsePushKey(params.pushKey)) throw new Error('invalid push key')
+        this.store.setPushToken(device.id, token, platform, env, params.pushKey ? String(params.pushKey) : null)
+        this.log(`push registered for "${device.name}" (${platform}, ${env}${params.pushKey ? ', e2e content' : ''})`)
         return { registered: true, notifyOnResult: this.store.getDevice(device.id)?.pushOnResult ?? false }
       }
 

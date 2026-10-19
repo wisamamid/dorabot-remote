@@ -21,6 +21,8 @@ export interface DeviceRecord {
   pushEnv?: 'production' | 'sandbox'
   /** Also push when a run finishes or fails. Off by default. */
   pushOnResult?: boolean
+  /** base64 32-byte key the phone generated; encrypts push content. Never logged or sent anywhere but used locally. */
+  pushKey?: string | null
 }
 
 export interface ScopeRequest {
@@ -113,6 +115,7 @@ export class Store {
     if (!cols.includes('push_token')) this.db.exec('ALTER TABLE devices ADD COLUMN push_token TEXT')
     if (!cols.includes('push_platform')) this.db.exec('ALTER TABLE devices ADD COLUMN push_platform TEXT')
     if (!cols.includes('push_env')) this.db.exec("ALTER TABLE devices ADD COLUMN push_env TEXT NOT NULL DEFAULT 'production'")
+    if (!cols.includes('push_key')) this.db.exec('ALTER TABLE devices ADD COLUMN push_key TEXT')
     if (!cols.includes('push_on_result')) this.db.exec('ALTER TABLE devices ADD COLUMN push_on_result INTEGER NOT NULL DEFAULT 0')
   }
 
@@ -221,6 +224,7 @@ export class Store {
       pushPlatform: (row.push_platform as 'ios' | 'android' | null) ?? null,
       pushEnv: row.push_env === 'sandbox' ? 'sandbox' : 'production',
       pushOnResult: Boolean(row.push_on_result),
+      pushKey: (row.push_key as string | null) ?? null,
     }
   }
 
@@ -239,7 +243,7 @@ export class Store {
 
   /** Revoking also drops the push token: a revoked device must never be notified. */
   setRevoked(id: string, revoked: boolean): boolean {
-    if (revoked) this.db.prepare('UPDATE devices SET push_token = NULL, push_platform = NULL WHERE id = ?').run(id)
+    if (revoked) this.db.prepare('UPDATE devices SET push_token = NULL, push_platform = NULL, push_key = NULL WHERE id = ?').run(id)
     return this.db.prepare('UPDATE devices SET revoked = ? WHERE id = ?').run(revoked ? 1 : 0, id).changes > 0n
   }
 
@@ -247,17 +251,24 @@ export class Store {
     return this.db.prepare('UPDATE devices SET scopes = ? WHERE id = ?').run(JSON.stringify(scopes), id).changes > 0
   }
 
-  setPushToken(id: string, token: string | null, platform: 'ios' | 'android' | null, env: 'production' | 'sandbox' = 'production'): boolean {
+  /** Every (re-)registration replaces the key, so passing none drops the old one (rotation); clearing the token drops it too. */
+  setPushToken(
+    id: string,
+    token: string | null,
+    platform: 'ios' | 'android' | null,
+    env: 'production' | 'sandbox' = 'production',
+    pushKey: string | null = null,
+  ): boolean {
     return (
       this.db
-        .prepare('UPDATE devices SET push_token = ?, push_platform = ?, push_env = ? WHERE id = ?')
-        .run(token, platform, env, id).changes > 0
+        .prepare('UPDATE devices SET push_token = ?, push_platform = ?, push_env = ?, push_key = ? WHERE id = ?')
+        .run(token, platform, env, token ? pushKey : null, id).changes > 0
     )
   }
 
   /** Remove a token only if it is still the one we sent with (a newer registration may have replaced it). */
   clearPushTokenIf(id: string, token: string): boolean {
-    return this.db.prepare('UPDATE devices SET push_token = NULL, push_platform = NULL WHERE id = ? AND push_token = ?').run(id, token).changes > 0
+    return this.db.prepare('UPDATE devices SET push_token = NULL, push_platform = NULL, push_key = NULL WHERE id = ? AND push_token = ?').run(id, token).changes > 0
   }
 
   setPushOnResult(id: string, on: boolean): boolean {
