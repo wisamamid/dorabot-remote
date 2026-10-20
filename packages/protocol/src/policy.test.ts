@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { isMethodAllowed, methodsForScopes, denialReason } from './policy.js'
+import { isMethodAllowed, isValidScope, methodsForScopes, denialReason } from './policy.js'
 import { SCOPES, SCOPE_DEFAULTS, SCOPE_LABELS, SCOPE_DESCRIPTIONS, type Scope } from './wire.js'
 
 const only = (scope: Scope): Scope[] => [scope]
@@ -13,8 +13,8 @@ describe('scope split', () => {
     }
   })
 
-  it('turns git and file reads on by default, and every write off', () => {
-    expect(SCOPE_DEFAULTS).toEqual(['sessions', 'chat', 'approvals', 'work', 'files', 'git'])
+  it('grants only sessions, chat and approvals by default', () => {
+    expect(SCOPE_DEFAULTS).toEqual(['sessions', 'chat', 'approvals'])
     for (const s of ['git_write', 'terminal', 'admin'] as Scope[]) expect(SCOPE_DEFAULTS).not.toContain(s)
   })
 
@@ -22,6 +22,8 @@ describe('scope split', () => {
     const seen = new Map<string, Scope>()
     for (const s of SCOPES) {
       for (const m of exact(s)) {
+        // remote.roots is readable with either files or git (to show shared folders).
+        if (m === 'remote.roots') continue
         expect(seen.get(m), `${m} is in both ${seen.get(m)} and ${s}`).toBeUndefined()
         seen.set(m, s)
       }
@@ -66,7 +68,7 @@ describe('scope split', () => {
   })
 
   it('keeps files read-only and owns the file search methods', () => {
-    expect(exact('files').every((m) => /^(fs\.(list|read|readBinary|stat)|search\.(files|ripgrep))$/.test(m))).toBe(true)
+    expect(exact('files').every((m) => /^(fs\.(list|read|readBinary|stat)|search\.(files|ripgrep)|remote\.roots)$/.test(m))).toBe(true)
     expect(isMethodAllowed('search.files', ['chat'])).toBe(false)
     expect(isMethodAllowed('search.files', ['files'])).toBe(true)
     for (const m of ['fs.write', 'fs.mkdir', 'fs.rename', 'fs.copy', 'fs.delete', 'fs.reveal']) {
@@ -107,5 +109,28 @@ describe('bridge method gating', () => {
     expect(isMethodAllowed('fs.write', ['admin'])).toBe(false)
     expect(isMethodAllowed('security.set', ['admin'])).toBe(false)
     expect(isMethodAllowed('fs.read', ['files'])).toBe(true)
+  })
+})
+
+describe('schedule scope and scope validation', () => {
+  it('keeps persistent scheduled runs out of work and off by default', () => {
+    for (const m of ['cron.add', 'cron.toggle', 'cron.run', 'cron.remove', 'calendar.add', 'calendar.update', 'calendar.toggle', 'calendar.run', 'calendar.remove']) {
+      expect(isMethodAllowed(m, ['work']), m).toBe(false)
+      expect(isMethodAllowed(m, ['schedule']), m).toBe(true)
+    }
+    for (const m of ['cron.list', 'calendar.list', 'calendar.export']) expect(isMethodAllowed(m, ['work']), m).toBe(true)
+    expect(SCOPE_DEFAULTS).not.toContain('schedule')
+  })
+
+  it('validates scope names', () => {
+    expect(isValidScope('schedule')).toBe(true)
+    expect(isValidScope('terminal')).toBe(true)
+    for (const bad of ['root', '', 'TERMINAL', undefined, null, 5, {}, '__proto__']) expect(isValidScope(bad), String(bad)).toBe(false)
+  })
+
+  it('lets remote.roots through with files or git only', () => {
+    expect(isMethodAllowed('remote.roots', ['files'])).toBe(true)
+    expect(isMethodAllowed('remote.roots', ['git'])).toBe(true)
+    expect(isMethodAllowed('remote.roots', ['chat'])).toBe(false)
   })
 })

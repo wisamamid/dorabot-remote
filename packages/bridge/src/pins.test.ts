@@ -48,6 +48,7 @@ describe('remote.pins.*', () => {
   async function connect(scopes?: string[]): Promise<{ c: RemoteClient; ev: Array<{ event: string; data: any }> }> {
     const { uri } = bridge.newPairingPayload(scopes as never)
     const p: PairResult = await pairWithHost({ payload: decodePairingPayload(uri), deviceName: 'T', platform: 'ios', createSocket })
+    bridge.approveDevice(p.deviceId)
     const ev: Array<{ event: string; data: any }> = []
     const c = new RemoteClient({
       identity: p.identity,

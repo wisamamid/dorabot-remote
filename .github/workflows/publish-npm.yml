@@ -1,0 +1,38 @@
+# NPM Trusted Publishing (OIDC) Setup
+# This workflow publishes the package to npm using OIDC token-based authentication.
+# One-time setup on npmjs.com:
+#   1. Go to dorabot-remote package settings
+#   2. Navigate to Trusted Publishers > GitHub Actions
+#   3. Add: owner=wisamamid, repo=dorabot-remote, workflow=publish-npm.yml
+
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - run: npm test -w @dorabot-remote/protocol
+
+      - run: cd packages/cli && npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.npm_token || '' }}

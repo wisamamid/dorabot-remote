@@ -24,7 +24,8 @@ import type {
 import type { DeviceSocket } from './device-socket.js'
 import type { DeviceRecord } from './store.js'
 import { trimHistoryResult } from './history-trim.js'
-import { checkPathParams } from './path-guard.js'
+import { checkPathParams, filterSearchResult } from './path-guard.js'
+import { sanitizeParams } from './param-allowlist.js'
 
 /** Replay is paced against this so a long catch-up cannot blow the socket buffer. */
 const SEND_HIGH_WATER_BYTES = 512 * 1024
@@ -36,6 +37,8 @@ export interface ConnectionHost {
   sodium: Sodium
   hostIdentity: KeyPair
   hostSummary: HostSummary
+  /** [SEC-RELAY] hostSummary plus this device's relay token. */
+  hostSummaryFor(device: { id: string }): HostSummary
   getDevice(id: string): DeviceRecord | null
   touchDevice(id: string): void
   deviceSummary(device: DeviceRecord): DeviceSummary
@@ -56,6 +59,11 @@ export interface ConnectionHost {
   onClosed(conn: DeviceConnection): void
   /** Bridge-owned directories that fs.* / search.* must never reach. */
   protectedPaths?(): string[]
+  /** Folders shared with phones. Absent or empty means no file access at all. */
+  allowedRoots?(): string[]
+  /** When an unapproved device's pairing lapses (epoch ms). Display hint for the phone. */
+  pendingExpiresAt?(device: DeviceRecord): number | undefined
+  auditRpc?(conn: DeviceConnection, method: string, requestId: string | number | undefined, params: Record<string, unknown>): void // SEC-S3
 }
 
 /**
@@ -99,6 +107,8 @@ export class DeviceConnection {
   private authSeq = 0
   private sendQueue: Promise<void> = Promise.resolve()
   private handshakeTimer: NodeJS.Timeout | null = null
+  /** The one plaintext `hdr` this connection may receive. */
+  private gotHdr = false
 
   constructor(
     private readonly ws: DeviceSocket,
@@ -133,13 +143,13 @@ export class DeviceConnection {
 
   private failedWith: string | null = null
 
-  private fail(code: string, message: string): void {
+  private fail(code: string, message: string, extra: Record<string, unknown> = {}): void {
     if (!this.authed) {
       this.failedWith = code
       this.host.log?.(`device socket from ${this.remoteAddress} failed before auth: ${code} (${message})`)
     }
     try {
-      this.ws.send(JSON.stringify({ t: 'err', code, message }))
+      this.ws.send(JSON.stringify({ t: 'err', code, message, ...extra }))
     } catch {
       // Socket already gone.
     }
@@ -155,6 +165,13 @@ export class DeviceConnection {
     if (this.closed) return
     try {
       if (!isBinary) {
+        // Plaintext frames exist only for the handshake. Once the encrypted channel is
+        // up, one more (e.g. a replayed or forged `hdr`) would reset the receive
+        // counter and re-enable replay, so it ends the connection.
+        if (this.channel?.established) {
+          this.fail('bad_handshake', 'plaintext frame after handshake')
+          return
+        }
         await this.onHandshakeFrame(JSON.parse(raw.toString()) as Record<string, unknown>)
         return
       }
@@ -174,6 +191,10 @@ export class DeviceConnection {
     const s = this.host.sodium
 
     if (frame.t === 'hello') {
+      if (this.channel) {
+        this.fail('bad_handshake', 'duplicate hello')
+        return
+      }
       if (frame.v !== PROTOCOL_VERSION) {
         this.fail('bad_version', `this host speaks protocol v${PROTOCOL_VERSION}`)
         return
@@ -187,6 +208,12 @@ export class DeviceConnection {
         this.fail('revoked', 'access for this device was revoked')
         return
       }
+      if (device.pending) { // SEC-S3
+        const exp = this.host.pendingExpiresAt?.(device)
+        this.fail('pending', 'waiting for approval on your Mac', exp ? { approvalExpiresAt: exp } : {})
+        return
+      }
+
       this.device = device
 
       this.ephemeral = generateIdentity(s)
@@ -217,6 +244,11 @@ export class DeviceConnection {
         this.fail('bad_handshake', 'header before hello')
         return
       }
+      if (this.gotHdr) {
+        this.fail('bad_handshake', 'duplicate header')
+        return
+      }
+      this.gotHdr = true
       // If the device used the wrong long-term key, the derived keys differ and
       // the first payload simply fails to decrypt. That is the authentication.
       this.channel.startReceive(fromB64(s, String(frame.hdr)))
@@ -240,7 +272,7 @@ export class DeviceConnection {
         this.send({
           t: 'ready',
           device: this.host.deviceSummary(device),
-          host: this.host.hostSummary,
+          host: this.host.hostSummaryFor(device), // [SEC-RELAY] carries this device's relay token
           allowed: methodsForScopes(device.scopes),
           seq: this.host.currentSeq(),
           gatewayConnected: this.host.gatewayConnected(),
@@ -268,7 +300,8 @@ export class DeviceConnection {
   }
 
   private async onRpc(env: RpcEnvelope): Promise<void> {
-    const params = (env.params ?? {}) as Record<string, unknown>
+    const rawParams = env.params
+    let params = (rawParams && typeof rawParams === 'object' && !Array.isArray(rawParams) ? rawParams : {}) as Record<string, unknown>
     const reply = (result: unknown): void => this.send({ t: 'rpc_res', id: env.id, result })
     const fail = (message: string, code?: string): void =>
       this.send({ t: 'rpc_res', id: env.id, error: { message, code } })
@@ -288,6 +321,11 @@ export class DeviceConnection {
       return
     }
 
+    // Drop params the phone has no business sending (e.g. tool.approve modifiedInput
+    // without `terminal`). Done once, before anything is forwarded.
+    params = sanitizeParams(env.method, params, this.device.scopes)
+
+    this.host.auditRpc?.(this, env.method, env.id, params) // SEC-S3: audit log hook
     try {
       // Subscriptions are served by the bridge, not the gateway. The bridge holds
       // one subscription upstream covering every session and keeps its own durable
@@ -322,7 +360,13 @@ export class DeviceConnection {
         return
       }
 
-      const blocked = checkPathParams(env.method, params, this.host.protectedPaths?.() ?? [])
+      if (env.method === 'remote.roots') {
+        reply({ roots: this.host.allowedRoots?.() ?? [] })
+        return
+      }
+
+      const guardCtx = { roots: this.host.allowedRoots?.() ?? [], extraDenied: this.host.protectedPaths?.() ?? [] }
+      const blocked = checkPathParams(env.method, params, guardCtx)
       if (blocked) {
         this.host.log(`refused ${env.method} from ${this.device.name}: ${blocked}`)
         fail(blocked, 'forbidden')
@@ -345,7 +389,7 @@ export class DeviceConnection {
       }
 
       const result = await this.host.callGateway(env.method, params)
-      reply(trimHistoryResult(env.method, result, this.ws.maxFrameBytes))
+      reply(trimHistoryResult(env.method, filterSearchResult(env.method, result, guardCtx), this.ws.maxFrameBytes))
     } catch (err) {
       fail((err as Error).message)
     }

@@ -22,7 +22,7 @@ export function MacsSection(): ReactNode {
         ? { tone: 'good', text: `Connected${via ? ` ${via}` : ''}` }
         : { tone: 'warn', text: 'Reachable, dorabot is not running' }
     }
-    if (conn.state === 'revoked') return { tone: 'bad', text: 'Access removed' }
+    if (conn.state === 'pending') return { tone: 'warn', text: 'Waiting for approval on your Mac' }
     return { tone: conn.state === 'connecting' || conn.state === 'handshaking' ? 'warn' : 'bad', text: conn.state === 'connecting' || conn.state === 'handshaking' ? 'Connecting…' : 'Offline' }
   }
 

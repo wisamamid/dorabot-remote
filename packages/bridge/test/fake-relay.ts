@@ -14,6 +14,7 @@ import {
   encodeMux,
   encodeMuxClose,
   newChallengeNonce,
+  relayTokenHash,
   verifyChallenge,
 } from '@dorabot-remote/protocol'
 import { WebSocket, WebSocketServer } from 'ws'
@@ -51,6 +52,13 @@ export class FakeRelay {
    */
   blackHole = false
   heartbeats = 0
+  /** Access state the host last pushed ({t:'tokens'}), mirroring the real Room. */
+  tokenSet = new Set<string>()
+  tickets = new Set<string>()
+  enforce = false
+  tokensFrames: Array<{ set: string[]; tickets: string[]; enforce: boolean }> = []
+  /** Devices refused for a missing or wrong token. */
+  unauthorized = 0
   devicesAccepted = 0
 
   get url(): string {
@@ -114,6 +122,14 @@ export class FakeRelay {
       }
       this.maxHostFrame = Math.max(this.maxHostFrame, raw.length)
       if (!isBinary) {
+        if (raw.toString().startsWith('{"t":"tokens"')) {
+          const f = JSON.parse(raw.toString()) as { set: string[]; tickets?: string[]; enforce: boolean }
+          this.tokenSet = new Set(f.set)
+          this.tickets = new Set(f.tickets ?? [])
+          this.enforce = f.enforce === true
+          this.tokensFrames.push({ set: f.set, tickets: f.tickets ?? [], enforce: this.enforce })
+          return
+        }
         if (raw.toString() === RELAY_HB_REQUEST) {
           this.heartbeats++
           if (this.answerHeartbeat) ws.send(RELAY_HB_RESPONSE)
@@ -146,10 +162,36 @@ export class FakeRelay {
     const host = this.authedHost
     if (!host) return void ws.close(RELAY_CLOSE.hostOffline, 'host_offline')
     const connId = this.nextConn++
-    this.devices.set(connId, ws)
-    this.devicesAccepted++
-    if (!this.blackHole) host.ws.send(encodeMux(MuxKind.open, connId))
+    let admitted = false
+    const admit = (): void => {
+      admitted = true
+      this.devices.set(connId, ws)
+      this.devicesAccepted++
+      if (!this.blackHole) host.ws.send(encodeMux(MuxKind.open, connId))
+    }
+    // Not enforcing: legacy devices are admitted at once. Enforcing: only after a valid {t:'auth',tok} frame.
+    if (!this.enforce) admit()
     ws.on('message', (raw: Buffer, isBinary: boolean) => {
+      if (!isBinary && raw.length < 400 && raw.toString().includes('"auth"')) {
+        try {
+          const f = JSON.parse(raw.toString()) as { t?: string; tok?: string }
+          if (f.t === 'auth') {
+            const h = relayTokenHash(String(f.tok))
+            if (!this.tokenSet.has(h) && !this.tickets.delete(h)) {
+              this.unauthorized++
+              return void ws.close(RELAY_CLOSE.unauthorized, 'unauthorized')
+            }
+            if (!admitted) admit()
+            return
+          }
+        } catch {
+          // Ordinary frame.
+        }
+      }
+      if (!admitted) {
+        this.unauthorized++
+        return void ws.close(RELAY_CLOSE.unauthorized, 'unauthorized')
+      }
       if (this.blackHole) return
       const h = this.authedHost
       if (!h) return void ws.close(RELAY_CLOSE.hostOffline, 'host_offline')
@@ -157,7 +199,7 @@ export class FakeRelay {
     })
     ws.on('close', (code, reason) => {
       this.devices.delete(connId)
-      if (!this.blackHole) this.authedHost?.ws.send(encodeMuxClose(connId, code, reason.toString()))
+      if (admitted && !this.blackHole) this.authedHost?.ws.send(encodeMuxClose(connId, code, reason.toString()))
     })
     ws.on('error', () => {})
   }

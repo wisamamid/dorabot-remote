@@ -52,6 +52,7 @@ function harness(over: Partial<PushDeps> = {}, fcmStatus = 200) {
     serviceAccount,
     now: () => Date.now(),
     rateLimit: async () => true,
+    dedupe: async () => true,
     cache,
     fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
@@ -72,6 +73,54 @@ describe('handlePush', () => {
     expect(res.status).toBe(503)
     expect(await res.json()).toEqual({ error: 'push_not_configured' })
     expect(calls).toHaveLength(0)
+  })
+
+  describe('replay guard', () => {
+    const memory = () => {
+      const seen = new Set<string>()
+      return {
+        dedupe: async (k: string) => (seen.has(k) ? false : (seen.add(k), true)),
+        forget: async (k: string) => void seen.delete(k),
+      }
+    }
+
+    it('rejects a replayed signed body with 409 and sends nothing the second time', async () => {
+      const { deps, calls } = harness(memory())
+      const first = signed(body())
+      const raw = await first.req.clone().text()
+      expect((await handlePush(first.req, relayId, deps)).status).toBe(200)
+      const n = calls.length
+      const replay = new Request(first.req.url, { method: 'POST', body: raw, headers: first.req.headers })
+      const res = await handlePush(replay, relayId, deps)
+      expect(res.status).toBe(409)
+      expect(await res.json()).toEqual({ error: 'duplicate' })
+      expect(calls).toHaveLength(n)
+    })
+
+    it('dedupes on (rid, kind, token) even when ts differs, but not across kinds, rids or devices', async () => {
+      const { deps } = harness(memory())
+      const send = async (o: Partial<PushBody>) => (await handlePush(signed(body(o)).req, relayId, deps)).status
+      expect(await send({ ts: Date.now() })).toBe(200)
+      expect(await send({ ts: Date.now() + 5 })).toBe(409)
+      expect(await send({ kind: 'approval' })).toBe(200)
+      expect(await send({ rid: 'req-2' })).toBe(200)
+      expect(await send({ token: 'another-device-token' })).toBe(200)
+    })
+
+    it('does not burn the key when the send fails, so a retry goes through', async () => {
+      const m = memory()
+      const failing = harness(m, 500)
+      expect((await handlePush(signed(body()).req, relayId, failing.deps)).status).toBe(502)
+      const ok = harness(m, 200)
+      expect((await handlePush(signed(body()).req, relayId, ok.deps)).status).toBe(200)
+    })
+
+    it('a bad signature never reaches the guard', async () => {
+      let asked = 0
+      const { deps } = harness({ dedupe: async () => (asked++, true) })
+      await handlePush(signed(body(), generateSigningKey()).req, relayId, deps)
+      expect(asked).toBe(0)
+    })
   })
 
   it('rejects a bad signature, a foreign key, a mismatched relayId and a stale timestamp', async () => {

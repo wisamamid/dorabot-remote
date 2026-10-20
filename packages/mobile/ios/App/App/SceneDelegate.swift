@@ -15,6 +15,24 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         SceneDelegateProxy.shared.scene(scene, willConnectTo: session, options: connectionOptions)
     }
 
+    // Cover the window while the app is inactive so the app-switcher snapshot never shows
+    // conversation content (also covers the Face ID prompt and Control Centre).
+    private var privacyCover: UIView?
+
+    func sceneWillResignActive(_ scene: UIScene) {
+        guard let window = window, privacyCover == nil else { return }
+        let cover = UIView(frame: window.bounds)
+        cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        cover.backgroundColor = UIColor(red: 0.06, green: 0.07, blue: 0.08, alpha: 1)
+        window.addSubview(cover)
+        privacyCover = cover
+    }
+
+    func sceneDidBecomeActive(_ scene: UIScene) {
+        privacyCover?.removeFromSuperview()
+        privacyCover = nil
+    }
+
     func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
         SceneDelegateProxy.shared.scene(scene, openURLContexts: URLContexts)
     }

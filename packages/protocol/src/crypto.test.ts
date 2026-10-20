@@ -94,6 +94,16 @@ describe('session handshake', () => {
     expect(() => h.open(frame)).toThrow()
   })
 
+  it('refuses a second stream header, so a re-key cannot rewind the counter for replay', () => {
+    const { d, h } = handshake()
+    const frame = d.seal({ i: 1 })
+    h.open(frame)
+    expect(() => h.startReceive(new Uint8Array(16))).toThrow(/already/)
+    // The original stream is untouched: the replayed frame still fails.
+    expect(() => h.open(frame)).toThrow()
+    expect(h.open(d.seal({ i: 2 }))).toEqual({ i: 2 })
+  })
+
   it('rejects a reordered frame', () => {
     const { d, h } = handshake()
     const a = d.seal({ i: 1 })

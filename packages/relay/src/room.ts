@@ -20,15 +20,44 @@ import {
   encodeMux,
   encodeMuxClose,
   newChallengeNonce,
+  relayTokenHash,
+  RELAY_HASH_RE,
+  RELAY_TOKEN_PROTOCOL_PREFIX,
+  RELAY_TOKEN_RE,
   verifyChallenge,
 } from '@dorabot-remote/protocol'
 import { LIMITS, SlidingWindow, TokenBucket } from './limits.js'
 import type { Env } from './index.js'
 
 type HostAtt = { role: 'host'; rid: string; n: string; authed: boolean; t0: number; /** auth time; liveness floor until the first heartbeat. */ seen?: number }
-/** `dropped` marks a device the room closed because its host went away; no one needs telling. */
-type DevAtt = { role: 'dev'; connId: number; rid?: string; t0?: number; dropped?: boolean }
+/**
+ * `dropped` marks a device the room closed because its host went away; no one needs telling.
+ * `auth`: 'pending' = connected, no valid token yet, the host has NOT been told about it;
+ * 'tok' / 'ticket' = presented a valid token / single-use ticket; 'legacy' = connected with no
+ * token while the host had not enforced yet. `h` is the hash it authenticated with (for revocation).
+ */
+type DevAtt = {
+  role: 'dev'
+  connId: number
+  rid?: string
+  t0?: number
+  dropped?: boolean
+  auth: 'pending' | 'legacy' | 'tok' | 'ticket'
+  h?: string
+  ip?: string
+}
 type Att = HostAtt | DevAtt
+
+/** Access state pushed by the authenticated host; persisted so it survives hibernation. */
+interface Access {
+  tokens: string[]
+  /** ticket hash -> expiry (unix ms) */
+  tickets: Record<string, number>
+  /** ticket hash -> time used; kept so a re-sent set cannot resurrect a consumed ticket */
+  used: Record<string, number>
+  enforce: boolean
+}
+const ACCESS_KEY = 'access'
 
 const OPEN = 1
 /** A host that has not heartbeat (bridge sends every 15s) for this long is a zombie link. */
@@ -63,9 +92,16 @@ function rejectSoon(ws: WebSocket, code: number, reason: string): void {
 export class Room extends DurableObject<Env> {
   private buckets = new Map<number, TokenBucket>()
   private pushWindow = new SlidingWindow(LIMITS.pushPerMinute, LIMITS.pushWindowMs)
+  private access: Access = { tokens: [], tickets: {}, used: {}, enforce: false }
+  private ipHits = new Map<string, number[]>()
+  private dedupe = new Map<string, number>()
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
+    void this.ctx.blockConcurrencyWhile(async () => {
+      const a = await this.ctx.storage.get<Access>(ACCESS_KEY)
+      if (a) this.access = { tokens: a.tokens ?? [], tickets: a.tickets ?? {}, used: a.used ?? {}, enforce: !!a.enforce }
+    })
     // Answered by the runtime without waking a hibernated object; it also stamps
     // getWebSocketAutoResponseTimestamp, which is how host liveness is judged.
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(RELAY_HB_REQUEST, RELAY_HB_RESPONSE))
@@ -78,19 +114,67 @@ export class Room extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
-    const m = /^\/(h|d|rate)\/([A-Za-z0-9_-]{22})$/.exec(url.pathname)
+    const m = /^\/(h|d|rate|dedupe)\/([A-Za-z0-9_-]{22})$/.exec(url.pathname)
     if (!m) return new Response('not found', { status: 404 })
     const [, route, relayId] = m as unknown as [string, string, string]
 
     if (route === 'rate') {
       return new Response(null, { status: this.pushWindow.allow() ? 204 : 429 })
     }
+    if (route === 'dedupe') {
+      // Internal (from the push handler): first sight of a key within the window is 204, a repeat is 409.
+      const { k, forget } = (await request.json().catch(() => ({}))) as { k?: string; forget?: boolean }
+      if (typeof k !== 'string' || k.length === 0 || k.length > 128) return new Response(null, { status: 400 })
+      return new Response(null, { status: this.pushDedupe(k, !!forget) })
+    }
     if (request.headers.get('Upgrade') !== 'websocket') return new Response('expected websocket', { status: 426 })
 
+    // Cloudflare always sets this; without it (local dev) per-IP limits do not apply.
+    const ip = request.headers.get('CF-Connecting-IP') ?? undefined
+    if (ip && !this.ipAllow(ip)) {
+      rlog('conn_rejected', relayId, { reason: 'ip_rate' })
+      return new Response('rate limited', { status: 429 })
+    }
+
     const { 0: client, 1: server } = new WebSocketPair()
+    const headers: Record<string, string> = {}
     if (route === 'h') this.acceptHost(server, relayId)
-    else this.acceptDevice(server, relayId)
-    return new Response(null, { status: 101, webSocket: client })
+    else {
+      // Browsers cannot set headers, so a token may ride in Sec-WebSocket-Protocol; the chosen value must be echoed.
+      const offered = (request.headers.get('Sec-WebSocket-Protocol') ?? '').split(',').map((p) => p.trim())
+      const tokProto = offered.find((p) => p.startsWith(RELAY_TOKEN_PROTOCOL_PREFIX))
+      if (tokProto) headers['Sec-WebSocket-Protocol'] = tokProto
+      this.acceptDevice(server, relayId, ip, tokProto?.slice(RELAY_TOKEN_PROTOCOL_PREFIX.length))
+    }
+    return new Response(null, { status: 101, webSocket: client, headers })
+  }
+
+  private pushDedupe(key: string, forget: boolean): number {
+    const now = Date.now()
+    if (forget) {
+      this.dedupe.delete(key)
+      return 204
+    }
+    for (const [k, exp] of this.dedupe) if (exp <= now) this.dedupe.delete(k)
+    if (this.dedupe.has(key)) return 409
+    // Over capacity: drop the oldest (Map keeps insertion order) rather than refuse real pushes.
+    while (this.dedupe.size >= LIMITS.pushDedupeMax) this.dedupe.delete(this.dedupe.keys().next().value as string)
+    this.dedupe.set(key, now + LIMITS.pushDedupeMs)
+    return 204
+  }
+
+  /** Connections per IP per minute (hosts and devices alike). In memory: it only matters while under attack. */
+  private ipAllow(ip: string): boolean {
+    const now = Date.now()
+    if (this.ipHits.size > 2000) this.ipHits.clear()
+    const hits = (this.ipHits.get(ip) ?? []).filter((t) => now - t < LIMITS.ipWindowMs)
+    if (hits.length >= LIMITS.ipConnsPerWindow) {
+      this.ipHits.set(ip, hits)
+      return false
+    }
+    hits.push(now)
+    this.ipHits.set(ip, hits)
+    return true
   }
 
   // -------------------------------------------------------------------------
@@ -100,23 +184,30 @@ export class Room extends DurableObject<Env> {
   private acceptHost(ws: WebSocket, relayId: string): void {
     this.ctx.acceptWebSocket(ws, ['host'])
     rlog('host_connect', relayId)
-    const pending = this.ctx.getWebSockets('host').filter((w) => !(w.deserializeAttachment() as HostAtt | null)?.authed)
-    // The fresh socket has no attachment yet, so it is counted as pending above.
-    if (pending.length > LIMITS.maxPendingHosts) {
-      rlog('host_rejected', relayId, { reason: 'too_many_pending' })
-      rejectSoon(ws, RELAY_CLOSE.rateLimited, 'too_many_pending')
-      return
+    const pending = this.ctx.getWebSockets('host').filter((w) => w !== ws && !(w.deserializeAttachment() as HostAtt | null)?.authed)
+    // Junk sockets must not be able to lock the real host out: when full, the oldest
+    // pending one is evicted to make room instead of refusing the newcomer. (A successful
+    // auth also evicts every other pending socket, see onHostMessage.)
+    if (pending.length >= LIMITS.maxPendingHosts) {
+      pending.sort((a, b) => ((a.deserializeAttachment() as HostAtt | null)?.t0 ?? 0) - ((b.deserializeAttachment() as HostAtt | null)?.t0 ?? 0))
+      for (const old of pending.slice(0, pending.length - LIMITS.maxPendingHosts + 1)) {
+        rlog('host_rejected', relayId, { reason: 'pending_evicted' })
+        tryClose(old, RELAY_CLOSE.rateLimited, 'pending_evicted')
+      }
     }
     const n = newChallengeNonce()
     ws.serializeAttachment({ role: 'host', rid: relayId, n, authed: false, t0: Date.now() } satisfies HostAtt)
     ws.send(JSON.stringify({ t: 'challenge', n }))
-    // setTimeout would not survive hibernation; an alarm does.
-    void this.ctx.storage.getAlarm().then((a) => {
-      if (a === null) return this.ctx.storage.setAlarm(Date.now() + LIMITS.hostAuthTimeoutMs)
-    })
+    void this.armAlarm(Date.now() + LIMITS.hostAuthTimeoutMs)
   }
 
-  private acceptDevice(ws: WebSocket, relayId: string): void {
+  /** setTimeout would not survive hibernation; an alarm does. Keep the earliest wanted deadline. */
+  private async armAlarm(at: number): Promise<void> {
+    const cur = await this.ctx.storage.getAlarm()
+    if (cur === null || cur > at) await this.ctx.storage.setAlarm(at)
+  }
+
+  private acceptDevice(ws: WebSocket, relayId: string, ip?: string, protoTok?: string): void {
     this.ctx.acceptWebSocket(ws)
     const host = this.authedHost()
     if (!host) {
@@ -125,20 +216,107 @@ export class Room extends DurableObject<Env> {
       return
     }
     const devices = this.devices()
-    if (devices.length >= LIMITS.maxDevices) {
+    const atts = devices.map((d) => d.deserializeAttachment() as DevAtt | null)
+    const joined = atts.filter((a) => a && a.auth !== 'pending').length
+    if (joined >= LIMITS.maxDevices) {
       rlog('device_rejected', relayId, { reason: 'too_many_devices' })
       rejectSoon(ws, RELAY_CLOSE.rateLimited, 'too_many_devices')
       return
     }
-    const used = new Set(devices.map((d) => (d.deserializeAttachment() as DevAtt | null)?.connId))
+    if (atts.length - joined >= LIMITS.maxPendingDevices) {
+      rlog('device_rejected', relayId, { reason: 'too_many_pending' })
+      rejectSoon(ws, RELAY_CLOSE.rateLimited, 'too_many_pending')
+      return
+    }
+    if (ip && atts.filter((a) => a?.ip === ip).length >= LIMITS.ipMaxDevices) {
+      rlog('device_rejected', relayId, { reason: 'ip_devices' })
+      rejectSoon(ws, RELAY_CLOSE.rateLimited, 'too_many_from_ip')
+      return
+    }
+    const used = new Set(atts.map((a) => a?.connId))
     let connId = 0
     do {
       connId = crypto.getRandomValues(new Uint32Array(1))[0]!
     } while (connId === 0 || used.has(connId))
-    ws.serializeAttachment({ role: 'dev', connId, rid: relayId, t0: Date.now() } satisfies DevAtt)
-    rlog('device_accepted', relayId, { conn: connId, devices: devices.length + 1 })
-    this.buckets.set(connId, new TokenBucket(LIMITS.deviceFrames, LIMITS.deviceWindowMs))
-    host.send(encodeMux(MuxKind.open, connId))
+
+    const att: DevAtt = { role: 'dev', connId, rid: relayId, t0: Date.now(), auth: 'pending', ...(ip ? { ip } : {}) }
+    if (protoTok !== undefined) {
+      const c = this.checkCredential(protoTok)
+      if (!c) {
+        // Wrong token: refuse whether or not enforcement is on, and never tell the host.
+        ws.serializeAttachment(att)
+        rlog('device_rejected', relayId, { reason: 'bad_token' })
+        rejectSoon(ws, RELAY_CLOSE.unauthorized, 'unauthorized')
+        return
+      }
+      att.auth = c.via
+      att.h = c.h
+    } else if (!this.access.enforce) {
+      att.auth = 'legacy'
+    }
+    ws.serializeAttachment(att)
+    if (att.auth === 'pending') {
+      // Not announced to the host: it learns about a device only once the device has authenticated.
+      void this.armAlarm(att.t0! + LIMITS.deviceAuthTimeoutMs)
+      return
+    }
+    this.admit(ws, att, host)
+  }
+
+  /** Tell the host about a device that is allowed in, and start forwarding. */
+  private admit(ws: WebSocket, att: DevAtt, host: WebSocket): void {
+    rlog('device_accepted', att.rid ?? '', { conn: att.connId, via: att.auth })
+    this.buckets.set(att.connId, new TokenBucket(LIMITS.deviceFrames, LIMITS.deviceWindowMs))
+    host.send(encodeMux(MuxKind.open, att.connId))
+  }
+
+  /**
+   * Is this token (or single-use ticket) currently valid? Tickets are consumed here.
+   * Matching is on the SHA-256 hash, so the relay never holds a usable token.
+   */
+  private checkCredential(tok: string): { via: 'tok' | 'ticket'; h: string } | null {
+    if (!RELAY_TOKEN_RE.test(tok)) return null
+    const h = relayTokenHash(tok)
+    if (this.access.tokens.includes(h)) return { via: 'tok', h }
+    const exp = this.access.tickets[h]
+    if (exp !== undefined && exp > Date.now()) {
+      delete this.access.tickets[h]
+      this.access.used[h] = Date.now()
+      void this.saveAccess()
+      return { via: 'ticket', h }
+    }
+    return null
+  }
+
+  private saveAccess(): Promise<void> {
+    return this.ctx.storage.put(ACCESS_KEY, this.access)
+  }
+
+  /** Apply a `tokens` frame from the authenticated host, then drop every device that lost access. */
+  private applyTokens(frame: { set?: unknown; tickets?: unknown; enforce?: unknown }): void {
+    const hashes = (v: unknown, cap: number): string[] =>
+      Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && RELAY_HASH_RE.test(x)).slice(0, cap) : []
+    const now = Date.now()
+    const tickets: Record<string, number> = {}
+    for (const h of hashes(frame.tickets, LIMITS.maxTickets)) {
+      if (h in this.access.used) continue
+      tickets[h] = this.access.tickets[h] ?? now + LIMITS.ticketTtlMs
+    }
+    for (const [h, t] of Object.entries(this.access.used)) if (now - t > 2 * LIMITS.ticketTtlMs) delete this.access.used[h]
+    this.access = { ...this.access, tokens: hashes(frame.set, LIMITS.maxTokens), tickets, enforce: frame.enforce === true }
+    void this.saveAccess()
+    const live = new Set(this.access.tokens)
+    for (const d of this.devices()) {
+      const a = d.deserializeAttachment() as DevAtt
+      // 'ticket' sockets are single-use pairing connections: they outlive their ticket.
+      const revoked = a.auth === 'tok' && !!a.h && !live.has(a.h)
+      const unauth = this.access.enforce && a.auth === 'legacy'
+      if (revoked || unauth) {
+        rlog('device_revoked', a.rid ?? '', { conn: a.connId, why: revoked ? 'token_removed' : 'enforce' })
+        // Not `dropped`: the host saw this device open, so it is told it closed.
+        tryClose(d, RELAY_CLOSE.unauthorized, revoked ? 'revoked' : 'unauthorized')
+      }
+    }
   }
 
   /** Last sign of life from an authed host: its latest heartbeat, or its auth time if it has not sent one yet. */
@@ -189,7 +367,8 @@ export class Room extends DurableObject<Env> {
 
   private deviceById(connId: number): WebSocket | null {
     for (const w of this.devices()) {
-      if ((w.deserializeAttachment() as DevAtt).connId === connId && w.readyState === OPEN) return w
+      const a = w.deserializeAttachment() as DevAtt
+      if (a.connId === connId && a.auth !== 'pending' && w.readyState === OPEN) return w
     }
     return null
   }
@@ -243,13 +422,26 @@ export class Room extends DurableObject<Env> {
         if (old === ws) continue
         if ((old.deserializeAttachment() as HostAtt | null)?.authed) tryClose(old, RELAY_CLOSE.replaced, 'replaced')
       }
+      // Junk sockets that opened but never authenticated must not hold slots against the real host.
+      for (const other of this.ctx.getWebSockets('host')) {
+        if (other !== ws && !(other.deserializeAttachment() as HostAtt | null)?.authed) tryClose(other, RELAY_CLOSE.rateLimited, 'pending_evicted')
+      }
       this.closeAllDevices(RELAY_CLOSE.hostOffline, 'host_replaced')
       ws.serializeAttachment({ ...att, authed: true, n: '', seen: Date.now() } satisfies HostAtt)
       ws.send(JSON.stringify({ t: 'ok' }))
       return
     }
 
-    if (typeof message === 'string') return
+    if (typeof message === 'string') {
+      if (message.length > 64 * 1024 || !message.startsWith('{"t":"tokens"')) return
+      try {
+        const f = JSON.parse(message) as { t?: string; set?: unknown; tickets?: unknown; enforce?: unknown }
+        if (f.t === 'tokens') this.applyTokens(f)
+      } catch {
+        // Ignore malformed.
+      }
+      return
+    }
     const frame = decodeMux(new Uint8Array(message))
     if (!frame) return
     const target = this.deviceById(frame.connId)
@@ -273,12 +465,47 @@ export class Room extends DurableObject<Env> {
     }
   }
 
+  /** The credential in a `{t:'auth',tok}` frame ('' if it has no tok); undefined if it is not an auth frame. */
+  private parseAuthFrame(message: string | ArrayBuffer): string | undefined {
+    if (typeof message !== 'string' || message.length > 400 || !message.includes('"auth"')) return undefined
+    try {
+      const f = JSON.parse(message) as { t?: unknown; tok?: unknown }
+      if (f.t !== 'auth') return undefined
+      return typeof f.tok === 'string' ? f.tok : ''
+    } catch {
+      return undefined
+    }
+  }
+
   private onDeviceMessage(ws: WebSocket, att: DevAtt, message: string | ArrayBuffer): void {
     const host = this.authedHost()
     if (!host) {
       rlog('device_rejected', att.rid ?? '', { reason: 'host_offline', conn: att.connId })
       tryClose(ws, RELAY_CLOSE.hostOffline, 'host_offline')
       return
+    }
+    if (att.auth === 'pending' || att.auth === 'legacy') {
+      // Pending: the first frame must be {t:'auth',tok}. Legacy (host not enforcing yet): a token frame
+      // is consumed too, but anything else is ordinary traffic.
+      const cred = this.parseAuthFrame(message)
+      if (att.auth === 'pending' && cred === undefined) {
+        rlog('device_rejected', att.rid ?? '', { reason: 'no_token', conn: att.connId })
+        tryClose(ws, RELAY_CLOSE.unauthorized, 'unauthorized')
+        return
+      }
+      if (cred !== undefined) {
+        const c = this.checkCredential(cred)
+        if (!c) {
+          rlog('device_rejected', att.rid ?? '', { reason: 'bad_token', conn: att.connId })
+          tryClose(ws, RELAY_CLOSE.unauthorized, 'unauthorized')
+          return
+        }
+        const wasPending = att.auth === 'pending'
+        const next: DevAtt = { ...att, auth: c.via, h: c.h }
+        ws.serializeAttachment(next)
+        if (wasPending) this.admit(ws, next, host)
+        return
+      }
     }
     // After hibernation the bucket is gone; a fresh one is fine, the room was idle.
     let bucket = this.buckets.get(att.connId)
@@ -319,7 +546,8 @@ export class Room extends DurableObject<Env> {
     if (att.role === 'dev') {
       rlog('device_close', att.rid ?? '', { conn: att.connId, code, reason: reason.slice(0, 40), ms: att.t0 ? Date.now() - att.t0 : undefined, dropped: att.dropped || undefined })
       this.buckets.delete(att.connId)
-      if (att.dropped) return
+      // A pending device was never announced, so the host has nothing to close.
+      if (att.dropped || att.auth === 'pending') return
       this.authedHost(ws)?.send(encodeMuxClose(att.connId, code, reason))
       return
     }
@@ -331,14 +559,26 @@ export class Room extends DurableObject<Env> {
   async alarm(): Promise<void> {
     const now = Date.now()
     let next: number | null = null
-    for (const w of this.ctx.getWebSockets('host')) {
-      const att = w.deserializeAttachment() as HostAtt | null
-      if (!att || att.authed) continue
-      const deadline = att.t0 + LIMITS.hostAuthTimeoutMs
-      if (deadline <= now + 50) {
-        rlog('host_auth_fail', att.rid, { reason: 'auth_timeout' })
-        tryClose(w, RELAY_CLOSE.unauthorized, 'auth_timeout')
-      } else next = next === null ? deadline : Math.min(next, deadline)
+    const consider = (deadline: number): void => {
+      next = next === null ? deadline : Math.min(next, deadline)
+    }
+    for (const w of this.ctx.getWebSockets()) {
+      const att = w.deserializeAttachment() as Att | null
+      if (!att) continue
+      if (att.role === 'host') {
+        if (att.authed) continue
+        const deadline = att.t0 + LIMITS.hostAuthTimeoutMs
+        if (deadline <= now + 50) {
+          rlog('host_auth_fail', att.rid, { reason: 'auth_timeout' })
+          tryClose(w, RELAY_CLOSE.unauthorized, 'auth_timeout')
+        } else consider(deadline)
+      } else if (att.auth === 'pending') {
+        const deadline = (att.t0 ?? now) + LIMITS.deviceAuthTimeoutMs
+        if (deadline <= now + 50) {
+          rlog('device_rejected', att.rid ?? '', { reason: 'auth_timeout', conn: att.connId })
+          tryClose(w, RELAY_CLOSE.unauthorized, 'auth_timeout')
+        } else consider(deadline)
+      }
     }
     if (next !== null) await this.ctx.storage.setAlarm(next)
   }

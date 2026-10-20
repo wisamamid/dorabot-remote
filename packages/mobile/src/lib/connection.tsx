@@ -91,6 +91,8 @@ interface ConnectionValue {
   renameMac: (hostId: string, alias: string) => void
   state: ConnectionState
   stateDetail?: string
+  /** While state is 'pending': epoch ms when the Mac discards the unapproved pairing, if known. Otherwise null. */
+  approvalExpiresAt: number | null
   host: HostSummary | null
   device: DeviceSummary | null
   gatewayConnected: boolean
@@ -153,6 +155,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   const pairing = useMemo(() => activePairing(file), [file])
   const [state, setState] = useState<ConnectionState>('idle')
   const [stateDetail, setStateDetail] = useState<string | undefined>()
+  const [approvalExpiresAt, setApprovalExpiresAt] = useState<number | null>(null)
   const [host, setHost] = useState<HostSummary | null>(null)
   const [device, setDevice] = useState<DeviceSummary | null>(null)
   const [gatewayConnected, setGatewayConnected] = useState(false)
@@ -282,6 +285,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
         hostPublicKey: fromB64(null, pairing.hostPublicKey),
         addresses: pairing.addresses,
         relay: pairing.relay ?? null,
+        approvalExpiresAt: pairing.approvalExpiresAt ?? null,
         createSocket,
         lastSeq: cursor,
         clientVersion: '0.1.0',
@@ -291,6 +295,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
           connLog('state', detail ? `${s} (${detail})` : s)
           setState(s)
           setStateDetail(detail)
+          setApprovalExpiresAt(s === 'pending' ? (client?.approvalExpiresAt ?? pairing.approvalExpiresAt ?? null) : null)
         },
         onTransport: (t) => {
           if (cancelled) return
@@ -301,8 +306,11 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
         onRelay: (relay) => {
           // The effect is keyed on identity fields only, so this does not rebuild the client.
           if (cancelled) return
+          // The client acks the token to the Mac only after this resolves, so it must reflect a real write.
+          if (degradedRef.current) throw new Error('secure storage unavailable; relay token not saved')
           commit(updatePairing(fileRef.current, hostId, (p) => ({ ...p, relay })))
           setConnMeta({ relayUrl: relay.u, relayId: relay.i.slice(0, 6) })
+          return writeChain.current
         },
         onReady: (info) => {
           if (cancelled) return
@@ -399,7 +407,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   useEffect(() => {
     return onAppBackground(() => {
       const c = clientRef.current
-      if (!c || c.state === 'revoked') return
+      if (!c) return
       backgrounded.current = true
       connLog('app', 'background: closing connection')
       c.disconnect()
@@ -413,7 +421,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     return onNetworkChange(
       () => {
         const c = clientRef.current
-        if (!c || c.state === 'revoked') return
+        if (!c) return
         backgrounded.current = false
         connLog('net', 'network changed: forcing reconnect')
         c.forceReconnect()
@@ -650,6 +658,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       hostPublicKey: toB64(null, result.hostPublicKey),
       addresses: result.addresses,
       relay: result.relay,
+      ...(result.pending && result.approvalExpiresAt ? { approvalExpiresAt: result.approvalExpiresAt } : {}),
       identity: identityToB64(null, result.identity),
       scopes: result.scopes,
       pairedAt: now,
@@ -750,6 +759,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       renameMac,
       state,
       stateDetail,
+      approvalExpiresAt,
       host,
       device,
       gatewayConnected,
@@ -793,6 +803,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       renameMac,
       state,
       stateDetail,
+      approvalExpiresAt,
       host,
       device,
       gatewayConnected,

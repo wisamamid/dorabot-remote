@@ -187,6 +187,12 @@ export interface PairingResponse {
   scopes: string[]
   /** Echoed so the phone can confirm it reached the key it scanned. */
   hostPublicKey: string
+  /** [SEC-RELAY] This device's relay access token, sent E2E so the phone can reconnect through the relay. */
+  relayTok?: string
+  /** [SEC-CONTROL] True when the Mac still has to approve this phone before it can connect. */
+  pending?: boolean
+  /** Epoch ms after which an unapproved pairing is discarded. Display only. */
+  approvalExpiresAt?: number
 }
 
 const SEAL_CONTEXT = utf8(null, 'dorabot-remote/seal/v1')
@@ -299,6 +305,9 @@ export class SecureChannel {
   /** Accept the peer's header, opening our inbound stream. */
   startReceive(header: Uint8Array): void {
     if (header.length !== NONCE_PREFIX_BYTES) throw new Error('bad stream header length')
+    // One header per connection, ever: a second one would reset the counter and
+    // let an attacker replay earlier ciphertext frames.
+    if (this.rxPrefix) throw new Error('stream header already received')
     this.rxPrefix = header
     this.rxCounter = 0n
   }

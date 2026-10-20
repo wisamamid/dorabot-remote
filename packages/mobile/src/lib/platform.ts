@@ -27,7 +27,7 @@ export const platformName = Capacitor.getPlatform()
 // store automatically, so the public API is the same get/set/remove as before.
 // ---------------------------------------------------------------------------
 
-export const SECRET_KEY = /\.(pairings?|secret)\./
+export const SECRET_KEY = /\.(pairings?|secret|applock)\./
 
 // Capacitor plugin objects are Proxies that answer *any* property, including
 // `then`. Returning one from an async function (or resolving a promise with it)

@@ -27,12 +27,15 @@ let paths: BridgePaths
 
 async function freshPairing(scopes?: string[]): Promise<PairResult> {
   const { uri } = bridge.newPairingPayload(scopes as never)
-  return pairWithHost({
+  const res = await pairWithHost({
     payload: decodePairingPayload(uri),
     deviceName: 'Test iPhone',
     platform: 'ios',
     createSocket,
   })
+  // Pairing leaves the device pending; these tests act as the user clicking Allow.
+  expect(bridge.approveDevice(res.deviceId)).toBe(true)
+  return res
 }
 
 async function connectAs(pair: PairResult): Promise<RemoteClient> {
@@ -94,7 +97,7 @@ describe('pairing', () => {
     const pair = await freshPairing()
     expect(pair.deviceId).toBeTruthy()
     expect(pair.hostName).toBeTruthy()
-    expect([...pair.scopes].sort()).toEqual(['approvals', 'chat', 'files', 'git', 'sessions', 'work'])
+    expect([...pair.scopes].sort()).toEqual(['approvals', 'chat', 'sessions'])
     // Terminal is never granted at pairing time.
     expect(pair.scopes).not.toContain('terminal')
   })
@@ -171,8 +174,8 @@ describe('authorisation', () => {
     client.disconnect()
   })
 
-  it('lets a freshly paired phone read git but not write it', async () => {
-    const pair = await freshPairing()
+  it('lets a phone granted git read but not write it', async () => {
+    const pair = await freshPairing(['sessions', 'chat', 'approvals', 'files', 'git'])
     expect(pair.scopes).toEqual(expect.arrayContaining(['git', 'files']))
     expect(pair.scopes).not.toContain('git_write')
     const client = await connectAs(pair)

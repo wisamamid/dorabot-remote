@@ -5,7 +5,73 @@ title: Support
 
 # Support
 
+## Getting Started
+
+### Install
+
+Requires Node 22.13 or newer.
+
+```bash
+npx dorabot-remote setup
+```
+
+This will start the bridge on your Mac and open the pairing page in your browser.
+
+### Update
+
+To update to the latest version:
+
+```bash
+npx dorabot-remote@latest update
+```
+
+### Uninstall
+
+To stop and remove the bridge:
+
+```bash
+npx dorabot-remote uninstall
+```
+
+Add `--purge` to also delete pairing keys and device records:
+
+```bash
+npx dorabot-remote uninstall --purge
+```
+
 ## Frequently Asked Questions
+
+### My phone says it's waiting for approval
+
+The device needs approval on your Mac before it can connect.
+
+1. On your Mac, run:
+   ```
+   npx dorabot-remote open
+   ```
+   This opens the control page in your browser.
+
+2. On the control page, find your device and click **Approve**.
+
+3. Your phone will connect immediately.
+
+### The Code tab is empty / says no folders are shared
+
+You have not shared any folders yet. Only folders you explicitly allow can be accessed by your phone.
+
+To add folders:
+
+1. On your Mac, run:
+   ```
+   npx dorabot-remote open
+   ```
+
+2. Go to **Shared folders** and click **Add**.
+
+3. Or use the command line:
+   ```
+   npx dorabot-remote folders add /path/to/folder
+   ```
 
 ### I can connect on WiFi but not on cellular
 
@@ -62,20 +128,6 @@ If you want to block access from a paired device:
 To delete the pairing record entirely:
 ```
 dorabot-remote remove <deviceId>
-```
-
-### How do I uninstall the bridge?
-
-To remove the bridge from your Mac:
-
-```
-dorabot-remote uninstall
-```
-
-This stops the bridge and removes it, but keeps its keys and paired devices so you can reinstall later. Add `--purge` to delete those too:
-
-```
-dorabot-remote uninstall --purge
 ```
 
 ## Send a Connection Log

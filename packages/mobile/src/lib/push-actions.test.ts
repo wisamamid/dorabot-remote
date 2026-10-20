@@ -1,12 +1,18 @@
 import { describe, expect, it } from 'vitest'
-import { DENY_REASON, routePushAction, runDecision, staleDelivered } from './push-actions.js'
+import { DENY_REASON, buildPushNav, routePushAction, runDecision, staleDelivered } from './push-actions.js'
+import { chacha20poly1305 } from '@noble/ciphers/chacha.js'
+import { b64ToBytes, bytesToB64, generatePushKey } from './push-crypto.js'
+import { pushKeyId } from './push-keys.js'
 import { recentlyAuthed } from './biometric.js'
-import { shouldLock } from './app-lock.js'
+import { APPLOCK_KEY, LOCK_GRACE_MS, shouldLock } from './app-lock.js'
+import { SECRET_KEY } from './platform.js'
 
 describe('routePushAction', () => {
   it('approve / deny buttons on an approval become decisions', () => {
-    expect(routePushAction({ rid: 'r1', kind: 'approval', actionId: 'APPROVE', sessionKey: 's' })).toEqual({ type: 'decide', decision: 'approve', rid: 'r1', sessionKey: 's' })
-    expect(routePushAction({ rid: 'r1', kind: 'approval', actionId: 'DENY' })).toEqual({ type: 'decide', decision: 'deny', rid: 'r1' })
+    expect(routePushAction({ rid: 'r1', kind: 'approval', actionId: 'APPROVE', sessionKey: 's', hostId: 'h1' })).toEqual({ type: 'decide', decision: 'approve', rid: 'r1', sessionKey: 's', hostId: 'h1' })
+    expect(routePushAction({ rid: 'r1', kind: 'approval', actionId: 'DENY', hostId: 'h1' })).toEqual({ type: 'decide', decision: 'deny', rid: 'r1', hostId: 'h1' })
+    // No verified Mac: never a decision.
+    expect(routePushAction({ rid: 'r1', kind: 'approval', actionId: 'DENY' }).type).toBe('open')
   })
   it('carries the Mac (hostId from enc, or the kid) through to the route', () => {
     expect(routePushAction({ rid: 'r1', kind: 'approval', actionId: 'APPROVE', hostId: 'h2', kid: 'abcd1234' })).toEqual({ type: 'decide', decision: 'approve', rid: 'r1', hostId: 'h2', kid: 'abcd1234' })
@@ -88,14 +94,59 @@ describe('staleDelivered', () => {
 
 describe('app lock and auth windows', () => {
   it('locks only when enabled and away longer than the grace period', () => {
-    expect(shouldLock(true, 1000, 1000 + 59_000)).toBe(false)
-    expect(shouldLock(true, 1000, 1000 + 61_000)).toBe(true)
+    expect(shouldLock(true, 1000, 1000 + 14_000)).toBe(false)
+    expect(shouldLock(true, 1000, 1000 + 16_000)).toBe(true)
+    expect(LOCK_GRACE_MS).toBe(15_000)
     expect(shouldLock(false, 1000, 1000 + 600_000)).toBe(false)
     expect(shouldLock(true, null, 5)).toBe(false)
+  })
+  it('keeps the lock flag in the Keychain, not Preferences', () => {
+    expect(SECRET_KEY.test(APPLOCK_KEY)).toBe(true)
   })
   it('a very recent success is reused', () => {
     expect(recentlyAuthed(10_000, 5_000)).toBe(true)
     expect(recentlyAuthed(30_000, 5_000)).toBe(false)
     expect(recentlyAuthed(10_000, 0)).toBe(false)
+  })
+})
+
+describe('buildPushNav (notification actions trust only decrypted content)', () => {
+  const seal = (body: object, keyB64: string): string => {
+    const nonce = crypto.getRandomValues(new Uint8Array(12))
+    const ct = chacha20poly1305(b64ToBytes(keyB64), nonce).encrypt(new TextEncoder().encode(JSON.stringify(body)))
+    const out = new Uint8Array(12 + ct.length)
+    out.set(nonce)
+    out.set(ct, 12)
+    return bytesToB64(out)
+  }
+  const key = generatePushKey()
+  const keys = [{ kid: pushKeyId('h1'), key }]
+  const body = { kind: 'approval', rid: 'real', title: 't', body: 'b', hostId: 'h1', sessionKey: 's' }
+
+  it('uses rid / kind / hostId from the decrypted content, not the plaintext userInfo', () => {
+    const nav = buildPushNav({ enc: seal(body, key), kid: pushKeyId('h1'), rid: 'forged', k: 'question' }, 'APPROVE', keys)
+    expect(nav).toMatchObject({ rid: 'real', kind: 'approval', hostId: 'h1', actionId: 'APPROVE', sessionKey: 's' })
+    expect(routePushAction(nav)).toMatchObject({ type: 'decide', rid: 'real', hostId: 'h1' })
+  })
+  it('opens the Inbox without acting when there is no enc or it will not decrypt', () => {
+    for (const data of [{ rid: 'forged', k: 'approval' }, { enc: seal(body, generatePushKey()), rid: 'forged', k: 'approval' }, { enc: 'garbage', rid: 'x', k: 'approval' }]) {
+      const nav = buildPushNav(data, 'APPROVE', keys)
+      expect(nav).toEqual({ actionId: 'tap' })
+      expect(routePushAction(nav)).toEqual({ type: 'open' })
+    }
+    expect(buildPushNav({ enc: seal(body, key) }, 'APPROVE', [])).toEqual({ actionId: 'tap' })
+  })
+  it('rejects a hostId that does not belong to the key that decrypted it', () => {
+    const nav = buildPushNav({ enc: seal({ ...body, hostId: 'other' }, key) }, 'APPROVE', keys)
+    expect(nav.hostId).toBeUndefined()
+    expect(routePushAction(nav).type).toBe('open')
+  })
+  it('never acts on a legacy key or content with no hostId', () => {
+    expect(routePushAction(buildPushNav({ enc: seal(body, key) }, 'DENY', [{ kid: '', key }])).type).toBe('open')
+    const { hostId: _h, ...noHost } = body
+    expect(routePushAction(buildPushNav({ enc: seal(noHost, key) }, 'DENY', keys)).type).toBe('open')
+  })
+  it('a tap on a verified push opens with the decrypted rid', () => {
+    expect(routePushAction(buildPushNav({ enc: seal(body, key) }, 'tap', keys))).toMatchObject({ type: 'open', rid: 'real', hostId: 'h1' })
   })
 })

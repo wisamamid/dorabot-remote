@@ -239,6 +239,6 @@ function describeState(state: string, detail?: string): string {
   if (state === 'ready') return 'connected'
   if (state === 'connecting') return 'connecting…'
   if (state === 'handshaking') return 'verifying…'
-  if (state === 'revoked') return detail ? `access removed (${detail})` : 'access removed'
+  if (state === 'pending') return 'waiting for approval on your Mac'
   return detail ? `offline (${detail})` : 'offline'
 }

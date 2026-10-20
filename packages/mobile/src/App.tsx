@@ -1,6 +1,7 @@
-import type { StoredSession } from '@dorabot-remote/protocol'
+import { NOT_RECOGNISED_TEXT, type StoredSession } from '@dorabot-remote/protocol'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { keyOf } from './lib/connection.js'
+import { formatCountdown } from './lib/countdown.js'
 import { CodeScreen } from './components/CodeScreen.js'
 import { InboxScreen } from './components/InboxScreen.js'
 import { MoreScreen } from './components/MoreScreen.js'
@@ -23,6 +24,7 @@ import { AppLinkQueue, ASK_TTL_MS, nextAskStep, parseAppLink } from './lib/appli
 import { displayName } from './lib/hosts.js'
 import { routePushAction, runDecision, type PushRoute } from './lib/push-actions.js'
 import { createPortal } from 'react-dom'
+import { AskConfirmSheet } from './components/AskConfirmSheet.js'
 import { PushProvider } from './lib/push-context.js'
 
 type TabName = 'sessions' | 'inbox' | 'work' | 'code' | 'more'
@@ -89,9 +91,9 @@ function Shell(): ReactNode {
       if (targetHost && targetHost !== c.activeHostId) c.switchTo(targetHost)
       setTab('inbox')
       setOpen(null)
-      if (route.type === 'decide') {
+      if (route.type === 'decide' && c.pairings.some((p) => p.hostId === route.hostId)) {
         // Face ID is asked inside runDecision; the delivered notification is cleared by the prune below.
-        setDecision({ ...route, hostId: targetHost ?? undefined })
+        setDecision({ ...route, hostId: route.hostId })
         return
       }
       void clearDeliveredNotifications()
@@ -136,11 +138,12 @@ function Shell(): ReactNode {
   }, [toast])
 
   // ---- Siri / Shortcuts: dorabot-remote://ask?prompt=...&host=... and ://inbox ----
-  // Requests are queued until the app can act: restored, unlocked (Face ID if the lock is on),
-  // on the right Mac, and connected. The decisions themselves are pure (lib/applink.ts).
+  // Requests are queued until the app can act: restored, unlocked, confirmed by
+  // the user on a sheet showing the full prompt (nothing is sent without tapping Send), on the right Mac, and connected. The decisions themselves are pure (lib/applink.ts).
   const askQueue = useRef(new AppLinkQueue())
   const [askTick, setAskTick] = useState(0)
-  const askVerified = useRef(false)
+  const askConfirmed = useRef(false)
+  const [askConfirm, setAskConfirm] = useState<{ prompt: string; hostName: string } | null>(null)
   const askBusy = useRef(false)
   const lockRef = useRef(lock)
   lockRef.current = lock
@@ -149,7 +152,7 @@ function Shell(): ReactNode {
     () =>
       onAppUrl((url) => {
         const link = parseAppLink(url)
-        if (link && askQueue.current.push(link, Date.now(), lockRef.current.locked)) setAskTick((t) => t + 1)
+        if (link && askQueue.current.push(link, Date.now())) setAskTick((t) => t + 1)
       }, 'ask'),
     [],
   )
@@ -161,11 +164,11 @@ function Shell(): ReactNode {
     const bump = (): void => setAskTick((t) => t + 1)
     const finish = (message?: { text: string; ok: boolean }): void => {
       q.shift()
-      askVerified.current = false
+      askConfirmed.current = false
+      setAskConfirm(null)
       if (message) setToast(message)
       bump()
     }
-    if (lock.locked) head.arrivedLocked = true
     const link = head.link
     if (link.type === 'inbox') {
       if (!conn.ready || lock.locked) return
@@ -181,7 +184,6 @@ function Shell(): ReactNode {
       prompt: link.prompt,
       ...(link.host ? { host: link.host } : {}),
       at: head.at,
-      arrivedLocked: head.arrivedLocked,
       now: Date.now(),
       ready: conn.ready,
       hosts,
@@ -189,8 +191,7 @@ function Shell(): ReactNode {
       connState: conn.state,
       hasChatScope: conn.hasScope('chat'),
       appLocked: lock.locked,
-      lockEnabled: lock.enabled,
-      verified: askVerified.current,
+      confirmed: askConfirmed.current,
     })
     if (step.do === 'wait') {
       // Re-check when the request would expire, so it cannot sit there forever.
@@ -202,17 +203,12 @@ function Shell(): ReactNode {
       conn.switchTo(step.hostId)
       return
     }
-    askBusy.current = true
-    if (step.do === 'verify') {
-      void lock.verify('Start a dorabot session').then((r) => {
-        askBusy.current = false
-        if (r === 'ok' || r === 'unavailable') {
-          askVerified.current = true
-          bump()
-        } else finish({ text: 'Not confirmed. Nothing was started.', ok: false })
-      })
+    if (step.do === 'confirm') {
+      // Show the full prompt; nothing happens until the user taps Send.
+      setAskConfirm((cur) => (cur && cur.prompt === link.prompt && cur.hostName === step.hostName ? cur : { prompt: link.prompt, hostName: step.hostName }))
       return
     }
+    askBusy.current = true
     // send: start a NEW session on that Mac with the prompt, then show it.
     const c = connRef.current
     const name = hosts.find((h) => h.hostId === step.hostId)
@@ -230,7 +226,7 @@ function Shell(): ReactNode {
         askBusy.current = false
         finish({ text: `Could not start the session: ${err.message}`, ok: false })
       })
-  }, [askTick, conn.ready, conn.state, conn.activeHostId, conn.pairings, conn.demo, lock.locked, lock.enabled, activeHostId])
+  }, [askTick, conn.ready, conn.state, conn.activeHostId, conn.pairings, conn.demo, lock.locked, activeHostId])
 
   // Drop delivered notifications for requests that are already settled.
   useEffect(() => {
@@ -262,6 +258,10 @@ function Shell(): ReactNode {
   }
 
   if ((!conn.pairing && !conn.demo) || conn.adding) return <PairScreen onCancel={conn.adding ? conn.cancelAddMac : undefined} />
+
+  if (conn.state === 'pending' && conn.approvalExpiresAt !== null) {
+    return <PendingApprovalScreen approvalExpiresAt={conn.approvalExpiresAt} onUnpair={() => void conn.forget()} />
+  }
 
   const openSession = (session: StoredSession | null, sessionKey: string): void => {
     setOpen({ session, sessionKey, hostId: activeHostId })
@@ -316,10 +316,10 @@ function Shell(): ReactNode {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {conn.state === 'revoked' && (
+      {conn.state === 'disconnected' && conn.stateDetail === NOT_RECOGNISED_TEXT && (
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-ink-700 bg-ink-900 px-4 py-2.5">
           <p className="text-[13.5px] leading-snug text-amber-glow">
-            {conn.stateDetail || 'This Mac no longer trusts this phone.'}
+            {NOT_RECOGNISED_TEXT}
           </p>
           <Button variant="primary" onClick={() => void conn.forget()} className="shrink-0 px-3 text-[14px]">
             Pair again
@@ -360,6 +360,23 @@ function Shell(): ReactNode {
           bottom of the screen, which is where a thumb already is. */}
       {!split && !open && (
         <nav className="kb-hide safe-bottom flex shrink-0 border-t border-ink-700 bg-ink-900 px-1 pt-1.5">{tabs(false)}</nav>
+      )}
+      {askConfirm && !lock.locked && (
+        <AskConfirmSheet
+          prompt={askConfirm.prompt}
+          hostName={askConfirm.hostName}
+          onSend={() => {
+            askConfirmed.current = true
+            setAskConfirm(null)
+            setAskTick((t) => t + 1)
+          }}
+          onCancel={() => {
+            askQueue.current.shift()
+            askConfirmed.current = false
+            setAskConfirm(null)
+            setAskTick((t) => t + 1)
+          }}
+        />
       )}
       {toast &&
         createPortal(
@@ -472,5 +489,74 @@ function Tab({
       </span>
       <span className="text-[13px] font-medium">{label}</span>
     </button>
+  )
+}
+
+function PendingApprovalScreen({
+  approvalExpiresAt,
+  onUnpair,
+}: {
+  approvalExpiresAt: number
+  onUnpair: () => void
+}): ReactNode {
+  const [timeLeft, setTimeLeft] = useState(() => Math.max(0, approvalExpiresAt - Date.now()))
+  const [expired, setExpired] = useState(timeLeft <= 0)
+
+  useEffect(() => {
+    if (expired) return
+    const interval = setInterval(() => {
+      const remaining = Math.max(0, approvalExpiresAt - Date.now())
+      setTimeLeft(remaining)
+      if (remaining <= 0) {
+        setExpired(true)
+      }
+    }, 100)
+    return () => clearInterval(interval)
+  }, [approvalExpiresAt, expired])
+
+  return (
+    <div className="scroll h-full">
+      <div className="mx-auto flex min-h-full w-full max-w-md flex-col justify-center gap-7 px-6 py-10">
+        <div className="space-y-2">
+          <div className="mb-5 flex size-12 items-center justify-center rounded-2xl bg-amber-dim text-amber-glow">
+            <Spinner className="size-6" />
+          </div>
+          <h1 className="text-[26px] font-semibold leading-tight tracking-[-0.02em]">Waiting for approval</h1>
+          <p className="text-[15px] leading-relaxed text-ink-300">
+            Open the control page on your Mac and allow this phone. Run <span className="font-mono">npx dorabot-remote open</span> on the Mac if the page isn't open.
+          </p>
+        </div>
+
+        {expired ? (
+          <>
+            <div className="space-y-3">
+              <p className="text-[15px] leading-relaxed text-rose-glow">
+                This request expired. Pair again.
+              </p>
+            </div>
+            <Button variant="primary" onClick={onUnpair} className="w-full">
+              Pair again
+            </Button>
+          </>
+        ) : (
+          <>
+            <div className="space-y-2">
+              <p className="text-[13px] font-medium uppercase tracking-wider text-ink-400">Expires in</p>
+              <p className="text-[28px] font-semibold font-mono text-ink-200">
+                {formatCountdown(timeLeft)}
+              </p>
+            </div>
+            <div className="space-y-3">
+              <Button variant="primary" disabled className="w-full">
+                Waiting…
+              </Button>
+              <Button variant="ghost" onClick={onUnpair} className="w-full">
+                Cancel
+              </Button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
   )
 }

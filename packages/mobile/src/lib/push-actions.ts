@@ -2,6 +2,8 @@
  * What to do with a notification tap or action button. Pure routing plus the
  * approve/deny flow, with every side effect injected so it can be tested.
  */
+import { decryptWithKeyInfo, pushKeyId, type StoredPushKey } from './push-keys.js'
+
 export interface PushNav {
   rid?: string
   kind?: string
@@ -18,11 +20,42 @@ export type PushRoute =
   | { type: 'decide'; decision: 'approve' | 'deny'; rid: string; sessionKey?: string; hostId?: string; kid?: string }
   | { type: 'open'; rid?: string; sessionKey?: string; hostId?: string; kid?: string }
 
+export interface PushData {
+  enc?: unknown
+  kid?: unknown
+  rid?: unknown
+  k?: unknown
+}
+
+/**
+ * Build the navigation for a tapped notification / action button from what the push says.
+ * The unencrypted userInfo (rid, k, kid) is attacker-controllable by anything that can reach the
+ * relay, so it is never used to act. Only `enc`, decrypted with a stored key, is trusted: rid, kind
+ * and hostId come from the decrypted content, and the hostId must match the Mac the key belongs to.
+ * If that fails, the result is a plain tap that opens the Inbox without acting.
+ */
+export function buildPushNav(data: PushData, actionId: string | undefined, keys: readonly StoredPushKey[]): PushNav {
+  const opened = typeof data.enc === 'string' ? decryptWithKeyInfo(data.enc, typeof data.kid === 'string' ? data.kid : undefined, keys) : null
+  if (!opened) return { actionId: 'tap' }
+  const { content, kid } = opened
+  // A key only vouches for its own Mac. A legacy key (kid '') cannot be tied to one, so it never acts.
+  const bound = kid !== '' && !!content.hostId && pushKeyId(content.hostId) === kid
+  return {
+    rid: content.rid,
+    kind: content.kind,
+    // Without a verified Mac, any button press is demoted to a plain open.
+    actionId: bound && actionId ? actionId : 'tap',
+    ...(content.sessionKey ? { sessionKey: content.sessionKey } : {}),
+    ...(bound && content.hostId ? { hostId: content.hostId } : {}),
+    ...(kid ? { kid } : {}),
+  }
+}
+
 export function routePushAction(nav: PushNav): PushRoute {
   const where = { ...(nav.hostId ? { hostId: nav.hostId } : {}), ...(nav.kid ? { kid: nav.kid } : {}) }
   const open: PushRoute = { type: 'open', ...(nav.rid ? { rid: nav.rid } : {}), ...(nav.sessionKey ? { sessionKey: nav.sessionKey } : {}), ...where }
   // Only an approval notification can be approved or denied from a button; anything else just opens.
-  if (nav.rid && nav.kind === 'approval' && (nav.actionId === 'APPROVE' || nav.actionId === 'DENY')) {
+  if (nav.rid && nav.hostId && nav.kind === 'approval' && (nav.actionId === 'APPROVE' || nav.actionId === 'DENY')) {
     return { type: 'decide', decision: nav.actionId === 'APPROVE' ? 'approve' : 'deny', rid: nav.rid, ...(nav.sessionKey ? { sessionKey: nav.sessionKey } : {}), ...where }
   }
   return open

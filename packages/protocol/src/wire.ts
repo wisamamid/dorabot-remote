@@ -37,7 +37,7 @@ export interface HeaderFrame {
 
 export interface HandshakeErrorFrame {
   t: 'err'
-  code: 'bad_version' | 'unknown_device' | 'revoked' | 'bad_handshake' | 'rate_limited' | 'internal'
+  code: 'bad_version' | 'unknown_device' | 'revoked' | 'pending' | 'bad_handshake' | 'rate_limited' | 'internal'
   message: string
 }
 
@@ -139,22 +139,23 @@ export type Envelope =
  * Scopes are coarse on purpose: each maps to a set of gateway RPC methods.
  * `terminal` is never granted at pairing time; see SCOPE_DEFAULTS.
  */
-export const SCOPES = ['sessions', 'chat', 'approvals', 'work', 'files', 'git', 'git_write', 'terminal', 'admin'] as const
+export const SCOPES = ['sessions', 'chat', 'approvals', 'work', 'schedule', 'files', 'git', 'git_write', 'terminal', 'admin'] as const
 export type Scope = (typeof SCOPES)[number]
 
 /**
- * What a freshly paired device gets. Reading files and git state is on because a
- * phone that cannot show you what the agent changed is not much of a remote.
- * Anything that writes to the Mac (git_write), opens a shell (terminal) or changes
- * settings (admin) stays off until a human grants it on the Mac.
+ * What a freshly paired device gets: watch and steer sessions, answer approvals.
+ * Everything that reads the Mac's files or project data (work, files, git) or
+ * writes to it (git_write, terminal, admin) stays off until a human grants it per
+ * device on the Mac's control page.
  */
-export const SCOPE_DEFAULTS: Scope[] = ['sessions', 'chat', 'approvals', 'work', 'files', 'git']
+export const SCOPE_DEFAULTS: Scope[] = ['sessions', 'chat', 'approvals']
 
 export const SCOPE_LABELS: Record<Scope, string> = {
   sessions: 'Sessions',
   chat: 'Chat',
   approvals: 'Approvals',
   work: 'Tasks & projects',
+  schedule: 'Scheduled runs',
   files: 'File browsing',
   git: 'Git (read)',
   git_write: 'Git (write)',
@@ -166,7 +167,8 @@ export const SCOPE_DESCRIPTIONS: Record<Scope, string> = {
   sessions: 'List, open, rename, fork and abort sessions.',
   chat: 'Send prompts and images, read history, answer questions.',
   approvals: 'Approve or deny tool calls the agent is waiting on.',
-  work: 'Read and edit tasks, projects, research and the schedule.',
+  work: 'Read and edit tasks, projects and research; view the schedule.',
+  schedule: 'Create and change scheduled agent runs (cron, calendar). They keep running after the phone disconnects.',
   files: 'Browse and read files on the host machine.',
   git: 'Read git status, diffs, branches and history.',
   git_write: 'Stage, commit, push, pull and switch branches.',
@@ -183,6 +185,10 @@ export interface DeviceSummary {
   lastSeenAt: number | null
   revoked: boolean
   fingerprint: string
+  /** Paired but not yet approved on the Mac. Such a device can do nothing. */
+  pending?: boolean
+  /** Why it was revoked automatically, e.g. 'expired' (unseen for 90 days). */
+  revokedReason?: string | null
 }
 
 export interface HostSummary {

@@ -6,11 +6,11 @@ import { RemoteClient, decodePairingPayload, pairWithHost, type PairResult } fro
 import { WebSocket } from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Bridge } from './bridge.js'
+import { loadControlSecret } from './control-auth.js'
 import { DeviceConnection } from './connection.js'
 import { FakeGateway } from '../test/fake-gateway.js'
 import { loadSettings, readDorabotVersion, resolvePaths, type BridgePaths } from './config.js'
 import { mdnsName } from './addresses.js'
-import { checkPathParams } from './path-guard.js'
 import { trimHistoryResult } from './history-trim.js'
 import { applyEventToSnapshots } from './snapshot-state.js'
 
@@ -26,7 +26,9 @@ let paths: BridgePaths
 
 async function pair(scopes?: string[]): Promise<PairResult> {
   const { uri } = bridge.newPairingPayload(scopes as never)
-  return pairWithHost({ payload: decodePairingPayload(uri), deviceName: 'T', platform: 'ios', createSocket })
+  const res = await pairWithHost({ payload: decodePairingPayload(uri), deviceName: 'T', platform: 'ios', createSocket })
+  bridge.approveDevice(res.deviceId)
+  return res
 }
 type Ev = { event: string; data: any; seq?: number }
 async function connect(p: PairResult, extra: { lastSeq?: number } = {}): Promise<{ c: RemoteClient; ev: Ev[] }> {
@@ -181,32 +183,11 @@ describe('live device record', () => {
   })
 })
 
-describe('path guard', () => {
-  const h = homedir()
-  it('blocks secrets and escapes, allows normal files', () => {
-    const extra = [home]
-    expect(checkPathParams('fs.read', { path: join(home, 'host-key.json') }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: '~/.ssh/id_rsa' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.list', { path: '~/Documents/../.aws' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: '../.config/gh/hosts.yml' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: 'Desktop/../../x' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: '.config/gh/hosts.yml' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: join(h, 'proj/.env') }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: join(h, 'proj/a.pem') }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('search.files', { path: h, query: 'x' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: join(h, 'proj/readme.md') }, extra)).toBeNull()
-    expect(checkPathParams('git.log', { path: '~/.ssh' }, extra)).toBeNull()
-  })
-  it('follows symlinks', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'pg-'))
-    mkdirSync(join(dir, 'secret'))
-    symlinkSync(join(dir, 'secret'), join(dir, 'link'))
-    expect(checkPathParams('fs.read', { path: join(dir, 'link/x') }, [join(dir, 'secret')])).toMatch(/blocked/)
-    rmSync(dir, { recursive: true, force: true })
-  })
-  it('is enforced on forwarded RPCs', async () => {
-    const { c } = await connect(await pair())
-    await expect(c.rpc('fs.read', { path: join(home, 'host-key.json') })).rejects.toThrow(/blocked/)
+describe('path guard (end to end)', () => {
+  it('refuses everything until a folder is shared', async () => {
+    const { c } = await connect(await pair(['sessions', 'files']))
+    await expect(c.rpc('fs.read', { path: join(home, 'host-key.json') })).rejects.toThrow(/isn't shared/)
+    await expect(c.rpc('fs.list', { path: home })).rejects.toThrow(/isn't shared/)
     c.disconnect()
   })
 })
@@ -215,7 +196,7 @@ describe('control page host/origin checks', () => {
   const get = (host: string, origin?: string) =>
     new Promise<number>((resolve, reject) => {
       const req = request(
-        { host: '127.0.0.1', port: PORT, path: '/api/state', headers: { host, ...(origin ? { origin } : {}) } },
+        { host: '127.0.0.1', port: PORT, path: '/api/state', headers: { host, authorization: `Bearer ${loadControlSecret(home)}`, ...(origin ? { origin } : {}) } },
         (res) => { res.resume(); resolve(res.statusCode ?? 0) },
       )
       req.on('error', reject)

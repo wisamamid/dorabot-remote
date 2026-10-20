@@ -8,6 +8,8 @@ import { candidateAddresses } from './addresses.js'
 import { BRIDGE_VERSION, loadIdentity, loadSettings, resolvePaths, saveSettings } from './config.js'
 import { Bridge } from './bridge.js'
 import { Store } from './store.js'
+import { loginUrl } from './control-auth.js'
+import { createRootsStore, rootsFilePath } from './roots.js'
 import * as launchd from './launchd.js'
 import { SetupError, isFirstRun, runSetup, runUninstall } from './setup.js'
 
@@ -18,8 +20,13 @@ const USAGE = `dorabot-remote ${BRIDGE_VERSION}
   setup                       One-command install: run at login, then show the pairing QR
   update                      Re-run setup with this version (npx dorabot-remote@latest update)
   start                       Run the bridge (also opens the pairing page)
-  pair                        Print a pairing QR in the terminal
-  devices                     List paired devices
+  open                        Open the control page (prints a one-time login link)
+  pair                        Print a pairing QR in the terminal (--open: also open the control page)
+  devices                     List paired devices (--pending: only those awaiting approval)
+  approve <deviceId>          Allow a newly paired phone to control dorabot
+  reject <deviceId>           Refuse and delete a newly paired phone
+  audit                       Show recent security-relevant actions (--device <id>, --limit <n>)
+  folders [add|remove <path>] List, add or remove shared folders
   grant <deviceId> <scope>    Add a permission to a device
   revoke <deviceId>           Block a device without deleting it
   remove <deviceId>           Delete a device entirely
@@ -35,7 +42,10 @@ Options
   --bind <addr>       Interface to bind (default 0.0.0.0)
   --advertise <addr>  Extra address to put in the QR, e.g. a Tailscale name
   --scopes <a,b,c>    Permissions to grant at pairing time
-  --open              Open the control page in a browser on start
+  --open              Open the control page in a browser (start, pair)
+  --pending           With devices: only phones waiting for approval
+  --device <id>       With audit: only this device
+  --limit <n>         With audit: how many entries (default 50)
   --yes               Do not ask questions (setup)
   --purge             With uninstall: also delete keys and paired devices
 
@@ -51,6 +61,9 @@ async function main(): Promise<void> {
       advertise: { type: 'string', multiple: true },
       scopes: { type: 'string' },
       open: { type: 'boolean' },
+      pending: { type: 'boolean' },
+      device: { type: 'string' },
+      limit: { type: 'string' },
       yes: { type: 'boolean', short: 'y' },
       purge: { type: 'boolean' },
       uninstall: { type: 'boolean' },
@@ -102,11 +115,26 @@ async function main(): Promise<void> {
     case 'start':
       await cmdStart(values.open === true)
       return
+    case 'open':
+      await cmdOpen()
+      return
     case 'pair':
-      await cmdPair(scopes)
+      await cmdPair(scopes, values.open === true)
       return
     case 'devices':
-      await cmdDevices()
+      await cmdDevices(values.pending === true)
+      return
+    case 'approve':
+      cmdDecide(positionals[1], true)
+      return
+    case 'reject':
+      cmdDecide(positionals[1], false)
+      return
+    case 'audit':
+      cmdAudit(values.device, Number(values.limit ?? 50))
+      return
+    case 'folders':
+      await cmdFolders(positionals[1], positionals[2])
       return
     case 'grant':
       await cmdGrant(positionals[1], positionals[2] as Scope)
@@ -171,12 +199,11 @@ async function main(): Promise<void> {
         launchd,
         env,
         log: say,
-        health: async () => (await fetch(`http://127.0.0.1:${settings.port}/api/state`)).ok,
-        pair: () => cmdPair(undefined),
+        health: async () => (await fetch(`http://127.0.0.1:${settings.port}/health`)).ok,
+        pair: () => cmdPair(undefined, false),
         skipPair: isUpdate,
-        openUrl: (url) => {
-          void import('node:child_process').then(({ spawn }) => spawn('open', [url], { stdio: 'ignore', detached: true }).unref())
-        },
+        // The control page needs a one-time login link, not the bare URL.
+        openUrl: () => openBrowser(mintLoginUrl()),
         confirm: interactive
           ? async (q) => {
               const { createInterface } = await import('node:readline/promises')
@@ -203,7 +230,14 @@ async function main(): Promise<void> {
 
     const addrs = candidateAddresses(settings.port, settings.extraAddresses, settings.bind)
     process.stdout.write(`\n  dorabot remote is running.\n\n`)
-    process.stdout.write(`  Control page   http://127.0.0.1:${settings.port}/\n`)
+    // Only mint a login link when someone is looking (a TTY) or asked for one; under
+    // launchd the log would otherwise collect live links.
+    const link = open || process.stdout.isTTY ? loginUrl(settings.port, bridge.store.createLoginToken()) : null
+    process.stdout.write(
+      link
+        ? `  Control page   ${link}\n                 (one-time link, valid 5 minutes; run "dorabot-remote open" for a new one)\n`
+        : `  Control page   run "dorabot-remote open"\n`,
+    )
     process.stdout.write(`  Host key       ${bridge.hostSummary.fingerprint}\n`)
     process.stdout.write(`  Reachable at   ${addrs.map((a) => a.address).join('\n                 ')}\n`)
     const devices = bridge.store.listDevices()
@@ -213,10 +247,7 @@ async function main(): Promise<void> {
         : `\n  ${devices.length} device(s) paired.\n\n`,
     )
 
-    if (open) {
-      const { spawn } = await import('node:child_process')
-      spawn('open', [`http://127.0.0.1:${settings.port}/`], { stdio: 'ignore', detached: true }).unref()
-    }
+    if (open && link) openBrowser(link)
 
     const shutdown = async (): Promise<void> => {
       process.stdout.write('\nshutting down…\n')
@@ -231,7 +262,26 @@ async function main(): Promise<void> {
    * Prints a QR straight into the terminal, so pairing works over SSH with no
    * browser. The payload is identical to the one the control page renders.
    */
-  async function cmdPair(withScopes?: Scope[]): Promise<void> {
+  function mintLoginUrl(): string {
+    const store = new Store(paths.db)
+    try {
+      return loginUrl(settings.port, store.createLoginToken())
+    } finally {
+      store.close()
+    }
+  }
+
+  function openBrowser(url: string): void {
+    void import('node:child_process').then(({ spawn }) => spawn('open', [url], { stdio: 'ignore', detached: true }).unref())
+  }
+
+  async function cmdOpen(): Promise<void> {
+    const url = mintLoginUrl()
+    process.stdout.write(`${url}\n(one-time link, valid 5 minutes)\n`)
+    openBrowser(url)
+  }
+
+  async function cmdPair(withScopes?: Scope[], open = false): Promise<void> {
     const identity = loadIdentity(null, paths)
     const store = new Store(paths.db)
     const { code, expiresAt } = store.createPairing(settings.pairingTtlMs, withScopes)
@@ -251,20 +301,22 @@ async function main(): Promise<void> {
     process.stdout.write(`  Host key    ${fingerprint(null, identity.publicKey)}\n`)
     process.stdout.write(`  Expires     ${new Date(expiresAt).toLocaleTimeString()}\n`)
     process.stdout.write(`  Addresses   ${payload.a.join('\n              ')}\n\n`)
-    process.stdout.write(`  The bridge must be running for the phone to connect: dorabot-remote start\n\n`)
+    process.stdout.write(`  The bridge must be running for the phone to connect: dorabot-remote start\n`)
+    process.stdout.write(`  After pairing, approve the phone on this Mac: the control page, or "dorabot-remote approve <id>".\n\n`)
     store.close()
+    if (open) await cmdOpen()
   }
 
-  async function cmdDevices(): Promise<void> {
+  async function cmdDevices(pendingOnly = false): Promise<void> {
     const store = new Store(paths.db)
-    const devices = store.listDevices()
+    const devices = pendingOnly ? store.listPending() : store.listDevices()
     if (devices.length === 0) {
-      process.stdout.write('No devices paired.\n')
+      process.stdout.write(pendingOnly ? 'No devices waiting for approval.\n' : 'No devices paired.\n')
     }
     for (const d of devices) {
       const fp = fingerprint(null, fromB64(null, d.publicKey))
       process.stdout.write(
-        `${d.revoked ? '✗' : '✓'} ${d.name}  (${d.platform})\n` +
+        `${d.pending ? '?' : d.revoked ? '✗' : '✓'} ${d.name}  (${d.platform})${d.pending ? '  WAITING FOR APPROVAL' : ''}${d.revokedReason === 'expired' ? '  revoked: unseen for 90 days' : ''}\n` +
           `  id        ${d.id}\n` +
           `  key       ${fp}\n` +
           `  allowed   ${d.scopes.join(', ')}\n` +
@@ -288,7 +340,10 @@ async function main(): Promise<void> {
       store.close()
       return
     }
-    if (!device.scopes.includes(scope)) store.setScopes(deviceId, [...device.scopes, scope])
+    if (!device.scopes.includes(scope)) {
+      store.setScopes(deviceId, [...device.scopes, scope])
+      store.recordAudit({ deviceId, deviceName: device.name, action: 'scopes', summary: `+[${scope}]`, transport: 'cli' })
+    }
     process.stdout.write(`Granted "${scope}" to ${device.name}.\n`)
     if (scope === 'terminal') {
       process.stdout.write('That device can now open a real shell on this machine.\n')
@@ -304,7 +359,13 @@ async function main(): Promise<void> {
       return
     }
     const store = new Store(paths.db)
+    const dev = store.getDevice(deviceId)
     const ok = store.setRevoked(deviceId, revoked)
+    if (ok) {
+      // Restoring restarts the 90-day unseen clock so the expiry sweep does not undo it.
+      if (!revoked) store.touchDevice(deviceId)
+      store.recordAudit({ deviceId, deviceName: dev?.name, action: revoked ? 'revoke' : 'restore', transport: 'cli' })
+    }
     process.stdout.write(ok ? `${revoked ? 'Revoked' : 'Restored'} ${deviceId}.\n` : `No device with id ${deviceId}\n`)
     store.close()
   }
@@ -316,8 +377,77 @@ async function main(): Promise<void> {
       return
     }
     const store = new Store(paths.db)
-    process.stdout.write(store.deleteDevice(deviceId) ? `Removed ${deviceId}.\n` : `No device with id ${deviceId}\n`)
+    const dev = store.getDevice(deviceId)
+    const ok = store.deleteDevice(deviceId)
+    if (ok) store.recordAudit({ deviceId, deviceName: dev?.name, action: 'delete', transport: 'cli' })
+    process.stdout.write(ok ? `Removed ${deviceId}.\n` : `No device with id ${deviceId}\n`)
     store.close()
+  }
+
+  function cmdDecide(deviceId: string | undefined, approve: boolean): void {
+    if (!deviceId) {
+      process.stderr.write(`Usage: dorabot-remote ${approve ? 'approve' : 'reject'} <deviceId>   (see: dorabot-remote devices --pending)\n`)
+      process.exitCode = 1
+      return
+    }
+    const store = new Store(paths.db)
+    const dev = store.getDevice(deviceId)
+    const ok = dev ? (approve ? store.approveDevice(deviceId) : store.rejectDevice(deviceId)) : false
+    if (ok) {
+      store.recordAudit({
+        deviceId,
+        deviceName: dev?.name,
+        action: approve ? 'approve' : 'reject',
+        summary: approve ? `scopes=${dev?.scopes.join(',')}` : undefined,
+        transport: 'cli',
+      })
+      process.stdout.write(approve ? `Approved ${dev?.name}. It can connect now.\n` : `Rejected and removed ${dev?.name}.\n`)
+    } else {
+      process.stderr.write(`No pending device with id ${deviceId}\n`)
+      process.exitCode = 1
+    }
+    store.close()
+  }
+
+  function cmdAudit(deviceId: string | undefined, limit: number): void {
+    const store = new Store(paths.db)
+    const rows = store.listAudit({ deviceId, limit: Number.isFinite(limit) && limit > 0 ? limit : 50 })
+    if (rows.length === 0) process.stdout.write('Nothing recorded yet.\n')
+    for (const r of rows) {
+      process.stdout.write(
+        `${new Date(r.at).toLocaleString()}  ${(r.deviceName ?? (r.deviceId ? r.deviceId.slice(0, 8) : 'this Mac')).padEnd(18)} ` +
+          `${(r.action === 'rpc' ? r.method : r.action)?.padEnd(20)} ${[r.summary, r.requestId ? `req ${r.requestId}` : '', r.transport ?? ''].filter(Boolean).join(' | ')}\n`,
+      )
+    }
+    store.close()
+  }
+
+  const rootsStore = createRootsStore(() => rootsFilePath(paths.root), { protectedPaths: () => [paths.root, paths.db, paths.identity, paths.signingKey, paths.settings, paths.dorabotRoot, paths.gatewayToken, paths.gatewaySocket] })
+  async function cmdFolders(sub: string | undefined, path: string | undefined): Promise<void> {
+    if (sub === 'add' || sub === 'remove') {
+      if (!path) {
+        process.stderr.write(`Usage: dorabot-remote folders ${sub} <absolute path>\n`)
+        process.exitCode = 1
+        return
+      }
+      try {
+        if (sub === 'add') rootsStore.addRoot(path)
+        else rootsStore.removeRoot(path)
+      } catch (err) {
+        process.stderr.write(`${(err as Error).message}\n`)
+        process.exitCode = 1
+        return
+      }
+      const store = new Store(paths.db)
+      store.recordAudit({ action: sub === 'add' ? 'folder_add' : 'folder_remove', summary: path.slice(0, 150), transport: 'cli' })
+      store.close()
+    } else if (sub !== undefined) {
+      process.stderr.write('Usage: dorabot-remote folders [add|remove <absolute path>]\n')
+      process.exitCode = 1
+      return
+    }
+    const roots = rootsStore.listRoots()
+    process.stdout.write(roots.length ? `${roots.join('\n')}\n` : 'No folders shared.\n')
   }
 
   function cmdInstall(): void {
