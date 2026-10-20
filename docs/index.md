@@ -14,12 +14,12 @@ DoraBot Remote is a companion app for iOS that lets you pair your phone with dor
 To use DoraBot Remote, you need:
 
 - A Mac running [dorabot](https://github.com/suitedaces/dorabot)
-- Node.js 22.5 or newer installed on that Mac
+- Node.js 22.13 or newer installed on that Mac
 - An iPhone with iOS 14 or later
 
 ## Setup
 
-The bridge runs on your Mac as a small daemon. Installation takes three steps.
+The bridge runs on your Mac as a small daemon.
 
 On your Mac, run:
 
@@ -27,17 +27,33 @@ On your Mac, run:
 npx dorabot-remote setup
 ```
 
-This installs the bridge program. You will be prompted to confirm permissions (network and local file access) if this is the first time.
+This installs the bridge program and runs it at login. You will be prompted to confirm permissions (network and local file access) if this is the first time.
 
-Once installed, start the bridge:
-
-```
-dorabot-remote start
-```
-
-It will print the addresses your phone can reach your Mac on. Open the control page in your web browser to see pairing codes.
+Open the control page in your web browser to see pairing codes. The address is shown in the terminal, typically `http://127.0.0.1:7788`.
 
 On your phone, open DoraBot Remote and tap **Pair a device**. Scan the QR code shown on your Mac's control page. The code is single-use and expires after five minutes. Once paired, your phone can connect to your Mac whenever both are online.
+
+### Updating
+
+To update to the latest version:
+
+```
+npx dorabot-remote@latest update
+```
+
+### Uninstalling
+
+To uninstall the bridge:
+
+```
+npx dorabot-remote uninstall
+```
+
+This removes the bridge but keeps your keys and paired devices so you can reinstall later. To also delete those:
+
+```
+npx dorabot-remote uninstall --purge
+```
 
 ## Features
 
