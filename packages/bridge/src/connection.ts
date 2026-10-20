@@ -24,7 +24,8 @@ import type {
 import type { DeviceSocket } from './device-socket.js'
 import type { DeviceRecord } from './store.js'
 import { trimHistoryResult } from './history-trim.js'
-import { checkPathParams } from './path-guard.js'
+import { checkPathParams, filterSearchResult } from './path-guard.js'
+import { sanitizeParams } from './param-allowlist.js'
 
 /** Replay is paced against this so a long catch-up cannot blow the socket buffer. */
 const SEND_HIGH_WATER_BYTES = 512 * 1024
@@ -56,6 +57,8 @@ export interface ConnectionHost {
   onClosed(conn: DeviceConnection): void
   /** Bridge-owned directories that fs.* / search.* must never reach. */
   protectedPaths?(): string[]
+  /** Folders shared with phones. Absent or empty means no file access at all. */
+  allowedRoots?(): string[]
 }
 
 /**
@@ -99,6 +102,8 @@ export class DeviceConnection {
   private authSeq = 0
   private sendQueue: Promise<void> = Promise.resolve()
   private handshakeTimer: NodeJS.Timeout | null = null
+  /** The one plaintext `hdr` this connection may receive. */
+  private gotHdr = false
 
   constructor(
     private readonly ws: DeviceSocket,
@@ -155,6 +160,13 @@ export class DeviceConnection {
     if (this.closed) return
     try {
       if (!isBinary) {
+        // Plaintext frames exist only for the handshake. Once the encrypted channel is
+        // up, one more (e.g. a replayed or forged `hdr`) would reset the receive
+        // counter and re-enable replay, so it ends the connection.
+        if (this.channel?.established) {
+          this.fail('bad_handshake', 'plaintext frame after handshake')
+          return
+        }
         await this.onHandshakeFrame(JSON.parse(raw.toString()) as Record<string, unknown>)
         return
       }
@@ -174,6 +186,10 @@ export class DeviceConnection {
     const s = this.host.sodium
 
     if (frame.t === 'hello') {
+      if (this.channel) {
+        this.fail('bad_handshake', 'duplicate hello')
+        return
+      }
       if (frame.v !== PROTOCOL_VERSION) {
         this.fail('bad_version', `this host speaks protocol v${PROTOCOL_VERSION}`)
         return
@@ -217,6 +233,11 @@ export class DeviceConnection {
         this.fail('bad_handshake', 'header before hello')
         return
       }
+      if (this.gotHdr) {
+        this.fail('bad_handshake', 'duplicate header')
+        return
+      }
+      this.gotHdr = true
       // If the device used the wrong long-term key, the derived keys differ and
       // the first payload simply fails to decrypt. That is the authentication.
       this.channel.startReceive(fromB64(s, String(frame.hdr)))
@@ -268,7 +289,8 @@ export class DeviceConnection {
   }
 
   private async onRpc(env: RpcEnvelope): Promise<void> {
-    const params = (env.params ?? {}) as Record<string, unknown>
+    const rawParams = env.params
+    let params = (rawParams && typeof rawParams === 'object' && !Array.isArray(rawParams) ? rawParams : {}) as Record<string, unknown>
     const reply = (result: unknown): void => this.send({ t: 'rpc_res', id: env.id, result })
     const fail = (message: string, code?: string): void =>
       this.send({ t: 'rpc_res', id: env.id, error: { message, code } })
@@ -287,6 +309,10 @@ export class DeviceConnection {
       fail(denialReason(env.method, this.device.scopes), 'forbidden')
       return
     }
+
+    // Drop params the phone has no business sending (e.g. tool.approve modifiedInput
+    // without `terminal`). Done once, before anything is forwarded.
+    params = sanitizeParams(env.method, params, this.device.scopes)
 
     try {
       // Subscriptions are served by the bridge, not the gateway. The bridge holds
@@ -322,7 +348,13 @@ export class DeviceConnection {
         return
       }
 
-      const blocked = checkPathParams(env.method, params, this.host.protectedPaths?.() ?? [])
+      if (env.method === 'remote.roots') {
+        reply({ roots: this.host.allowedRoots?.() ?? [] })
+        return
+      }
+
+      const guardCtx = { roots: this.host.allowedRoots?.() ?? [], extraDenied: this.host.protectedPaths?.() ?? [] }
+      const blocked = checkPathParams(env.method, params, guardCtx)
       if (blocked) {
         this.host.log(`refused ${env.method} from ${this.device.name}: ${blocked}`)
         fail(blocked, 'forbidden')
@@ -345,7 +377,7 @@ export class DeviceConnection {
       }
 
       const result = await this.host.callGateway(env.method, params)
-      reply(trimHistoryResult(env.method, result, this.ws.maxFrameBytes))
+      reply(trimHistoryResult(env.method, filterSearchResult(env.method, result, guardCtx), this.ws.maxFrameBytes))
     } catch (err) {
       fail((err as Error).message)
     }

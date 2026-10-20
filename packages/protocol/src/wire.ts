@@ -139,7 +139,7 @@ export type Envelope =
  * Scopes are coarse on purpose: each maps to a set of gateway RPC methods.
  * `terminal` is never granted at pairing time; see SCOPE_DEFAULTS.
  */
-export const SCOPES = ['sessions', 'chat', 'approvals', 'work', 'files', 'git', 'git_write', 'terminal', 'admin'] as const
+export const SCOPES = ['sessions', 'chat', 'approvals', 'work', 'schedule', 'files', 'git', 'git_write', 'terminal', 'admin'] as const
 export type Scope = (typeof SCOPES)[number]
 
 /**
@@ -155,6 +155,7 @@ export const SCOPE_LABELS: Record<Scope, string> = {
   chat: 'Chat',
   approvals: 'Approvals',
   work: 'Tasks & projects',
+  schedule: 'Scheduled runs',
   files: 'File browsing',
   git: 'Git (read)',
   git_write: 'Git (write)',
@@ -166,7 +167,8 @@ export const SCOPE_DESCRIPTIONS: Record<Scope, string> = {
   sessions: 'List, open, rename, fork and abort sessions.',
   chat: 'Send prompts and images, read history, answer questions.',
   approvals: 'Approve or deny tool calls the agent is waiting on.',
-  work: 'Read and edit tasks, projects, research and the schedule.',
+  work: 'Read and edit tasks, projects and research; view the schedule.',
+  schedule: 'Create and change scheduled agent runs (cron, calendar). They keep running after the phone disconnects.',
   files: 'Browse and read files on the host machine.',
   git: 'Read git status, diffs, branches and history.',
   git_write: 'Stage, commit, push, pull and switch branches.',

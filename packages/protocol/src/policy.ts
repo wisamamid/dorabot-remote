@@ -10,11 +10,22 @@
  * Method names below were taken from the `case` labels in dorabot v0.3.2
  * src/gateway/server.ts, not from the RpcMethod union, which is badly out of date.
  */
-import type { Scope } from './wire.js'
+import { SCOPES, type Scope } from './wire.js'
 
 /** Exact method name, or a `prefix.*` wildcard. */
 type Rule = string
 
+/**
+ * Trust note. These scopes are NOT independent privilege levels:
+ *  - `chat` + `approvals` together are effectively shell-equivalent: a phone can
+ *    prompt the agent to run commands and approve them. (tool.approve is stripped
+ *    of `modifiedInput` unless the device also has `terminal`, but the agent can
+ *    still be told what to run.)
+ *  - `admin` (mcp.*, config.set, skills.*) is shell-equivalent too: it can register
+ *    an MCP server, which is an arbitrary local command.
+ *  - `schedule` creates persistent agent runs that outlive the phone session.
+ * Grant them accordingly.
+ */
 const RULES: Record<Scope, Rule[]> = {
   sessions: [
     'ping',
@@ -95,25 +106,32 @@ const RULES: Record<Scope, Rule[]> = {
     'research.read',
     'research.update',
     'research.delete',
+    // Read-only schedule views. Creating or changing scheduled agent runs is `schedule`.
     'calendar.list',
+    'calendar.export',
+    'cron.list',
+    'pulse.status',
+  ],
+  // Persistent scheduled agent runs. Off by default: a scheduled run keeps executing
+  // after the phone is gone, so this is as sensitive as `chat`.
+  schedule: [
     'calendar.add',
     'calendar.remove',
     'calendar.toggle',
     'calendar.run',
     'calendar.update',
-    'calendar.export',
-    'cron.list',
     'cron.add',
     'cron.remove',
     'cron.toggle',
     'cron.run',
-    'pulse.status',
   ],
   // Read-only by design. fs.write, fs.delete, fs.rename, fs.copy, fs.mkdir and
   // fs.reveal are deliberately absent: a phone browses, it does not edit in place.
   // search.files / search.ripgrep live here, not in `chat`: they return file
   // contents from anywhere under a path, which is file reading by another name.
-  files: ['fs.list', 'fs.read', 'fs.readBinary', 'fs.stat', 'search.files', 'search.ripgrep'],
+  // All of it is further limited to the folders the user shared on the Mac
+  // (bridge path-guard allowlist), and remote.roots lists them.
+  files: ['fs.list', 'fs.read', 'fs.readBinary', 'fs.stat', 'search.files', 'search.ripgrep', 'remote.roots'],
   // Read-only git. Nothing here changes the working tree, the index or a ref.
   git: [
     'git.detect',
@@ -129,6 +147,7 @@ const RULES: Record<Scope, Rule[]> = {
     'git.prDiff',
     'git.prFileDiff',
     'git.branchCompare',
+    'remote.roots',
   ],
   // Everything that mutates the repo or talks to a remote. git.discardFile and
   // git.worktreeRemove exist on the gateway and are deliberately NOT exposed: they
@@ -199,10 +218,16 @@ export const BRIDGE_METHODS = new Set([
   'remote.pushPrefs',
   'remote.pins.list',
   'remote.pins.set',
+  'remote.roots',
 ])
 
 /** Bridge methods that also require a scope (they are not open to every device). */
-const BRIDGE_SCOPE_GATED = new Set(['remote.events', 'remote.registerPush', 'remote.unregisterPush', 'remote.setPushPrefs', 'remote.pushPrefs', 'remote.pins.list', 'remote.pins.set'])
+const BRIDGE_SCOPE_GATED = new Set(['remote.events', 'remote.registerPush', 'remote.unregisterPush', 'remote.setPushPrefs', 'remote.pushPrefs', 'remote.pins.list', 'remote.pins.set', 'remote.roots'])
+
+/** True when `scope` is one of the known scope names (guards remote.requestScope). */
+export function isValidScope(scope: unknown): scope is Scope {
+  return typeof scope === 'string' && (SCOPES as readonly string[]).includes(scope)
+}
 
 function matches(rule: Rule, method: string): boolean {
   if (rule.endsWith('.*')) return method.startsWith(rule.slice(0, -1))

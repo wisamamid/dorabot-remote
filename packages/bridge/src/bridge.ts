@@ -8,6 +8,7 @@ import {
   fingerprint,
   fromB64,
   isRelayUrlConfigured,
+  isValidScope,
   relayIdFromPublicKey,
   openSealedJson,
   sealJson,
@@ -30,6 +31,7 @@ import type {
 import QRCode from 'qrcode'
 import { WebSocketServer } from 'ws'
 import { candidateAddresses } from './addresses.js'
+import { createRootsStore, rootsFilePath, type RootsStore } from './roots.js'
 import {
   BRIDGE_VERSION,
   type BridgePaths,
@@ -73,6 +75,8 @@ export class Bridge implements ConnectionHost {
   readonly store: Store
   readonly settings: BridgeSettings
   private readonly paths: BridgePaths
+  /** Folders shared with phones (empty until the user adds some). Use for the control page / CLI. */
+  readonly roots: RootsStore
   private gateway!: GatewayClient
   private http: HttpServer | null = null
   private wss: WebSocketServer | null = null
@@ -92,6 +96,7 @@ export class Bridge implements ConnectionHost {
     this.paths = opts.paths
     this.settings = opts.settings
     this.store = new Store(opts.paths.db)
+    this.roots = createRootsStore(() => rootsFilePath(this.paths.root), { protectedPaths: () => this.protectedPaths() })
     if (opts.log) this.externalLog = opts.log
   }
 
@@ -440,6 +445,10 @@ export class Bridge implements ConnectionHost {
     return this.snapshots.get(sessionKey) ?? null
   }
 
+  allowedRoots(): string[] {
+    return this.roots.listRoots()
+  }
+
   protectedPaths(): string[] {
     const p = this.paths
     return [p.root, p.db, p.identity, p.signingKey, p.settings, p.dorabotRoot, p.gatewayToken, p.gatewaySocket]
@@ -509,7 +518,8 @@ export class Bridge implements ConnectionHost {
       }
 
       case 'remote.requestScope': {
-        const scope = String(params.scope ?? '') as Scope
+        if (!isValidScope(params.scope)) throw new Error('unknown permission')
+        const scope = params.scope
         const reason = String(params.reason ?? '').slice(0, 200)
         if (!conn.device) throw new Error('not authenticated')
         if (conn.device.scopes.includes(scope)) return { alreadyGranted: true }
