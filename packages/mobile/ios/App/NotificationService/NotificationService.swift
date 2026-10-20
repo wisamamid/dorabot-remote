@@ -15,9 +15,15 @@ class NotificationService: UNNotificationServiceExtension {
         let content = (request.content.mutableCopy() as? UNMutableNotificationContent) ?? UNMutableNotificationContent()
         best = content
         let info = request.content.userInfo
+        // Approve / Deny buttons are only offered when the content decrypts with a stored key and says
+        // it is an approval. The plaintext category comes from the relay and is not trusted, so strip it
+        // first and restore it only after a successful decrypt (this also covers the expiry path).
+        let offeredCategory = content.categoryIdentifier
+        if offeredCategory == "APPROVAL" { content.categoryIdentifier = "ACTIVITY" }
         if let enc = info["enc"] as? String {
             let keys = PushKeychain.candidates(kid: info["kid"] as? String)
             if let text = Self.decrypt(enc, keys: keys) {
+                if offeredCategory == "APPROVAL", (text["kind"] as? String) == "approval" { content.categoryIdentifier = "APPROVAL" }
                 if let title = text["title"] as? String, !title.isEmpty { content.title = title }
                 if let body = text["body"] as? String, !body.isEmpty { content.body = body }
                 // With more than one Mac paired, say which one this is from.

@@ -39,8 +39,8 @@ describe('AppLinkQueue', () => {
 
   it('is FIFO and holds requests until taken', () => {
     const q = new AppLinkQueue()
-    q.push(ask('one'), 0, false)
-    q.push(ask('two'), 0, false)
+    q.push(ask('one'), 0)
+    q.push(ask('two'), 0)
     expect(q.peek()?.link).toEqual(ask('one'))
     expect(q.shift()?.link).toEqual(ask('one'))
     expect(q.shift()?.link).toEqual(ask('two'))
@@ -48,21 +48,21 @@ describe('AppLinkQueue', () => {
   })
   it('ignores a replay of the same nonce (cold-launch URL delivered twice), even after it ran', () => {
     const q = new AppLinkQueue()
-    expect(q.push(ask('x', 'n1'), 0, false)).toBe(true)
-    expect(q.push(ask('x', 'n1'), 0, false)).toBe(false)
+    expect(q.push(ask('x', 'n1'), 0)).toBe(true)
+    expect(q.push(ask('x', 'n1'), 0)).toBe(false)
     q.shift()
-    expect(q.push(ask('x', 'n1'), 0, false)).toBe(false)
-    expect(q.push(ask('x', 'n2'), 0, false)).toBe(true)
+    expect(q.push(ask('x', 'n1'), 0)).toBe(false)
+    expect(q.push(ask('x', 'n2'), 0)).toBe(true)
   })
   it('requests without a nonce are never deduped', () => {
     const q = new AppLinkQueue()
-    expect(q.push(ask('x'), 0, false) && q.push(ask('x'), 0, false)).toBe(true)
+    expect(q.push(ask('x'), 0) && q.push(ask('x'), 0)).toBe(true)
   })
   it('keeps only the newest few so a stuck app cannot pile up prompts', () => {
     const q = new AppLinkQueue(2)
-    q.push(ask('a'), 0, false)
-    q.push(ask('b'), 0, false)
-    q.push(ask('c'), 0, false)
+    q.push(ask('a'), 0)
+    q.push(ask('b'), 0)
+    q.push(ask('c'), 0)
     expect(q.size).toBe(2)
     expect(q.peek()?.link).toEqual(ask('b'))
   })
@@ -95,7 +95,6 @@ describe('nextAskStep', () => {
   const base: AskStepInput = {
     prompt: 'do it',
     at: 1000,
-    arrivedLocked: false,
     now: 2000,
     ready: true,
     hosts,
@@ -103,41 +102,46 @@ describe('nextAskStep', () => {
     connState: 'ready',
     hasChatScope: true,
     appLocked: false,
-    lockEnabled: false,
-    verified: false,
+    confirmed: false,
   }
   const step = (o: Partial<AskStepInput>) => nextAskStep({ ...base, ...o })
 
-  it('sends on the active Mac when everything is ready', () => {
-    expect(step({})).toEqual({ do: 'send', hostId: 'a' })
+  it('never sends without confirmation: it asks, with the full prompt target Mac', () => {
+    expect(step({})).toEqual({ do: 'confirm', hostId: 'a', hostName: 'Studio' })
+    expect(step({ host: 'laptop' })).toEqual({ do: 'confirm', hostId: 'b', hostName: 'Laptop' })
+    // Not even when connected, scoped and the lock was just cleared.
+    expect(step({ connState: 'ready', hasChatScope: true, appLocked: false }).do).toBe('confirm')
+  })
+  it('sends on the active Mac only once confirmed', () => {
+    expect(step({ confirmed: true })).toEqual({ do: 'send', hostId: 'a' })
   })
   it('queues until pairings are restored, the lock is cleared, and the link is up', () => {
     expect(step({ ready: false })).toEqual({ do: 'wait' })
-    expect(step({ appLocked: true, lockEnabled: true })).toEqual({ do: 'wait' })
-    expect(step({ connState: 'connecting' })).toEqual({ do: 'wait' })
-    expect(step({ connState: 'handshaking' })).toEqual({ do: 'wait' })
+    expect(step({ appLocked: true })).toEqual({ do: 'wait' })
+    expect(step({ connState: 'connecting', confirmed: true })).toEqual({ do: 'wait' })
+    expect(step({ connState: 'handshaking', confirmed: true })).toEqual({ do: 'wait' })
   })
-  it('requires Face ID first when the lock is on, unless it was just done at the lock screen', () => {
-    expect(step({ lockEnabled: true })).toEqual({ do: 'verify' })
-    expect(step({ lockEnabled: true, verified: true })).toEqual({ do: 'send', hostId: 'a' })
-    expect(step({ lockEnabled: true, arrivedLocked: true })).toEqual({ do: 'send', hostId: 'a' })
-    expect(step({ lockEnabled: false })).toEqual({ do: 'send', hostId: 'a' })
+  it('unlocking is not consent: a locked app waits, and an unlocked one still confirms', () => {
+    expect(step({ appLocked: true, confirmed: true }).do).toBe('wait')
+    expect(step({ appLocked: false }).do).toBe('confirm')
   })
-  it('never verifies or sends before Face ID on a locked app', () => {
-    expect(step({ lockEnabled: true, appLocked: true, connState: 'ready' }).do).toBe('wait')
+  it('does not switch Macs before the user confirmed', () => {
+    expect(step({ host: 'laptop' }).do).toBe('confirm')
   })
   it('switches to a named Mac first, then sends once it is connected', () => {
-    expect(step({ host: 'laptop' })).toEqual({ do: 'switch', hostId: 'b' })
-    expect(step({ host: 'laptop', activeHostId: 'b', connState: 'connecting' })).toEqual({ do: 'wait' })
-    expect(step({ host: 'laptop', activeHostId: 'b' })).toEqual({ do: 'send', hostId: 'b' })
+    expect(step({ host: 'laptop', confirmed: true })).toEqual({ do: 'switch', hostId: 'b' })
+    expect(step({ host: 'laptop', activeHostId: 'b', connState: 'connecting', confirmed: true })).toEqual({ do: 'wait' })
+    expect(step({ host: 'laptop', activeHostId: 'b', confirmed: true })).toEqual({ do: 'send', hostId: 'b' })
   })
   it('drops with a message for an unknown Mac, no pairings, a missing scope, or a stale request', () => {
     expect(step({ host: 'nope' })).toMatchObject({ do: 'drop', message: expect.stringContaining('nope') })
     expect(step({ hosts: [] })).toMatchObject({ do: 'drop' })
-    expect(step({ hasChatScope: false })).toMatchObject({ do: 'drop' })
+    expect(step({ hasChatScope: false, confirmed: true })).toMatchObject({ do: 'drop' })
     expect(step({ now: base.at + ASK_TTL_MS + 1 })).toMatchObject({ do: 'drop' })
+    // Once the user tapped Send, the TTL no longer applies.
+    expect(step({ now: base.at + ASK_TTL_MS + 1, confirmed: true }).do).toBe('send')
   })
   it('falls back to the first Mac when none is active yet', () => {
-    expect(step({ activeHostId: null })).toEqual({ do: 'switch', hostId: 'a' })
+    expect(step({ activeHostId: null, confirmed: true })).toEqual({ do: 'switch', hostId: 'a' })
   })
 })

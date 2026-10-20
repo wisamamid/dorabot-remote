@@ -44,8 +44,6 @@ export function parseAppLink(url: string): AppLink | null {
 export interface QueuedLink {
   link: AppLink
   at: number
-  /** The app lock was already showing when the link arrived, so Face ID has been done by the time it can run. */
-  arrivedLocked: boolean
 }
 
 /** FIFO of pending links. Replays of the same nonce (cold-launch URL seen twice) are ignored. */
@@ -55,13 +53,13 @@ export class AppLinkQueue {
 
   constructor(private readonly max = 3) {}
 
-  push(link: AppLink, now: number, arrivedLocked: boolean): boolean {
+  push(link: AppLink, now: number): boolean {
     if (link.nonce) {
       if (this.seen.includes(link.nonce)) return false
       this.seen.push(link.nonce)
       if (this.seen.length > 50) this.seen.shift()
     }
-    this.items.push({ link, at: now, arrivedLocked })
+    this.items.push({ link, at: now })
     if (this.items.length > this.max) this.items.shift()
     return true
   }
@@ -97,7 +95,6 @@ export interface AskStepInput {
   prompt: string
   host?: string
   at: number
-  arrivedLocked: boolean
   now: number
   /** The connection layer has finished restoring pairings. */
   ready: boolean
@@ -106,26 +103,24 @@ export interface AskStepInput {
   connState: string
   hasChatScope: boolean
   appLocked: boolean
-  lockEnabled: boolean
-  /** Face ID already confirmed for this request. */
-  verified: boolean
+  /** The user tapped Send on the confirmation sheet for this request. Unlocking the app is NOT consent. */
+  confirmed: boolean
 }
 
 export type AskStep =
   | { do: 'wait' }
   | { do: 'drop'; message: string }
-  | { do: 'verify' }
+  | { do: 'confirm'; hostId: string; hostName: string }
   | { do: 'switch'; hostId: string }
   | { do: 'send'; hostId: string }
 
 /** What to do next for the queued ask at the head of the queue. Re-evaluated on every relevant state change. */
 export function nextAskStep(i: AskStepInput): AskStep {
   if (!i.ready) return { do: 'wait' }
-  if (i.now - i.at > ASK_TTL_MS) return { do: 'drop', message: 'That request expired before dorabot was ready.' }
+  if (!i.confirmed && i.now - i.at > ASK_TTL_MS) return { do: 'drop', message: 'That request expired before dorabot was ready.' }
   if (i.hosts.length === 0) return { do: 'drop', message: 'Pair a Mac first, then try again.' }
   // The lock screen asks for Face ID by itself; nothing runs behind it.
   if (i.appLocked) return { do: 'wait' }
-  if (i.lockEnabled && !i.arrivedLocked && !i.verified) return { do: 'verify' }
   let target: HostRef | null
   if (i.host) {
     target = resolveHost(i.hosts, i.host)
@@ -134,6 +129,8 @@ export function nextAskStep(i: AskStepInput): AskStep {
     target = i.hosts.find((h) => h.hostId === i.activeHostId) ?? i.hosts[0] ?? null
   }
   if (!target) return { do: 'drop', message: 'Pair a Mac first, then try again.' }
+  // Nothing is sent, and no Mac is switched to, until the user has seen the full prompt and tapped Send.
+  if (!i.confirmed) return { do: 'confirm', hostId: target.hostId, hostName: displayName(target) }
   if (target.hostId !== i.activeHostId) return { do: 'switch', hostId: target.hostId }
   if (i.connState !== 'ready') return { do: 'wait' }
   if (!i.hasChatScope) return { do: 'drop', message: 'This phone is not allowed to start chats on that Mac.' }

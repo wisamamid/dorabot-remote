@@ -26,8 +26,14 @@ export type Transport = 'lan' | 'relay'
 
 export type ConnectionState = 'idle' | 'connecting' | 'handshaking' | 'ready' | 'disconnected' | 'revoked'
 
-/** Host error codes that retrying can never fix: the device must pair again. */
-const TERMINAL_ERROR_CODES = new Set(['revoked', 'unknown_device'])
+/**
+ * Plaintext refusals before the encrypted channel exists are unauthenticated: anyone on
+ * the path can forge them. They are therefore only ever a soft failure (long backoff),
+ * and the text shown is fixed here, never taken from the frame.
+ */
+const SOFT_REFUSAL_CODES = new Set(['revoked', 'unknown_device'])
+const SOFT_REFUSAL_BACKOFF_MS = 5 * 60_000
+export const NOT_RECOGNISED_TEXT = "This Mac doesn't recognise this phone any more. Pair again from Settings."
 
 /** Minimal structural type so both the DOM and `ws` WebSocket satisfy it. */
 export interface SocketLike {
@@ -319,6 +325,8 @@ export class RemoteClient {
   private rxCount = 0
   private probeTimer: ReturnType<typeof setTimeout> | null = null
   private stopped = false
+  /** A plaintext 'revoked' / 'unknown_device' was seen; back off long and show fixed text. */
+  private notRecognised = false
   /** One-shot: the next race starts the relay at once (network just changed, LAN is unlikely). */
   private skipLanHeadStart = false
   /** Phone is on cellular: LAN candidates are unlikely, so the relay never waits for them. */
@@ -529,6 +537,7 @@ export class RemoteClient {
       }
       this.raceSockets.clear()
       this.rxCount = 0
+      this.notRecognised = false
       this.socket = socket
       this.channel = channel
       this.host = host
@@ -634,24 +643,19 @@ export class RemoteClient {
         message: (data, isBinary) => {
           try {
             if (!isBinary) {
+              // After the handshake nothing legitimate is plaintext. Anything else could be a
+              // forged control frame or a replayed header (which would reset the receive counter).
+              if (channel?.established) throw new Error('plaintext frame after handshake')
               const frame = JSON.parse(toText(data)) as Record<string, unknown>
               stopWatch()
               if (frame.t === 'err') {
                 clearTimeout(timer)
-                this.log(`attempt ${transport} ${target} host refused: ${String(frame.code ?? '')} ${String(frame.message)}`)
-                if (!stale() && typeof frame.code === 'string' && TERMINAL_ERROR_CODES.has(frame.code)) {
-                  // Retrying can never fix this; stop and say so.
-                  this.stopped = true
-                  if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
-                  this.reconnectTimer = null
-                  this.teardown()
-                  this.setState('revoked', String(frame.message ?? frame.code))
-                  return
-                }
+                this.log(`attempt ${transport} ${target} host refused: ${String(frame.code ?? '')}`)
+                if (!stale() && typeof frame.code === 'string' && SOFT_REFUSAL_CODES.has(frame.code)) this.notRecognised = true
                 this.closeQuietly(socket)
                 return
               }
-              if (frame.t === 'hello_ack') {
+              if (frame.t === 'hello_ack' && !channel) {
                 const keys = deriveSessionKeys(null, 'device', {
                   myEphemeral: ephemeral,
                   theirEphemeralPk: fromB64(null, String(frame.ephPk)),
@@ -871,7 +875,11 @@ export class RemoteClient {
 
   private scheduleReconnect(reason: string): void {
     if (this.stopped || this.reconnectTimer) return
-    const delay = Math.min(1000 * 2 ** Math.min(this.attempt, 4), 20_000) + Math.floor(Math.random() * 400)
+    let delay = Math.min(1000 * 2 ** Math.min(this.attempt, 4), 20_000) + Math.floor(Math.random() * 400)
+    if (this.notRecognised) {
+      delay = SOFT_REFUSAL_BACKOFF_MS
+      this.setState('disconnected', NOT_RECOGNISED_TEXT)
+    }
     this.attempt += 1
     this.log(`reconnecting in ${delay}ms (${reason})`)
     this.reconnectTimer = setTimeout(() => {
