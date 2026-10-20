@@ -56,6 +56,8 @@ export class FakeRelay {
   tokenSet = new Set<string>()
   tickets = new Set<string>()
   enforce = false
+  /** Model a relay that does NOT consume {t:'auth'} frames (e.g. an older Room still running): they are forwarded to the host. */
+  forwardAuth = false
   tokensFrames: Array<{ set: string[]; tickets: string[]; enforce: boolean }> = []
   /** Devices refused for a missing or wrong token. */
   unauthorized = 0
@@ -182,7 +184,7 @@ export class FakeRelay {
               return void ws.close(RELAY_CLOSE.unauthorized, 'unauthorized')
             }
             if (!admitted) admit()
-            return
+            if (!this.forwardAuth) return
           }
         } catch {
           // Ordinary frame.

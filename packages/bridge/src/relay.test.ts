@@ -264,6 +264,61 @@ describe('relay liveness', () => {
     expect(relay.unauthorized).toBe(0)
   })
 
+  it('self-test survives a relay that forwards the auth frame to the host (stray auth is dropped, no reconnect)', async () => {
+    const { client, logs } = await make({
+      selfTestTimeoutMs: 2000,
+      selfTestIntervalMs: 60_000,
+      // Same as Bridge.routeRelaySocket: a stray auth frame is not the first real frame.
+      onDeviceSocket: (sock) => {
+        let stray = false
+        sock.on('message', (raw: Buffer) => {
+          const f = JSON.parse(raw.toString()) as { t?: string; n?: string }
+          if (f.t === 'auth' && !stray) {
+            stray = true
+            return
+          }
+          if (f.t === 'selftest') client.confirmSelfTest(f.n)
+          sock.close(1000, 'selftest')
+        })
+      },
+    })
+    relay.forwardAuth = true
+    client.start()
+    await until(() => client.selfTestsPassed === 1, 5000, 'self-test')
+    expect(relay.hostAttempts).toBe(1)
+    expect(logs.some((l) => l.includes('self-test failed'))).toBe(false)
+  })
+
+  it('a probe the bridge itself closes (4400) is inconclusive: logged, link kept, not reconnected', async () => {
+    // Host routing that rejects everything, like routeRelaySocket on a frame it does not know.
+    const { client, logs } = await make({
+      selfTestTimeoutMs: 2000,
+      selfTestIntervalMs: 60_000,
+      onDeviceSocket: (sock) => sock.once('message', () => sock.close(4400, 'unexpected first frame')),
+    })
+    client.start()
+    await until(() => logs.some((l) => l.includes('self-test inconclusive')), 5000, 'inconclusive self-test')
+    await sleep(500)
+    expect(logs.some((l) => l.includes('self-test failed'))).toBe(false)
+    expect(relay.hostAttempts).toBe(1)
+    expect(client.state).toBe('online')
+  })
+
+  it('a probe refused with 4404 (no live host) is a genuine failure and reconnects the link', async () => {
+    const { client, logs } = await make({ selfTestTimeoutMs: 2000, selfTestIntervalMs: 60_000 })
+    client.start()
+    await until(() => client.state === 'online')
+    const attempts = relay.hostAttempts
+    ;(client as unknown as { opts: { createSocket: (u: string) => unknown } }).opts.createSocket = (u: string) => {
+      const ws = new WebSocket(u)
+      ws.on('open', () => ws.close(4404, 'host_offline'))
+      return ws as never
+    }
+    ;(client as unknown as { runSelfTest(ws: unknown): void }).runSelfTest((client as unknown as { ws: unknown }).ws)
+    await until(() => logs.some((l) => l.includes('relay self-test failed') && l.includes('4404')), 5000, '4404 failure')
+    await until(() => relay.hostAttempts > attempts, 10_000, 'reconnect')
+  })
+
   it('BLACK HOLE: the room answers heartbeats and pings but delivers nothing; self-test detects it and reconnects', async () => {
     const { client, logs } = await make({ selfTestTimeoutMs: 400, selfTestIntervalMs: 60_000, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 80 })
     relay.blackHole = true

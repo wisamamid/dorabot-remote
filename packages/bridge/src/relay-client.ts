@@ -466,8 +466,18 @@ export class RelayClient extends EventEmitter {
     })
     probe.on('error', () => {})
     probe.on('close', (code: number, reason: Buffer) => {
-      // Closed before the host saw it: the room rejected us (e.g. 4404 host_offline).
-      if (this.pendingSelfTest?.n === n) fail(`probe closed by the relay (${code}${reason.length ? ` ${reason.toString()}` : ''})`)
+      if (this.pendingSelfTest?.n !== n) return
+      const why = `probe closed by the relay (${code}${reason.length ? ` ${reason.toString()}` : ''})`
+      if (code === RELAY_CLOSE.hostOffline) {
+        // The room has no live host link for us: a genuine delivery failure.
+        fail(why)
+        return
+      }
+      // Any other close says nothing about whether the room delivers opens. 4400 is our own routing (the open
+      // DID reach us); 4401/4429 are the room's access or rate rules. Reconnecting the host link would not
+      // help and would only drop every phone, so note it and let the next interval try again.
+      this.abortSelfTest()
+      this.opts.log(`relay self-test inconclusive: ${why}; link kept, will retry`)
     })
   }
 
