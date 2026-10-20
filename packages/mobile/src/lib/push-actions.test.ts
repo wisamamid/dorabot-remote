@@ -8,6 +8,11 @@ describe('routePushAction', () => {
     expect(routePushAction({ rid: 'r1', kind: 'approval', actionId: 'APPROVE', sessionKey: 's' })).toEqual({ type: 'decide', decision: 'approve', rid: 'r1', sessionKey: 's' })
     expect(routePushAction({ rid: 'r1', kind: 'approval', actionId: 'DENY' })).toEqual({ type: 'decide', decision: 'deny', rid: 'r1' })
   })
+  it('carries the Mac (hostId from enc, or the kid) through to the route', () => {
+    expect(routePushAction({ rid: 'r1', kind: 'approval', actionId: 'APPROVE', hostId: 'h2', kid: 'abcd1234' })).toEqual({ type: 'decide', decision: 'approve', rid: 'r1', hostId: 'h2', kid: 'abcd1234' })
+    expect(routePushAction({ rid: 'r1', sessionKey: 's', hostId: 'h2' })).toEqual({ type: 'open', rid: 'r1', sessionKey: 's', hostId: 'h2' })
+    expect(routePushAction({ kid: 'abcd1234' })).toEqual({ type: 'open', kid: 'abcd1234' })
+  })
   it('taps, Answer, and buttons on other kinds only open', () => {
     expect(routePushAction({ rid: 'r1', kind: 'approval', actionId: 'tap', sessionKey: 's' })).toEqual({ type: 'open', rid: 'r1', sessionKey: 's' })
     expect(routePushAction({ rid: 'q1', kind: 'question', actionId: 'ANSWER' })).toEqual({ type: 'open', rid: 'q1' })

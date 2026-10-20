@@ -27,7 +27,7 @@ export const platformName = Capacitor.getPlatform()
 // store automatically, so the public API is the same get/set/remove as before.
 // ---------------------------------------------------------------------------
 
-const SECRET_KEY = /\.(pairing|secret)\./
+export const SECRET_KEY = /\.(pairings?|secret)\./
 
 // Capacitor plugin objects are Proxies that answer *any* property, including
 // `then`. Returning one from an async function (or resolving a promise with it)
@@ -345,24 +345,42 @@ export function onAppBackground(handler: () => void): () => void {
  * in-app scanner is a fallback rather than the only way in.
  */
 export function onPairingUrl(handler: (url: string) => void): () => void {
+  return onAppUrl((url) => {
+    // Only `dorabot-remote://pair...`; ask / inbox links go to onAppUrl's other consumer (lib/applink.ts).
+    if (/^dorabot-remote:\/\/pair/i.test(url)) handler(url)
+  }, 'pair')
+}
+
+/**
+ * Every `dorabot-remote://` URL opened from outside the app, including a cold launch
+ * from one. `webQueryParam` is the dev-only `?<name>=<url>` fallback in a browser.
+ */
+export function onAppUrl(handler: (url: string) => void, webQueryParam = 'pair'): () => void {
   if (!isNative) {
-    // During web development the same link can be passed as ?pair=<url>.
-    const fromQuery = new URLSearchParams(location.search).get('pair')
+    const fromQuery = new URLSearchParams(location.search).get(webQueryParam)
     if (fromQuery) queueMicrotask(() => handler(fromQuery))
     return () => {}
   }
   let cleanup: (() => void) | null = null
+  let removed = false
   void (async () => {
     const { App } = await import('@capacitor/app')
     const sub = await App.addListener('appUrlOpen', ({ url }) => {
       if (url?.startsWith('dorabot-remote://')) handler(url)
     })
+    if (removed) {
+      void sub.remove()
+      return
+    }
     // A cold launch from a link has already fired the event by the time we listen.
     const launch = await App.getLaunchUrl()
     if (launch?.url?.startsWith('dorabot-remote://')) handler(launch.url)
     cleanup = () => void sub.remove()
   })()
-  return () => cleanup?.()
+  return () => {
+    removed = true
+    cleanup?.()
+  }
 }
 
 export async function setStatusBarDark(): Promise<void> {

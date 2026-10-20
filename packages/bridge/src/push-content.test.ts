@@ -1,7 +1,8 @@
 import { chacha20poly1305 } from '@noble/ciphers/chacha.js'
 import { generateSigningKey, relayIdFromPublicKey } from '@dorabot-remote/protocol'
+import { createHash } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
-import { buildPushContent, decryptPushContent, displayToolName, encryptPushContent, parsePushKey, summarizeToolInput } from './push-content.js'
+import { buildPushContent, decryptPushContent, displayToolName, encryptPushContent, parsePushKey, pushKeyId, summarizeToolInput } from './push-content.js'
 import { PushNotifier } from './push.js'
 import { Store } from './store.js'
 
@@ -102,6 +103,36 @@ describe('PushNotifier with a push key', () => {
     s.store.setPushToken(s.d.id, TOKEN, 'ios', 'production', null)
     await Promise.all(s.n.onGatewayEvent('agent.ask_user', { requestId: 'q2', questions: [{ question: 'x' }] }))
     expect(s.calls[1]!.enc).toBeUndefined()
+  })
+
+  it('includes hostId/hostName in the encrypted content and a kid beside enc', async () => {
+    const store = new Store(':memory:')
+    const calls: Array<Record<string, unknown>> = []
+    const n = new PushNotifier({
+      store,
+      relay: { url: 'wss://relay.test/', id: relayId },
+      signingKey: key,
+      host: { id: 'host-abc', name: 'Studio Mac' },
+      isConnected: () => false,
+      log: () => {},
+      fetch: (async (_u: string, init: RequestInit) => {
+        calls.push(JSON.parse(new TextDecoder().decode(init.body as Uint8Array)))
+        return new Response('{}', { status: 200 })
+      }) as unknown as typeof fetch,
+    })
+    const d = store.createDevice({ name: 'Phone', platform: 'ios', publicKey: 'pk', scopes: ['approvals'] as never })
+    store.setPushToken(d.id, TOKEN, 'ios', 'production', KEY_B64)
+    await Promise.all(n.onGatewayEvent('agent.ask_user', { requestId: 'q1', questions: [{ question: 'Go?' }] }))
+    expect(decryptPushContent(calls[0]!.enc as string, KEY)).toMatchObject({ hostId: 'host-abc', hostName: 'Studio Mac' })
+    expect(calls[0]!.kid).toBe(pushKeyId('host-abc'))
+    expect(String(calls[0]!.kid)).toMatch(/^[0-9a-f]{8}$/)
+  })
+
+  it('pushKeyId is the first 8 hex of sha256(hostId)', () => {
+    // sha256("host-abc") fixed vector, shared with the mobile and Swift implementations.
+    expect(pushKeyId('host-abc')).toBe(createHash('sha256').update('host-abc').digest('hex').slice(0, 8))
+    expect(pushKeyId('host-abc')).toBe('dcf4a872')
+    expect(pushKeyId('a')).toBe('ca978112')
   })
 
   it('result pushes carry no enc even for keyed devices', async () => {

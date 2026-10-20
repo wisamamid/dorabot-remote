@@ -9,17 +9,21 @@ export interface PushNav {
   actionId?: string
   /** Learned by decrypting `enc`. */
   sessionKey?: string
+  /** Which Mac sent it: from `enc` (hostId) or, if that could not be decrypted, the unencrypted key id. */
+  hostId?: string
+  kid?: string
 }
 
 export type PushRoute =
-  | { type: 'decide'; decision: 'approve' | 'deny'; rid: string; sessionKey?: string }
-  | { type: 'open'; rid?: string; sessionKey?: string }
+  | { type: 'decide'; decision: 'approve' | 'deny'; rid: string; sessionKey?: string; hostId?: string; kid?: string }
+  | { type: 'open'; rid?: string; sessionKey?: string; hostId?: string; kid?: string }
 
 export function routePushAction(nav: PushNav): PushRoute {
-  const open: PushRoute = { type: 'open', ...(nav.rid ? { rid: nav.rid } : {}), ...(nav.sessionKey ? { sessionKey: nav.sessionKey } : {}) }
+  const where = { ...(nav.hostId ? { hostId: nav.hostId } : {}), ...(nav.kid ? { kid: nav.kid } : {}) }
+  const open: PushRoute = { type: 'open', ...(nav.rid ? { rid: nav.rid } : {}), ...(nav.sessionKey ? { sessionKey: nav.sessionKey } : {}), ...where }
   // Only an approval notification can be approved or denied from a button; anything else just opens.
   if (nav.rid && nav.kind === 'approval' && (nav.actionId === 'APPROVE' || nav.actionId === 'DENY')) {
-    return { type: 'decide', decision: nav.actionId === 'APPROVE' ? 'approve' : 'deny', rid: nav.rid, ...(nav.sessionKey ? { sessionKey: nav.sessionKey } : {}) }
+    return { type: 'decide', decision: nav.actionId === 'APPROVE' ? 'approve' : 'deny', rid: nav.rid, ...(nav.sessionKey ? { sessionKey: nav.sessionKey } : {}), ...where }
   }
   return open
 }

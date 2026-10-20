@@ -1,5 +1,8 @@
 /**
- * The app's single connection to the paired Mac, plus the session state it feeds.
+ * The app's connection to the active paired Mac, plus the session state it feeds.
+ * Several Macs can be paired; exactly one is active (one RemoteClient) and
+ * switching tears the client down and connects to the other. Everything cached in
+ * memory is namespaced per Mac (see HostCaches in hosts.ts).
  *
  * Everything stateful lives here so screens can stay dumb: they read from the
  * context and call `rpc`. Reconnects, resume cursors and subscription replay are
@@ -21,7 +24,6 @@ import {
   type ImageAttachment,
   type KeyPair,
   type PairResult,
-  type RelayInfo,
   type Scope,
   type SessionMessage,
   type SessionState,
@@ -44,23 +46,27 @@ import { switchModel } from './models.js'
 import { connLog, flushConnLog, loadConnLog, setConnMeta } from './connlog.js'
 import { createDemoClient, type ClientLike } from './demo.js'
 import { haptic, onAppBackground, onAppResume, onNetworkChange, storage } from './platform.js'
-import { clearPushKey } from './push-key.js'
+import { adoptLegacyPushKey, clearAllPushKeys, clearPushKey } from './push-key.js'
+import {
+  HostCaches,
+  PAIRINGS_KEY,
+  activePairing,
+  cursorKey,
+  emptyPairings,
+  loadPairings,
+  removeLegacyIfMatches,
+  removePairing,
+  renamePairing,
+  setActiveHost,
+  updatePairing,
+  upsertPairing,
+  type HostPairing,
+  type PairingsFile,
+  type StoredPairing,
+} from './hosts.js'
+import { forgetSent } from './push-hosts.js'
 
-const PAIRING_KEY = 'dorabot-remote.pairing.v1'
-const CURSOR_KEY = 'dorabot-remote.cursor.v1'
-
-export interface StoredPairing {
-  deviceId: string
-  hostId: string
-  hostName: string
-  hostPublicKey: string
-  addresses: string[]
-  /** Blind relay, persisted so a cold start off the LAN can still reach the Mac. */
-  relay?: RelayInfo
-  identity: { publicKey: string; privateKey: string }
-  scopes: Scope[]
-  pairedAt: number
-}
+export type { HostPairing, StoredPairing }
 
 export interface Attention {
   kind: 'approval' | 'question' | 'elicitation'
@@ -70,7 +76,19 @@ export interface Attention {
 
 interface ConnectionValue {
   ready: boolean
-  pairing: StoredPairing | null
+  /** The active Mac's pairing (null when none, or in demo mode). */
+  pairing: HostPairing | null
+  /** Every paired Mac, oldest first. */
+  pairings: HostPairing[]
+  activeHostId: string | null
+  /** The pair screen is open to add another Mac without forgetting the current ones. */
+  adding: boolean
+  startAddMac: () => void
+  cancelAddMac: () => void
+  /** Make another paired Mac the active one: tears down this client and connects to it. */
+  switchTo: (hostId: string) => void
+  /** Local nickname for a Mac; empty clears it. */
+  renameMac: (hostId: string, alias: string) => void
   state: ConnectionState
   stateDetail?: string
   host: HostSummary | null
@@ -88,8 +106,11 @@ interface ConnectionValue {
   attention: Attention[]
 
   savePairing: (result: PairResult) => Promise<void>
+  /** Unpair the active Mac only: unregisters push with it and deletes its keys and caches. */
   forget: () => Promise<void>
   rpc: <T = unknown>(method: string, params?: unknown) => Promise<T>
+  /** Like rpc, but rejects at once unless that Mac is the active one (no race with a switch). */
+  rpcOn: <T = unknown>(hostId: string, method: string, params?: unknown) => Promise<T>
   can: (method: string) => boolean
   hasScope: (scope: Scope) => boolean
   refreshSessions: () => Promise<void>
@@ -127,7 +148,9 @@ const createSocket = (url: string) => new WebSocket(url) as never
 
 export function ConnectionProvider({ children }: { children: ReactNode }): ReactNode {
   const [ready, setReady] = useState(false)
-  const [pairing, setPairing] = useState<StoredPairing | null>(null)
+  const [file, setFile] = useState<PairingsFile>(emptyPairings)
+  const [adding, setAdding] = useState(false)
+  const pairing = useMemo(() => activePairing(file), [file])
   const [state, setState] = useState<ConnectionState>('idle')
   const [stateDetail, setStateDetail] = useState<string | undefined>()
   const [host, setHost] = useState<HostSummary | null>(null)
@@ -145,13 +168,29 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   demoRef.current = demo
 
   const clientRef = useRef<ClientLike | null>(null)
-  const pairingRef = useRef<StoredPairing | null>(null)
+  const pairingRef = useRef<HostPairing | null>(null)
   pairingRef.current = pairing
+  const fileRef = useRef<PairingsFile>(emptyPairings)
+  const writeChain = useRef<Promise<void>>(Promise.resolve())
+  /** The pairings could not be read: nothing may be written until a later read succeeds. */
+  const degradedRef = useRef(false)
+  const caches = useRef(new HostCaches())
   const netTypeRef = useRef<string>('unknown')
   const aggRef = useRef(new SessionAggregator())
   const loadedHistory = useRef(new Set<string>())
   const historyInfo = useRef(new Map<string, { shown: number; total: number }>())
   const bump = useCallback(() => setRevision((r) => r + 1), [])
+
+  /** Change the pairings in memory at once; persisting (serialised) is optional. */
+  const commit = useCallback((next: PairingsFile, persist = true): void => {
+    fileRef.current = next
+    setFile(next)
+    if (!persist || degradedRef.current) return
+    const json = JSON.stringify(next)
+    writeChain.current = writeChain.current
+      .then(() => storage.set(PAIRINGS_KEY, json))
+      .catch((e) => connLog('app', `could not persist pairings: ${(e as Error).message}`))
+  }, [])
 
   // ---- restore ------------------------------------------------------------
 
@@ -159,16 +198,17 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     void loadConnLog()
     void (async () => {
       try {
-        const raw = await storage.get(PAIRING_KEY)
-        if (raw) {
-          try {
-            const p = JSON.parse(raw) as StoredPairing
-            setPairing(p)
-            connLog('app', `pairing restored: ${p.addresses.length} lan candidate(s), relay ${p.relay ? `${p.relay.u} id=${p.relay.i.slice(0, 6)}` : 'NOT stored'}`)
-          } catch {
-            await storage.remove(PAIRING_KEY).catch(() => {})
-          }
+        const { file: loaded, migrated, degraded, backedUpTo } = await loadPairings(storage, { log: (m) => connLog('app', m) })
+        degradedRef.current = degraded
+        if (backedUpTo) connLog('app', `corrupt pairings backed up to ${backedUpTo}`)
+        fileRef.current = loaded
+        setFile(loaded)
+        const p = activePairing(loaded)
+        if (migrated && p) {
+          connLog('app', 'migrated the single pairing to the multi-Mac list')
+          void adoptLegacyPushKey(p.hostId)
         }
+        if (p) connLog('app', `pairing restored (${loaded.pairings.length} Mac(s)): ${p.addresses.length} lan candidate(s), relay ${p.relay ? `${p.relay.u} id=${p.relay.i.slice(0, 6)}` : 'NOT stored'}`)
       } catch (err) {
         // Storage failed or hung: fall through to the Pair screen rather than
         // leaving the app on the spinner forever.
@@ -179,6 +219,29 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     })()
   }, [])
 
+  // Storage was unreadable at launch: keep trying. Once a read succeeds, that is the truth.
+  const [degraded, setDegraded] = useState(false)
+  useEffect(() => {
+    if (!ready) return
+    setDegraded(degradedRef.current)
+  }, [ready])
+  useEffect(() => {
+    if (!degraded) return
+    const t = setInterval(() => {
+      void loadPairings(storage, { log: (m) => connLog('app', m) }).then((r) => {
+        if (r.degraded) return
+        degradedRef.current = false
+        setDegraded(false)
+        const active = fileRef.current.activeHostId
+        const next = r.file.pairings.some((p) => p.hostId === active) ? setActiveHost(r.file, active!) : r.file
+        fileRef.current = next
+        setFile(next)
+        connLog('app', 'pairings storage readable again')
+      })
+    }, 5000)
+    return () => clearInterval(t)
+  }, [degraded])
+
   // ---- connect ------------------------------------------------------------
 
   useEffect(() => {
@@ -186,14 +249,32 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
 
     let cancelled = false
     let client: RemoteClient | null = null
+    const hostId = pairing.hostId
+
+    // This Mac's own in-memory state; nothing of the previous Mac is shown.
+    const cache = caches.current.get(hostId)
+    aggRef.current = cache.agg
+    loadedHistory.current = cache.loadedHistory
+    historyInfo.current = cache.historyInfo
+    lastOpened.current = null
+    setSessions(cache.sessions)
+    setPins(cache.pins)
+    setAttention([])
+    setHost(null)
+    setDevice(null)
+    setGatewayConnected(false)
+    setTransport(null)
+    setState('connecting')
+    setStateDetail(undefined)
+    bump()
 
     void (async () => {
-      const cursorRaw = await storage.get(CURSOR_KEY).catch(() => null)
-      const cursor = cursorRaw ? Number(cursorRaw) : 0
+      const cursorRaw = await storage.get(cursorKey(hostId)).catch(() => null)
+      const cursor = Math.max(cursorRaw ? Number(cursorRaw) || 0 : 0, cache.agg.cursor)
       if (cancelled) return
 
       const identity: KeyPair = identityFromB64(null, pairing.identity)
-      aggRef.current.cursor = cursor
+      cache.agg.cursor = cursor
 
       client = new RemoteClient({
         identity,
@@ -206,26 +287,25 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
         clientVersion: '0.1.0',
         log: (m) => connLog('client', m),
         onState: (s, detail) => {
+          if (cancelled) return
           connLog('state', detail ? `${s} (${detail})` : s)
           setState(s)
           setStateDetail(detail)
         },
         onTransport: (t) => {
+          if (cancelled) return
           connLog('transport', t ?? 'none')
           setConnMeta({ transport: t })
           setTransport(t)
         },
         onRelay: (relay) => {
           // The effect is keyed on identity fields only, so this does not rebuild the client.
-          const cur = pairingRef.current
-          if (!cur) return
-          const next = { ...cur, relay }
-          pairingRef.current = next
-          setPairing(next)
+          if (cancelled) return
+          commit(updatePairing(fileRef.current, hostId, (p) => ({ ...p, relay })))
           setConnMeta({ relayUrl: relay.u, relayId: relay.i.slice(0, 6) })
-          void storage.set(PAIRING_KEY, JSON.stringify(next)).catch((e) => connLog('client', `could not persist relay: ${(e as Error).message}`))
         },
         onReady: (info) => {
+          if (cancelled) return
           setHost(info.host)
           setDevice(info.device)
           setGatewayConnected(info.gatewayConnected)
@@ -233,12 +313,13 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
           void refreshPinsInternal()
           // Follow every session so an approval on any of them reaches the phone,
           // not just the one currently on screen.
-          void client?.subscribe(aggRef.current.keys()).catch(() => {})
+          void client?.subscribe(cache.agg.keys()).catch(() => {})
           // Whatever was on screen went stale while the link was down.
           const lo = lastOpened.current
           if (lo && loadedHistory.current.has(lo.key)) void openSessionRef.current(lo.key, lo.id, true)
         },
         onEvent: (event, data, seq, sessionKey) => {
+          if (cancelled) return
           handleEvent(event, data, seq, sessionKey)
         },
       })
@@ -254,12 +335,15 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
 
     return () => {
       cancelled = true
+      // Keep what this Mac showed so switching back is instant (and nothing leaks into the next Mac).
+      cache.sessions = sessionsRef.current
+      cache.pins = pinsRef.current
       client?.disconnect()
-      clientRef.current = null
+      if (clientRef.current === client) clientRef.current = null
     }
     // Keyed on the paired identity, not the record: scope or relay updates must not rebuild the client.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pairing?.deviceId, pairing?.pairedAt, pairing?.hostPublicKey])
+  }, [pairing?.hostId, pairing?.deviceId, pairing?.pairedAt, pairing?.hostPublicKey])
 
   // ---- demo ---------------------------------------------------------------
 
@@ -302,7 +386,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   }, [demo])
 
   const enterDemo = useCallback(() => {
-    if (!pairingRef.current) setDemo(true)
+    if (fileRef.current.pairings.length === 0) setDemo(true)
   }, [])
   const exitDemo = useCallback(() => setDemo(false), [])
 
@@ -366,6 +450,10 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   useEffect(() => {
     sessionsRef.current = sessions
   }, [sessions])
+  const pinsRef = useRef<Pin[]>([])
+  useEffect(() => {
+    pinsRef.current = pins
+  }, [pins])
 
   // Coalesce bursts of list events into one refetch.
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -405,7 +493,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       if (event === 'remote.scopes_changed') {
         const next = (data as { scopes: Scope[] }).scopes
         setDevice((d) => (d ? { ...d, scopes: next } : d))
-        setPairing((p) => (p ? { ...p, scopes: next } : p))
+        const cur = pairingRef.current
+        if (cur) commit(updatePairing(fileRef.current, cur.hostId, (p) => ({ ...p, scopes: next })))
         void haptic('success')
         bump()
         return
@@ -430,7 +519,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       }
 
       const touched = aggRef.current.apply(event, data, seq, sessionKey)
-      if (typeof seq === 'number') void storage.set(CURSOR_KEY, String(aggRef.current.cursor))
+      const hid = pairingRef.current?.hostId
+      if (typeof seq === 'number' && hid) void storage.set(cursorKey(hid), String(aggRef.current.cursor))
 
       // Three events mean a human has to do something or a run is stuck.
       if (event === 'agent.tool_approval' || event === 'agent.ask_user' || event === 'agent.elicitation') {
@@ -452,7 +542,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
 
       if (touched) bump()
     },
-    [bump, scheduleSessionsRefresh],
+    [bump, commit, scheduleSessionsRefresh],
   )
 
   // ---- actions ------------------------------------------------------------
@@ -468,7 +558,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     if (!c || c.state !== 'ready') return
     // Without the sessions scope the bridge refuses; the list simply has no pins.
     try {
-      setPins(normalizePins(await c.rpc('remote.pins.list')))
+      const next = normalizePins(await c.rpc('remote.pins.list'))
+      // Switched Macs while this was in flight: that answer belongs to the other Mac.
+      if (clientRef.current === c) setPins(next)
     } catch {
       // Offline or an older bridge without pins: keep what we have.
     }
@@ -480,6 +572,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     setSessionsLoading(true)
     try {
       const list = await c.rpc<StoredSession[]>('sessions.list')
+      if (clientRef.current !== c) return
       const sorted = sortSessions(list ?? [])
       setSessions(sorted)
       const keys = sorted
@@ -489,7 +582,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     } catch {
       // Offline. The status dot already says so.
     } finally {
-      setSessionsLoading(false)
+      if (clientRef.current === c) setSessionsLoading(false)
     }
   }, [])
 
@@ -502,34 +595,43 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     async (sessionKey: string, sessionId?: string, force = false) => {
       const c = clientRef.current
       if (!c) return
+      // Per-Mac state captured now: a switch mid-flight must not write into the other Mac's cache.
+      const loaded = loadedHistory.current
+      const info = historyInfo.current
+      const agg = aggRef.current
       await c.subscribe([sessionKey])
+      if (clientRef.current !== c) return
       if (sessionId) lastOpened.current = { key: sessionKey, id: sessionId }
-      if (force) loadedHistory.current.delete(sessionKey)
-      if (loadedHistory.current.has(sessionKey) || !sessionId) {
+      if (force) loaded.delete(sessionKey)
+      if (loaded.has(sessionKey) || !sessionId) {
         bump()
         return
       }
-      loadedHistory.current.add(sessionKey)
+      loaded.add(sessionKey)
       try {
         const res = await c.rpc<
           { messages?: SessionMessage[]; truncated?: boolean; totalMessages?: number; returnedMessages?: number } | SessionMessage[]
         >('sessions.get', { sessionId })
+        if (clientRef.current !== c) {
+          loaded.delete(sessionKey)
+          return
+        }
         const messages = Array.isArray(res) ? res : (res?.messages ?? [])
         if (!Array.isArray(res) && res?.truncated) {
-          historyInfo.current.set(sessionKey, {
+          info.set(sessionKey, {
             shown: res.returnedMessages ?? messages.length,
             total: res.totalMessages ?? messages.length,
           })
         } else {
-          historyInfo.current.delete(sessionKey)
+          info.delete(sessionKey)
         }
-        const existing = aggRef.current.get(sessionKey).chatItems
+        const existing = agg.get(sessionKey).chatItems
         const history = sessionMessagesToChatItems(messages)
         // History is authoritative. Items replayed live after a cold start are
         // already in it, so only live items newer than history are kept.
-        aggRef.current.setChatItems(sessionKey, mergeHistory(history, existing))
+        agg.setChatItems(sessionKey, mergeHistory(history, existing))
       } catch {
-        loadedHistory.current.delete(sessionKey)
+        loaded.delete(sessionKey)
       }
       bump()
     },
@@ -540,7 +642,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   openSessionRef.current = openSession
 
   const savePairing = useCallback(async (result: PairResult) => {
-    const record: StoredPairing = {
+    const now = Date.now()
+    const record: HostPairing = {
       deviceId: result.deviceId,
       hostId: result.hostId,
       hostName: result.hostName,
@@ -549,13 +652,41 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       relay: result.relay,
       identity: identityToB64(null, result.identity),
       scopes: result.scopes,
-      pairedAt: Date.now(),
+      pairedAt: now,
+      addedAt: now,
     }
+    if (degradedRef.current) throw new Error('Secure storage is not responding. Restart the app and try again.')
+    const next = upsertPairing(fileRef.current, record)
     // Throws if the secure store fails or hangs; PairScreen shows that error.
-    await storage.set(PAIRING_KEY, JSON.stringify(record))
-    await storage.remove(CURSOR_KEY).catch(() => {})
-    setPairing(record)
-  }, [])
+    await writeChain.current
+    await storage.set(PAIRINGS_KEY, JSON.stringify(next))
+    // A fresh pairing (new device identity) starts with no cursor and no cached state for that Mac.
+    await storage.remove(cursorKey(record.hostId)).catch(() => {})
+    caches.current.drop(record.hostId)
+    setAdding(false)
+    commit(next, false)
+  }, [commit])
+
+  const switchTo = useCallback(
+    (hostId: string) => {
+      if (demoRef.current) return
+      const f = fileRef.current
+      setAdding(false)
+      if (hostId === f.activeHostId || !f.pairings.some((p) => p.hostId === hostId)) return
+      connLog('app', `switching Mac -> ${hostId.slice(0, 6)}`)
+      void haptic('light')
+      // Same batch as the new active Mac, so nothing sees the old Mac's 'ready' next to the new Mac's id.
+      setState('connecting')
+      setStateDetail(undefined)
+      commit(setActiveHost(f, hostId))
+    },
+    [commit],
+  )
+
+  const renameMac = useCallback(
+    (hostId: string, alias: string) => commit(renamePairing(fileRef.current, hostId, alias)),
+    [commit],
+  )
 
   const forget = useCallback(async () => {
     // In the demo there is nothing real to forget; never reach the pairing storage below.
@@ -563,6 +694,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       setDemo(false)
       return
     }
+    const p = pairingRef.current
+    if (!p) return
+    if (degradedRef.current) throw new Error('Secure storage is not responding. Restart the app and try again.')
     // Tell the Mac to stop notifying this phone before the key is gone. Best effort:
     // offline, or without the approvals scope, the Mac's token is dropped on revoke
     // or by APNs once the app is deleted.
@@ -573,27 +707,47 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
         new Promise((r) => setTimeout(r, 3000)),
       ])
     }
-    await storage.remove('dorabot-remote.push.sent.v1').catch(() => {})
-    void clearPushKey()
-    clientRef.current?.disconnect()
-    clientRef.current = null
-    aggRef.current = new SessionAggregator()
-    loadedHistory.current.clear()
-    historyInfo.current.clear()
-    await storage.remove(PAIRING_KEY)
-    await storage.remove(CURSOR_KEY)
-    setPairing(null)
-    setSessions([])
-    setPins([])
-    setHost(null)
-    setDevice(null)
-    setState('idle')
-  }, [])
+    const next = removePairing(fileRef.current, p.hostId)
+    await forgetSent(p.hostId)
+    await clearPushKey(p.hostId)
+    if (next.pairings.length === 0) void clearAllPushKeys()
+    caches.current.drop(p.hostId)
+    await removeLegacyIfMatches(storage, p.hostId)
+    await storage.remove(cursorKey(p.hostId)).catch(() => {})
+    await writeChain.current
+    if (next.pairings.length === 0) await storage.remove(PAIRINGS_KEY)
+    else await storage.set(PAIRINGS_KEY, JSON.stringify(next))
+    if (next.pairings.length === 0) {
+      clientRef.current?.disconnect()
+      clientRef.current = null
+      aggRef.current = new SessionAggregator()
+      loadedHistory.current = new Set()
+      historyInfo.current = new Map()
+      setSessions([])
+      setPins([])
+      setAttention([])
+      setHost(null)
+      setDevice(null)
+      setState('idle')
+    }
+    if (next.pairings.length > 0) setState('connecting')
+    setAdding(false)
+    commit(next, false)
+  }, [commit])
 
   const value = useMemo<ConnectionValue>(
     () => ({
       ready,
       pairing,
+      pairings: file.pairings,
+      activeHostId: file.activeHostId,
+      adding,
+      startAddMac: () => {
+        if (!demoRef.current) setAdding(true)
+      },
+      cancelAddMac: () => setAdding(false),
+      switchTo,
+      renameMac,
       state,
       stateDetail,
       host,
@@ -610,6 +764,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       savePairing,
       forget,
       rpc,
+      rpcOn: (hostId, method, params) =>
+        pairingRef.current?.hostId === hostId ? rpc(method, params) : Promise.reject(new Error('That Mac is not the active one.')),
       can: (method) => clientRef.current?.can(method) ?? false,
       hasScope: (scope) => (device?.scopes ?? pairing?.scopes ?? []).includes(scope),
       refreshSessions: refreshSessionsInternal,
@@ -631,6 +787,10 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     [
       ready,
       pairing,
+      file,
+      adding,
+      switchTo,
+      renameMac,
       state,
       stateDetail,
       host,

@@ -8,7 +8,7 @@
  */
 import { createHash } from 'node:crypto'
 import { signBytes, type SigningKeyPair } from '@dorabot-remote/protocol'
-import { buildPushContent, encryptPushContent, parsePushKey, type PushContent } from './push-content.js'
+import { buildPushContent, encryptPushContent, parsePushKey, pushKeyId, type PushContent } from './push-content.js'
 import type { DeviceRecord, Store } from './store.js'
 
 export type PushKind = 'question' | 'approval' | 'result' | 'error'
@@ -24,6 +24,8 @@ export interface PushNotifierOptions {
   /** Relay base URL (wss/ws accepted) and relay id; push is silently off when absent. */
   relay: { url: string; id: string } | null
   signingKey: SigningKeyPair
+  /** This Mac, for the encrypted content (hostId/hostName) and the `kid` key selector. */
+  host?: { id: string; name: string }
   isConnected: (deviceId: string) => boolean
   log: (msg: string) => void
   fetch?: typeof fetch
@@ -82,7 +84,7 @@ export class PushNotifier {
         return []
     }
     const r = rid.slice(0, 128)
-    return this.notify(kind, r, buildPushContent(name, data, r))
+    return this.notify(kind, r, buildPushContent(name, data, r, this.opts.host))
   }
 
   private notify(kind: PushKind, rid: string, content: PushContent | null): Promise<void>[] {
@@ -140,6 +142,7 @@ export class PushNotifier {
         rid,
         ...(device.pushPlatform === 'ios' ? { env: device.pushEnv ?? 'production' } : {}),
         ...(enc ? { enc } : {}),
+        ...(enc && this.opts.host?.id ? { kid: pushKeyId(this.opts.host.id) } : {}),
         ts: this.now(),
       }),
     )

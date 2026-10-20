@@ -13,7 +13,7 @@ const createSocket = (url: string) => new WebSocket(url) as never
  * machine. Nothing here asks for a password, and no credential ever travels in
  * the clear.
  */
-export function PairScreen(): ReactNode {
+export function PairScreen({ onCancel }: { onCancel?: () => void } = {}): ReactNode {
   const { savePairing, enterDemo } = useConnection()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -91,9 +91,11 @@ export function PairScreen(): ReactNode {
             <path d="M14 14h3v3h-3zM18 18h3v3h-3z" />
           </svg>
         </div>
-        <h1 className="text-[26px] font-semibold leading-tight tracking-[-0.02em]">Pair with your Mac</h1>
+        <h1 className="text-[26px] font-semibold leading-tight tracking-[-0.02em]">{onCancel ? 'Add another Mac' : 'Pair with your Mac'}</h1>
         <p className="text-[15px] leading-relaxed text-ink-300">
-          On the Mac running dorabot, start the bridge and open the pairing page. Scan the code it shows.
+          {onCancel
+            ? 'Your other Macs stay paired. On the new Mac, start the bridge and open the pairing page, then scan the code it shows.'
+            : 'On the Mac running dorabot, start the bridge and open the pairing page. Scan the code it shows.'}
         </p>
       </div>
 
@@ -150,9 +152,15 @@ export function PairScreen(): ReactNode {
         )}
       </div>
 
-      <button onClick={enterDemo} className="text-center text-[14px] font-medium text-mint-500 underline">
-        Try a demo (no Mac needed)
-      </button>
+      {onCancel ? (
+        <Button variant="ghost" onClick={onCancel} disabled={busy} className="w-full">
+          Cancel
+        </Button>
+      ) : (
+        <button onClick={enterDemo} className="text-center text-[14px] font-medium text-mint-500 underline">
+          Try a demo (no Mac needed)
+        </button>
+      )}
 
       <p className="text-center text-[13px] leading-relaxed text-ink-500">
         Your phone talks straight to your Mac on your network. Away from home it goes through a relay that only ever sees encrypted data.

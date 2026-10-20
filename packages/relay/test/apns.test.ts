@@ -1,7 +1,7 @@
 import { generateSigningKey, relayIdFromPublicKey, signBytes } from '@dorabot-remote/protocol'
 import { beforeAll, describe, expect, it } from 'vitest'
-import { getApnsJwt, type ApnsCache } from '../src/apns.js'
-import { handlePush, type PushBody, type PushDeps } from '../src/push.js'
+import { buildApnsPayload, getApnsJwt, type ApnsCache } from '../src/apns.js'
+import { handlePush, parsePushBody, type PushBody, type PushDeps } from '../src/push.js'
 
 let keyP8: string
 let publicKey: CryptoKey
@@ -141,5 +141,22 @@ describe('APNs', () => {
     const r = await handlePush(signed(body({ platform: 'android' })), relayId, h.deps)
     expect(r.status).toBe(503) // no service account in this harness
     expect(h.calls).toHaveLength(0)
+  })
+})
+
+describe('kid passthrough', () => {
+  it('puts kid next to enc in the APNs payload, and only with enc', () => {
+    expect(buildApnsPayload('approval', 'r1', 'ZW5j', 'a1b2c3d4')).toMatchObject({ enc: 'ZW5j', kid: 'a1b2c3d4', rid: 'r1' })
+    expect(buildApnsPayload('approval', 'r1')).not.toHaveProperty('kid')
+    expect(buildApnsPayload('approval', 'r1', undefined, 'a1b2c3d4')).not.toHaveProperty('kid')
+  })
+
+  it('parsePushBody accepts a short kid and rejects bad ones', () => {
+    const raw = (kid: unknown) => JSON.stringify({ token: TOKEN, platform: 'ios', kind: 'approval', ts: 1, enc: 'ZW5j', kid })
+    expect(parsePushBody(raw('a1b2c3d4'))?.kid).toBe('a1b2c3d4')
+    expect(parsePushBody(raw('x'.repeat(17)))).toBeNull()
+    expect(parsePushBody(raw(''))).toBeNull()
+    expect(parsePushBody(raw('bad kid!'))).toBeNull()
+    expect(parsePushBody(raw(5))).toBeNull()
   })
 })

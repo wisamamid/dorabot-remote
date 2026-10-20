@@ -7,10 +7,10 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { useConnection } from './connection.js'
 import { APNS_ENV, enablePush, listenPush, pushSupported, registerIfGranted, type PushPermission } from './push.js'
 import { generatePushKey } from './push-crypto.js'
-import { getPushKey, setPushKey } from './push-key.js'
+import { setPushKey, storedKeyIds } from './push-key.js'
+import { markSent, planPushRegistrations, readSent, registerWithHost, withTempClient } from './push-hosts.js'
 import { storage } from './platform.js'
 
-const SENT_KEY = 'dorabot-remote.push.sent.v1'
 const DISMISS_KEY = 'dorabot-remote.push.dismissed.v1'
 const DISMISS_MS = 7 * 24 * 60 * 60 * 1000
 
@@ -42,10 +42,14 @@ export function PushProvider({ children }: { children: ReactNode }): ReactNode {
   const [registered, setRegistered] = useState(false)
   const [notifyOnResult, setNotify] = useState(false)
   const [dismissedAt, setDismissedAt] = useState<number | null>(null)
-  const sending = useRef(false)
+  const chain = useRef<Promise<void>>(Promise.resolve())
 
-  const paired = Boolean(conn.pairing)
-  const canPush = paired && conn.hasScope('approvals')
+  const paired = conn.pairings.length > 0
+  // Any Mac that allows approvals gets this phone registered, not just the active one.
+  const canPush = conn.pairings.some((p) => p.scopes.includes('approvals'))
+  const activeCanPush = conn.hasScope('approvals')
+  const connRef = useRef(conn)
+  connRef.current = conn
 
   // On every start while paired: learn the permission state, and if already granted
   // re-register silently so a rotated token is noticed.
@@ -70,42 +74,45 @@ export function PushProvider({ children }: { children: ReactNode }): ReactNode {
     return listenPush((t) => setToken(t))
   }, [paired])
 
-  // Send the token once connected; again if it changes, or after re-pairing.
+  // The phone has one APNs token; each Mac keeps its own record of it plus its own content
+  // key. Register with every Mac that is missing one (new token, newly paired, key lost): the
+  // active Mac over the live link, the others over a short-lived connection. Runs are chained
+  // so two never register the same Mac at once.
   useEffect(() => {
-    if (!token || !canPush || conn.state !== 'ready' || !conn.pairing || sending.current) return
-    const stamp = `${conn.pairing.deviceId}:${APNS_ENV}:${token}`
+    if (!token || !canPush) return
     let alive = true
-    sending.current = true
-    void (async () => {
-      try {
-        const last = await storage.get(SENT_KEY).catch(() => null)
-        // Already registered with the Mac, and the content key is still in the keychain.
-        if (last === stamp && (await getPushKey())) {
-          setRegistered(true)
-          return
+    chain.current = chain.current.then(async () => {
+      if (!alive) return
+      const c = connRef.current
+      const [sent, keyIds] = await Promise.all([readSent(), storedKeyIds()])
+      const plan = planPushRegistrations({ pairings: c.pairings, activeHostId: c.activeHostId, token, env: APNS_ENV, sent, keyIds })
+      for (const hostId of plan) {
+        if (!alive) return
+        const p = c.pairings.find((x) => x.hostId === hostId)
+        if (!p) continue
+        const isActive = hostId === connRef.current.activeHostId
+        // The active Mac is registered once its link is up; the others do not need it.
+        if (isActive && connRef.current.state !== 'ready') continue
+        try {
+          const mk = (rpc: (m: string, params: unknown) => Promise<unknown>) => ({ rpc, newKey: generatePushKey, storeKey: setPushKey })
+          const stamp = isActive
+            ? await registerWithHost(mk((m, params) => connRef.current.rpcOn(hostId, m, params)), p, token, APNS_ENV)
+            : await withTempClient(p, (rpc) => registerWithHost(mk(rpc), p, token, APNS_ENV))
+          await markSent(hostId, stamp)
+          if (isActive && alive) setRegistered(true)
+        } catch {
+          // Offline or refused: the next change (or launch) retries this Mac.
         }
-        // Every registration rotates the content key. The bridge switches to the new key
-        // as soon as it accepts it, so the keychain is updated right after; until then a
-        // push just shows its generic text.
-        const pushKey = generatePushKey()
-        await conn.rpc('remote.registerPush', { token, platform: 'ios', env: APNS_ENV, pushKey })
-        await setPushKey(pushKey)
-        await storage.set(SENT_KEY, stamp).catch(() => {})
-        if (alive) setRegistered(true)
-      } catch {
-        // Offline or refused: the next ready transition retries.
-      } finally {
-        sending.current = false
       }
-    })()
+    })
     return () => {
       alive = false
     }
-  }, [token, canPush, conn.state, conn.pairing, conn.rpc])
+  }, [token, canPush, conn.state, conn.pairings, conn.activeHostId])
 
   // Reflect the bridge's per-device prefs in Settings.
   useEffect(() => {
-    if (!canPush || conn.state !== 'ready' || !pushSupported) return
+    if (!activeCanPush || conn.state !== 'ready' || !pushSupported) return
     void conn
       .rpc<{ registered: boolean; notifyOnResult: boolean }>('remote.pushPrefs')
       .then((r) => {
@@ -113,7 +120,7 @@ export function PushProvider({ children }: { children: ReactNode }): ReactNode {
         setRegistered(Boolean(r?.registered))
       })
       .catch(() => {})
-  }, [canPush, conn.state, conn.rpc])
+  }, [activeCanPush, conn.state, conn.activeHostId, conn.rpc])
 
   const enable = useCallback(async () => {
     const p = await enablePush()

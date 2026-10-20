@@ -9,8 +9,8 @@
  */
 import { isNative, platformName } from './platform.js'
 import { staleDelivered, type PushNav } from './push-actions.js'
-import { decryptPushEnc } from './push-crypto.js'
-import { getPushKey } from './push-key.js'
+import { listPushKeys } from './push-key.js'
+import { decryptWithKeys } from './push-keys.js'
 
 export type { PushNav }
 
@@ -102,18 +102,21 @@ export function listenPush(onToken: (token: string) => void, onError?: (msg: str
     // and Capacitor shows no system banner unless presentationOptions says so.
     await add(() =>
       PushNotifications.addListener('pushNotificationActionPerformed', (a) => {
-        const data = (a.notification?.data ?? {}) as { rid?: unknown; k?: unknown; enc?: unknown }
+        const data = (a.notification?.data ?? {}) as { rid?: unknown; k?: unknown; enc?: unknown; kid?: unknown }
         const nav: PushNav = {
           ...(typeof data.rid === 'string' ? { rid: data.rid } : {}),
           ...(typeof data.k === 'string' ? { kind: data.k } : {}),
           ...(typeof a.actionId === 'string' ? { actionId: a.actionId } : {}),
+          ...(typeof data.kid === 'string' ? { kid: data.kid } : {}),
         }
-        // The encrypted content tells us which session this is about. Best effort.
+        // The encrypted content tells us which Mac and session this is about. The kid picks the
+        // key; with no kid (older bridge) every stored key is tried. Best effort.
         void (async () => {
           try {
-            const key = typeof data.enc === 'string' ? await Promise.race([getPushKey(), new Promise<null>((r) => setTimeout(() => r(null), 1500))]) : null
-            const content = key && typeof data.enc === 'string' ? decryptPushEnc(data.enc, key) : null
+            const keys = typeof data.enc === 'string' ? await Promise.race([listPushKeys(), new Promise<[]>((r) => setTimeout(() => r([]), 1500))]) : []
+            const content = typeof data.enc === 'string' ? decryptWithKeys(data.enc, nav.kid, keys) : null
             if (content?.sessionKey) nav.sessionKey = content.sessionKey
+            if (content?.hostId) nav.hostId = content.hostId
           } catch {
             // generic routing still works
           }

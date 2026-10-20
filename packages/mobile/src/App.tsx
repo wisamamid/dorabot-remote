@@ -15,16 +15,20 @@ import { useSplit } from './lib/layout.js'
 import { ConnectionProvider, useConnection } from './lib/connection.js'
 import { InboxProvider, useInbox } from './lib/inbox-context.js'
 import { bannerFor } from './lib/status-banner.js'
-import { haptic, setStatusBarDark } from './lib/platform.js'
+import { haptic, onAppUrl, setStatusBarDark } from './lib/platform.js'
 import { AppLockProvider, useAppLock } from './lib/app-lock.js'
 import { clearDeliveredNotifications, onPushNavigate, pruneDeliveredNotifications } from './lib/push.js'
+import { hostIdForKid } from './lib/push-keys.js'
+import { AppLinkQueue, ASK_TTL_MS, nextAskStep, parseAppLink } from './lib/applink.js'
+import { displayName } from './lib/hosts.js'
 import { routePushAction, runDecision, type PushRoute } from './lib/push-actions.js'
 import { createPortal } from 'react-dom'
 import { PushProvider } from './lib/push-context.js'
 
 type TabName = 'sessions' | 'inbox' | 'work' | 'code' | 'more'
 
-type Open = { session: StoredSession | null; sessionKey: string } | null
+/** `hostId` is the Mac the session lives on: after a switch, a session of another Mac is simply not shown. */
+type Open = { session: StoredSession | null; sessionKey: string; hostId: string | null } | null
 
 export default function App(): ReactNode {
   useEffect(() => {
@@ -63,7 +67,9 @@ function Shell(): ReactNode {
   const conn = useConnection()
   const inbox = useInbox()
   const [tab, setTab] = useState<TabName>('sessions')
-  const [open, setOpen] = useState<Open>(null)
+  const [openRaw, setOpen] = useState<Open>(null)
+  const activeHostId = conn.demo ? 'demo' : conn.activeHostId
+  const open = openRaw && openRaw.hostId === activeHostId ? openRaw : null
   // A tapped notification carries only a routing id; wait for the matching inbox item.
   const [pendingRid, setPendingRid] = useState<string | null>(null)
   const lock = useAppLock()
@@ -76,19 +82,24 @@ function Shell(): ReactNode {
     if (!paired) return
     return onPushNavigate((nav) => {
       const route = routePushAction(nav)
+      // A push from another Mac: switch to it first, then open / act there. The hostId
+      // comes from the decrypted content; the unencrypted kid is the fallback.
+      const c = connRef.current
+      const targetHost = (route.hostId && c.pairings.some((p) => p.hostId === route.hostId) ? route.hostId : hostIdForKid(c.pairings, route.kid)) ?? c.activeHostId
+      if (targetHost && targetHost !== c.activeHostId) c.switchTo(targetHost)
       setTab('inbox')
       setOpen(null)
       if (route.type === 'decide') {
         // Face ID is asked inside runDecision; the delivered notification is cleared by the prune below.
-        setDecision(route)
+        setDecision({ ...route, hostId: targetHost ?? undefined })
         return
       }
       void clearDeliveredNotifications()
       if (route.sessionKey) {
         const key = route.sessionKey
-        const s = connRef.current.sessions.find((x) => x.channel && x.chatType && x.chatId && `${x.channel}:${x.chatType}:${x.chatId}` === key)
+        const s = targetHost === connRef.current.activeHostId ? connRef.current.sessions.find((x) => keyOf(x) === key) : undefined
         setTab('sessions')
-        setOpen({ session: s ?? null, sessionKey: key })
+        setOpen({ session: s ?? null, sessionKey: key, hostId: targetHost })
       } else if (route.rid) {
         const rid = route.rid
         setPendingRid(rid)
@@ -107,6 +118,8 @@ function Shell(): ReactNode {
   }, [decision, lock])
   useEffect(() => {
     if (!decision || conn.state !== 'ready') return
+    // A decision for another Mac waits until that Mac is the connected one.
+    if (decision.hostId && decision.hostId !== conn.activeHostId) return
     const route = decision
     const verify = verifyOnce.current ?? lock.verify('Confirm')
     setDecision(null)
@@ -115,12 +128,109 @@ function Shell(): ReactNode {
       setToast({ text: out.message, ok: out.status === 'done' || out.status === 'already_resolved' })
       void haptic(out.status === 'done' ? 'success' : 'warning')
     })
-  }, [decision, conn.state, lock])
+  }, [decision, conn.state, conn.activeHostId, lock])
   useEffect(() => {
     if (!toast) return
     const t = setTimeout(() => setToast(null), 4000)
     return () => clearTimeout(t)
   }, [toast])
+
+  // ---- Siri / Shortcuts: dorabot-remote://ask?prompt=...&host=... and ://inbox ----
+  // Requests are queued until the app can act: restored, unlocked (Face ID if the lock is on),
+  // on the right Mac, and connected. The decisions themselves are pure (lib/applink.ts).
+  const askQueue = useRef(new AppLinkQueue())
+  const [askTick, setAskTick] = useState(0)
+  const askVerified = useRef(false)
+  const askBusy = useRef(false)
+  const lockRef = useRef(lock)
+  lockRef.current = lock
+
+  useEffect(
+    () =>
+      onAppUrl((url) => {
+        const link = parseAppLink(url)
+        if (link && askQueue.current.push(link, Date.now(), lockRef.current.locked)) setAskTick((t) => t + 1)
+      }, 'ask'),
+    [],
+  )
+
+  useEffect(() => {
+    const q = askQueue.current
+    const head = q.peek()
+    if (!head || askBusy.current) return
+    const bump = (): void => setAskTick((t) => t + 1)
+    const finish = (message?: { text: string; ok: boolean }): void => {
+      q.shift()
+      askVerified.current = false
+      if (message) setToast(message)
+      bump()
+    }
+    if (lock.locked) head.arrivedLocked = true
+    const link = head.link
+    if (link.type === 'inbox') {
+      if (!conn.ready || lock.locked) return
+      q.shift()
+      conn.cancelAddMac()
+      setTab('inbox')
+      setOpen(null)
+      bump()
+      return
+    }
+    const hosts = conn.demo ? [{ hostId: 'demo', hostName: 'Demo Mac' }] : conn.pairings
+    const step = nextAskStep({
+      prompt: link.prompt,
+      ...(link.host ? { host: link.host } : {}),
+      at: head.at,
+      arrivedLocked: head.arrivedLocked,
+      now: Date.now(),
+      ready: conn.ready,
+      hosts,
+      activeHostId,
+      connState: conn.state,
+      hasChatScope: conn.hasScope('chat'),
+      appLocked: lock.locked,
+      lockEnabled: lock.enabled,
+      verified: askVerified.current,
+    })
+    if (step.do === 'wait') {
+      // Re-check when the request would expire, so it cannot sit there forever.
+      const t = setTimeout(bump, Math.max(1000, head.at + ASK_TTL_MS - Date.now() + 100))
+      return () => clearTimeout(t)
+    }
+    if (step.do === 'drop') return finish({ text: step.message, ok: false })
+    if (step.do === 'switch') {
+      conn.switchTo(step.hostId)
+      return
+    }
+    askBusy.current = true
+    if (step.do === 'verify') {
+      void lock.verify('Start a dorabot session').then((r) => {
+        askBusy.current = false
+        if (r === 'ok' || r === 'unavailable') {
+          askVerified.current = true
+          bump()
+        } else finish({ text: 'Not confirmed. Nothing was started.', ok: false })
+      })
+      return
+    }
+    // send: start a NEW session on that Mac with the prompt, then show it.
+    const c = connRef.current
+    const name = hosts.find((h) => h.hostId === step.hostId)
+    void (c.demo ? c.rpc<{ sessionKey: string }>('chat.send', { prompt: link.prompt }) : c.rpcOn<{ sessionKey: string }>(step.hostId, 'chat.send', { prompt: link.prompt }))
+      .then((res) => {
+        askBusy.current = false
+        c.cancelAddMac()
+        void c.refreshSessions()
+        setTab('sessions')
+        setOpen({ session: null, sessionKey: res.sessionKey, hostId: step.hostId })
+        void haptic('success')
+        finish({ text: `Started on ${name ? displayName(name as { hostName: string; alias?: string }) : 'your Mac'}.`, ok: true })
+      })
+      .catch((err: Error) => {
+        askBusy.current = false
+        finish({ text: `Could not start the session: ${err.message}`, ok: false })
+      })
+  }, [askTick, conn.ready, conn.state, conn.activeHostId, conn.pairings, conn.demo, lock.locked, lock.enabled, activeHostId])
 
   // Drop delivered notifications for requests that are already settled.
   useEffect(() => {
@@ -134,9 +244,9 @@ function Shell(): ReactNode {
     if (!item) return
     setPendingRid(null)
     if (!item.sessionKey) return
-    const s = conn.sessions.find((x) => x.channel && x.chatType && x.chatId && `${x.channel}:${x.chatType}:${x.chatId}` === item.sessionKey)
-    setOpen({ session: s ?? null, sessionKey: item.sessionKey })
-  }, [pendingRid, inbox.items, conn.sessions])
+    const s = conn.sessions.find((x) => keyOf(x) === item.sessionKey)
+    setOpen({ session: s ?? null, sessionKey: item.sessionKey, hostId: activeHostId })
+  }, [pendingRid, inbox.items, conn.sessions, activeHostId])
 
   // Entering the two-pane layout with a conversation open: show it where it lives.
   useEffect(() => {
@@ -151,10 +261,10 @@ function Shell(): ReactNode {
     )
   }
 
-  if (!conn.pairing && !conn.demo) return <PairScreen />
+  if ((!conn.pairing && !conn.demo) || conn.adding) return <PairScreen onCancel={conn.adding ? conn.cancelAddMac : undefined} />
 
   const openSession = (session: StoredSession | null, sessionKey: string): void => {
-    setOpen({ session, sessionKey })
+    setOpen({ session, sessionKey, hostId: activeHostId })
     if (split) setTab('sessions')
   }
 
