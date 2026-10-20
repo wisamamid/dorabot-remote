@@ -238,7 +238,8 @@ export async function loadPairings(io: KeyValueIO, opts: LoadOptions = {}): Prom
   const { v1, raw: rawV1, failed } = await readV1(io)
   if (failed) return { file: emptyPairings, migrated: false, degraded: true }
   if (!v1) {
-    if (rawV1) await io.remove(LEGACY_PAIRING_KEY).catch(() => {})
+    // An unreadable v1 is left in place (never delete pairing data we can't read).
+    if (rawV1) log('legacy v1 pairing present but unparseable: left untouched')
     return { file: emptyPairings, migrated: false, degraded: false, ...(backedUpTo ? { backedUpTo } : {}) }
   }
   const file: PairingsFile = { v: 2, activeHostId: v1.hostId, pairings: [v1] }

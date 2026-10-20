@@ -147,10 +147,10 @@ describe('migration from the single v1 pairing', () => {
     expect(io.data.get(PAIRINGS_KEY)).toBe('garbage')
   })
 
-  it('drops a corrupt v1 record and starts empty', async () => {
+  it('leaves a corrupt v1 record in place and starts empty', async () => {
     const io = memIO({ [LEGACY_PAIRING_KEY]: '{nope' })
     expect((await loadPairings(io)).file).toEqual(emptyPairings)
-    expect(io.data.has(LEGACY_PAIRING_KEY)).toBe(false)
+    expect(io.data.has(LEGACY_PAIRING_KEY)).toBe(true)
   })
 
   it('nothing stored is an empty list', async () => {
