@@ -172,6 +172,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   pairingRef.current = pairing
   const fileRef = useRef<PairingsFile>(emptyPairings)
   const writeChain = useRef<Promise<void>>(Promise.resolve())
+  /** The pairings could not be read: nothing may be written until a later read succeeds. */
+  const degradedRef = useRef(false)
   const caches = useRef(new HostCaches())
   const netTypeRef = useRef<string>('unknown')
   const aggRef = useRef(new SessionAggregator())
@@ -183,7 +185,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   const commit = useCallback((next: PairingsFile, persist = true): void => {
     fileRef.current = next
     setFile(next)
-    if (!persist) return
+    if (!persist || degradedRef.current) return
     const json = JSON.stringify(next)
     writeChain.current = writeChain.current
       .then(() => storage.set(PAIRINGS_KEY, json))
@@ -196,7 +198,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     void loadConnLog()
     void (async () => {
       try {
-        const { file: loaded, migrated } = await loadPairings(storage)
+        const { file: loaded, migrated, degraded, backedUpTo } = await loadPairings(storage, { log: (m) => connLog('app', m) })
+        degradedRef.current = degraded
+        if (backedUpTo) connLog('app', `corrupt pairings backed up to ${backedUpTo}`)
         fileRef.current = loaded
         setFile(loaded)
         const p = activePairing(loaded)
@@ -214,6 +218,29 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       }
     })()
   }, [])
+
+  // Storage was unreadable at launch: keep trying. Once a read succeeds, that is the truth.
+  const [degraded, setDegraded] = useState(false)
+  useEffect(() => {
+    if (!ready) return
+    setDegraded(degradedRef.current)
+  }, [ready])
+  useEffect(() => {
+    if (!degraded) return
+    const t = setInterval(() => {
+      void loadPairings(storage, { log: (m) => connLog('app', m) }).then((r) => {
+        if (r.degraded) return
+        degradedRef.current = false
+        setDegraded(false)
+        const active = fileRef.current.activeHostId
+        const next = r.file.pairings.some((p) => p.hostId === active) ? setActiveHost(r.file, active!) : r.file
+        fileRef.current = next
+        setFile(next)
+        connLog('app', 'pairings storage readable again')
+      })
+    }, 5000)
+    return () => clearInterval(t)
+  }, [degraded])
 
   // ---- connect ------------------------------------------------------------
 
@@ -628,6 +655,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       pairedAt: now,
       addedAt: now,
     }
+    if (degradedRef.current) throw new Error('Secure storage is not responding. Restart the app and try again.')
     const next = upsertPairing(fileRef.current, record)
     // Throws if the secure store fails or hangs; PairScreen shows that error.
     await writeChain.current
@@ -668,6 +696,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     }
     const p = pairingRef.current
     if (!p) return
+    if (degradedRef.current) throw new Error('Secure storage is not responding. Restart the app and try again.')
     // Tell the Mac to stop notifying this phone before the key is gone. Best effort:
     // offline, or without the approvals scope, the Mac's token is dropped on revoke
     // or by APNs once the app is deleted.

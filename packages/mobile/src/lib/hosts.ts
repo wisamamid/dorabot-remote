@@ -150,29 +150,96 @@ export interface LoadResult {
   file: PairingsFile
   /** True when this call converted a v1 pairing. */
   migrated: boolean
+  /**
+   * True when the v2 value could not be read (error or timeout). The file is then the v1
+   * pairing, read-only: nothing may be written until a later load comes back non-degraded,
+   * or the other paired Macs would be wiped.
+   */
+  degraded: boolean
+  /** Key the unparseable v2 value was copied to before anything was rewritten. */
+  backedUpTo?: string
+}
+
+export interface LoadOptions {
+  now?: () => number
+  /** Wait before the single retry of a failed v2 read. */
+  retryDelayMs?: number
+  log?: (msg: string) => void
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+async function readV1(io: KeyValueIO): Promise<{ v1: HostPairing | null; raw: string | null; failed: boolean }> {
+  let raw: string | null
+  try {
+    raw = await io.get(LEGACY_PAIRING_KEY)
+  } catch {
+    return { v1: null, raw: null, failed: true }
+  }
+  if (!raw) return { v1: null, raw: null, failed: false }
+  try {
+    return { v1: toHostPairing(JSON.parse(raw)), raw, failed: false }
+  } catch {
+    return { v1: null, raw, failed: false }
+  }
 }
 
 /**
- * Read the pairings. If only the v1 single pairing exists, convert it: write v2
- * first, copy its resume cursor to the per-host key, and only then (never in this
- * release, see KEEP_LEGACY_V1) delete v1. A failed v2 write keeps the app on the
- * v1 data for this launch and retries next time.
+ * Read the pairings.
+ *  - v2 read fine: use it.
+ *  - v2 read failed (secure storage error / timeout): retry once; if it still fails, return
+ *    the v1 pairing read-only and `degraded`, writing nothing.
+ *  - v2 present but unparseable: copy the raw value to `<PAIRINGS_KEY>.corrupt.<ts>` first,
+ *    then carry on as if absent.
+ *  - v2 absent: convert v1 if there is one: write v2, copy its cursor, and only then (never in
+ *    this release, see KEEP_LEGACY_V1) delete v1. A failed v2 write keeps the app on the v1
+ *    data for this launch and retries next time.
  */
-export async function loadPairings(io: KeyValueIO): Promise<LoadResult> {
-  const v2 = parsePairingsFile(await io.get(PAIRINGS_KEY).catch(() => null))
-  if (v2) return { file: v2, migrated: false }
+export async function loadPairings(io: KeyValueIO, opts: LoadOptions = {}): Promise<LoadResult> {
+  const now = opts.now ?? Date.now
+  const log = opts.log ?? (() => {})
 
-  const rawV1 = await io.get(LEGACY_PAIRING_KEY).catch(() => null)
-  if (!rawV1) return { file: emptyPairings, migrated: false }
-  let v1: HostPairing | null = null
-  try {
-    v1 = toHostPairing(JSON.parse(rawV1))
-  } catch {
-    v1 = null
+  let rawV2: string | null = null
+  let readOk = false
+  for (let attempt = 0; attempt < 2 && !readOk; attempt++) {
+    try {
+      rawV2 = await io.get(PAIRINGS_KEY)
+      readOk = true
+    } catch (err) {
+      log(`pairings v2 read failed (attempt ${attempt + 1}): ${(err as Error).message}`)
+      if (attempt === 0) await sleep(opts.retryDelayMs ?? 400)
+    }
   }
+  if (!readOk) {
+    const { v1 } = await readV1(io)
+    const file: PairingsFile = v1 ? { v: 2, activeHostId: v1.hostId, pairings: [v1] } : emptyPairings
+    log('pairings storage unreadable: running read-only on the v1 pairing, nothing will be saved')
+    return { file, migrated: false, degraded: true }
+  }
+
+  let backedUpTo: string | undefined
+  if (rawV2) {
+    const parsed = parsePairingsFile(rawV2)
+    if (parsed) return { file: parsed, migrated: false, degraded: false }
+    // Present but unreadable: never overwrite it without keeping a copy.
+    const key = `${PAIRINGS_KEY}.corrupt.${now()}`
+    try {
+      await io.set(key, rawV2)
+      backedUpTo = key
+      log(`pairings v2 unparseable: raw value kept under ${key}`)
+    } catch (err) {
+      log(`pairings v2 unparseable and the backup failed (${(err as Error).message}): running read-only`)
+      const { v1 } = await readV1(io)
+      const file: PairingsFile = v1 ? { v: 2, activeHostId: v1.hostId, pairings: [v1] } : emptyPairings
+      return { file, migrated: false, degraded: true }
+    }
+  }
+
+  const { v1, raw: rawV1, failed } = await readV1(io)
+  if (failed) return { file: emptyPairings, migrated: false, degraded: true }
   if (!v1) {
-    await io.remove(LEGACY_PAIRING_KEY).catch(() => {})
-    return { file: emptyPairings, migrated: false }
+    if (rawV1) await io.remove(LEGACY_PAIRING_KEY).catch(() => {})
+    return { file: emptyPairings, migrated: false, degraded: false, ...(backedUpTo ? { backedUpTo } : {}) }
   }
   const file: PairingsFile = { v: 2, activeHostId: v1.hostId, pairings: [v1] }
   try {
@@ -183,9 +250,9 @@ export async function loadPairings(io: KeyValueIO): Promise<LoadResult> {
       await io.remove(LEGACY_PAIRING_KEY).catch(() => {})
       await io.remove(LEGACY_CURSOR_KEY).catch(() => {})
     }
-    return { file, migrated: true }
+    return { file, migrated: true, degraded: false, ...(backedUpTo ? { backedUpTo } : {}) }
   } catch {
-    return { file, migrated: false }
+    return { file, migrated: false, degraded: false, ...(backedUpTo ? { backedUpTo } : {}) }
   }
 }
 

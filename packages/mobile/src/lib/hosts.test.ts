@@ -94,6 +94,59 @@ describe('migration from the single v1 pairing', () => {
     expect(io.data.has(LEGACY_PAIRING_KEY)).toBe(true)
   })
 
+  it('(b) a read error on v2 never writes: retries once, then runs read-only on v1 and flags degraded', async () => {
+    const other = mk('h2')
+    const v2 = JSON.stringify({ v: 2, activeHostId: 'h1', pairings: [mk('h1'), other] })
+    const io = memIO({ [PAIRINGS_KEY]: v2, [LEGACY_PAIRING_KEY]: JSON.stringify(v1) })
+    let reads = 0
+    const flaky: KeyValueIO & { data: Map<string, string> } = {
+      ...io,
+      get: async (k) => {
+        if (k === PAIRINGS_KEY) {
+          reads++
+          throw new Error('Secure storage did not respond')
+        }
+        return io.get(k)
+      },
+      set: async (k) => {
+        throw new Error(`unexpected write ${k}`)
+      },
+    }
+    const r = await loadPairings(flaky, { retryDelayMs: 0 })
+    expect(reads).toBe(2)
+    expect(r.degraded).toBe(true)
+    expect(r.migrated).toBe(false)
+    expect(r.file.pairings.map((p) => p.hostId)).toEqual(['h1'])
+    expect(io.data.get(PAIRINGS_KEY)).toBe(v2) // the other Mac is untouched
+  })
+
+  it('(b) a transient read error is retried and succeeds', async () => {
+    const v2 = JSON.stringify({ v: 2, activeHostId: 'h1', pairings: [mk('h1'), mk('h2')] })
+    const io = memIO({ [PAIRINGS_KEY]: v2 })
+    let first = true
+    const r = await loadPairings({ ...io, get: async (k) => { if (k === PAIRINGS_KEY && first) { first = false; throw new Error('timeout') } return io.get(k) } }, { retryDelayMs: 0 })
+    expect(r.degraded).toBe(false)
+    expect(r.file.pairings).toHaveLength(2)
+  })
+
+  it('(c) an unparseable v2 is backed up before anything is rewritten, and never silently replaced', async () => {
+    const io = memIO({ [PAIRINGS_KEY]: '{"v":3,"weird":true}', [LEGACY_PAIRING_KEY]: JSON.stringify(v1) })
+    const logs: string[] = []
+    const r = await loadPairings(io, { now: () => 777, log: (m) => logs.push(m) })
+    const backup = `${PAIRINGS_KEY}.corrupt.777`
+    expect(r.backedUpTo).toBe(backup)
+    expect(io.data.get(backup)).toBe('{"v":3,"weird":true}')
+    expect(logs.join('\n')).toContain(backup)
+    expect(r.file.pairings[0]?.hostId).toBe('h1')
+  })
+
+  it('(c) if the backup itself cannot be written, nothing is overwritten', async () => {
+    const io = memIO({ [PAIRINGS_KEY]: 'garbage', [LEGACY_PAIRING_KEY]: JSON.stringify(v1) }, () => true)
+    const r = await loadPairings(io)
+    expect(r.degraded).toBe(true)
+    expect(io.data.get(PAIRINGS_KEY)).toBe('garbage')
+  })
+
   it('drops a corrupt v1 record and starts empty', async () => {
     const io = memIO({ [LEGACY_PAIRING_KEY]: '{nope' })
     expect((await loadPairings(io)).file).toEqual(emptyPairings)
@@ -101,7 +154,7 @@ describe('migration from the single v1 pairing', () => {
   })
 
   it('nothing stored is an empty list', async () => {
-    expect(await loadPairings(memIO())).toEqual({ file: emptyPairings, migrated: false })
+    expect(await loadPairings(memIO())).toEqual({ file: emptyPairings, migrated: false, degraded: false })
   })
 
   it('unpairing the migrated Mac removes the v1 copy so a rollback cannot resurrect it', async () => {
