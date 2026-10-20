@@ -40,3 +40,12 @@ export function decryptWithKeys(enc: string, kid: string | undefined, keys: read
   }
   return null
 }
+
+/** Like decryptWithKeys, but also says which stored key opened it (its content is bound to that key's Mac). */
+export function decryptWithKeyInfo(enc: string, kid: string | undefined, keys: readonly StoredPushKey[]): { content: PushContent; kid: string } | null {
+  for (const k of keyCandidates(kid, keys)) {
+    const c = decryptPushEnc(enc, k.key)
+    if (c) return { content: c, kid: k.kid }
+  }
+  return null
+}

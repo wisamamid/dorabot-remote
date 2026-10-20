@@ -1,7 +1,7 @@
 /**
  * Optional Face ID lock for the whole app. Off by default. When on, the app asks
  * for Face ID (or the device passcode) on a cold start and when it returns from
- * the background after more than a minute. `verify()` is the same helper the
+ * the background after more than 15 seconds. `verify()` is the same helper the
  * notification Approve / Deny actions use.
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
@@ -9,8 +9,10 @@ import { createPortal } from 'react-dom'
 import { authenticate, type AuthResult } from './biometric.js'
 import { isNative, onAppBackground, onAppResume, storage } from './platform.js'
 
-const KEY = 'dorabot-remote.applock.v1'
-export const LOCK_GRACE_MS = 60_000
+/** Matches SECRET_KEY, so the on/off flag lives in the Keychain (old Preferences copies are migrated on first read). */
+export const APPLOCK_KEY = 'dorabot-remote.applock.v1'
+const KEY = APPLOCK_KEY
+export const LOCK_GRACE_MS = 15_000
 
 export function shouldLock(enabled: boolean, hiddenAt: number | null, now: number, graceMs = LOCK_GRACE_MS): boolean {
   return enabled && hiddenAt !== null && now - hiddenAt > graceMs

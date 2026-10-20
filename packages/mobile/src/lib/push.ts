@@ -8,9 +8,8 @@
  * module inside the function that needs it.
  */
 import { isNative, platformName } from './platform.js'
-import { staleDelivered, type PushNav } from './push-actions.js'
+import { buildPushNav, staleDelivered, type PushData, type PushNav } from './push-actions.js'
 import { listPushKeys } from './push-key.js'
-import { decryptWithKeys } from './push-keys.js'
 
 export type { PushNav }
 
@@ -102,23 +101,16 @@ export function listenPush(onToken: (token: string) => void, onError?: (msg: str
     // and Capacitor shows no system banner unless presentationOptions says so.
     await add(() =>
       PushNotifications.addListener('pushNotificationActionPerformed', (a) => {
-        const data = (a.notification?.data ?? {}) as { rid?: unknown; k?: unknown; enc?: unknown; kid?: unknown }
-        const nav: PushNav = {
-          ...(typeof data.rid === 'string' ? { rid: data.rid } : {}),
-          ...(typeof data.k === 'string' ? { kind: data.k } : {}),
-          ...(typeof a.actionId === 'string' ? { actionId: a.actionId } : {}),
-          ...(typeof data.kid === 'string' ? { kid: data.kid } : {}),
-        }
-        // The encrypted content tells us which Mac and session this is about. The kid picks the
-        // key; with no kid (older bridge) every stored key is tried. Best effort.
+        const data = (a.notification?.data ?? {}) as PushData
+        const actionId = typeof a.actionId === 'string' ? a.actionId : undefined
+        // Only the decrypted `enc` is trusted (see buildPushNav). No key / no decrypt: open the Inbox, act on nothing.
         void (async () => {
+          let nav: PushNav = { actionId: 'tap' }
           try {
             const keys = typeof data.enc === 'string' ? await Promise.race([listPushKeys(), new Promise<[]>((r) => setTimeout(() => r([]), 1500))]) : []
-            const content = typeof data.enc === 'string' ? decryptWithKeys(data.enc, nav.kid, keys) : null
-            if (content?.sessionKey) nav.sessionKey = content.sessionKey
-            if (content?.hostId) nav.hostId = content.hostId
+            nav = buildPushNav(data, actionId, keys)
           } catch {
-            // generic routing still works
+            // falls back to a plain open
           }
           emitNav(nav)
         })()

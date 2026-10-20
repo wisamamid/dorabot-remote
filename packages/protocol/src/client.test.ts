@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { RemoteClient, type SocketLike } from './client.js'
+import { NOT_RECOGNISED_TEXT, RemoteClient, type SocketLike } from './client.js'
 import {
   SecureChannel,
   deriveSessionKeys,
@@ -39,6 +39,18 @@ class FakeSocket implements SocketLike {
   }
   private emit(type: string, ev: unknown): void {
     for (const fn of this.listeners.get(type) ?? []) fn(ev)
+  }
+
+  /** Test hooks: inject raw frames as the host (or an attacker on the path) would. */
+  injectText(obj: unknown): void {
+    this.pushText(obj)
+  }
+  injectBinary(frame: Uint8Array): void {
+    this.emit('message', { data: frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength) })
+  }
+  /** The host's own channel, to seal a legitimate frame for replay. */
+  get hostChannel(): SecureChannel {
+    return this.channel!
   }
 
   /** Host -> client */
@@ -233,18 +245,6 @@ describe('forceReconnect (network change)', () => {
     c.disconnect()
   })
 
-  it('does not resurrect a revoked client', async () => {
-    const host = new FakeHost()
-    host.refuse = 'revoked'
-    const c = make(host)
-    c.connect()
-    await settle(100)
-    expect(c.state).toBe('revoked')
-    const n = host.sockets.length
-    c.forceReconnect()
-    await settle(100)
-    expect(host.sockets.length).toBe(n)
-  })
 
   it('detects a dead socket within the 10s ping + 5s pong window', async () => {
     const host = new FakeHost()
@@ -309,18 +309,82 @@ describe('connect races', () => {
   })
 })
 
-describe('terminal host errors', () => {
-  it('revoked stops retrying and surfaces a distinct state', async () => {
+describe('plaintext frames and refusals', () => {
+  it('a plaintext revoked is only a soft failure: long backoff, fixed text, never the revoked state', async () => {
     const host = new FakeHost()
     host.refuse = 'revoked'
+    const states: Array<[string, string | undefined]> = []
+    const c = make(host, { onState: (s, d) => states.push([s, d]) })
+    c.connect()
+    await settle(60_000)
+    expect(host.sockets.length).toBe(1)
+    expect(states.map((x) => x[0])).not.toContain('revoked')
+    expect(c.state).toBe('disconnected')
+    expect(states.at(-1)![1]).toBe(NOT_RECOGNISED_TEXT)
+    // Retries after 5 minutes, and recovers if the host is fine by then.
+    host.refuse = null
+    await settle(5 * 60_000 + 1000)
+    expect(host.sockets.length).toBe(2)
+    expect(c.state).toBe('ready')
+    c.disconnect()
+  })
+
+  it('never shows server-provided refusal text', async () => {
+    const host = new FakeHost()
+    host.refuse = 'unknown_device'
+    const details: string[] = []
+    const c = make(host, { onState: (_s, d) => d && details.push(d) })
+    c.connect()
+    await settle(1000)
+    expect(details.every((d) => d === NOT_RECOGNISED_TEXT)).toBe(true)
+    expect(details.join()).not.toContain('refused')
+    c.disconnect()
+  })
+
+  it('a forged plaintext err after the session is up closes the socket and does not stop reconnecting', async () => {
+    const host = new FakeHost()
     const states: string[] = []
     const c = make(host, { onState: (s) => states.push(s) })
     c.connect()
-    await settle(60_000)
-    expect(c.state).toBe('revoked')
-    expect(host.sockets.length).toBe(1)
-    expect(host.open.length).toBe(0)
-    expect(states.at(-1)).toBe('revoked')
+    await settle()
+    expect(c.state).toBe('ready')
+    host.sockets[0]!.injectText({ t: 'err', code: 'revoked', message: 'visit evil.example' })
+    await settle(10)
+    expect(host.sockets[0]!.closed).toBe(true)
+    expect(states).not.toContain('revoked')
+    await settle(30_000)
+    expect(host.sockets.length).toBeGreaterThan(1)
+    expect(c.state).toBe('ready')
+    c.disconnect()
+  })
+
+  it('a second plaintext hdr closes the connection', async () => {
+    const host = new FakeHost()
+    const c = make(host)
+    c.connect()
+    await settle()
+    expect(c.state).toBe('ready')
+    host.sockets[0]!.injectText({ t: 'hdr', hdr: toB64(null, new Uint8Array(16)) })
+    await settle(10)
+    expect(host.sockets[0]!.closed).toBe(true)
+    await settle(30_000)
+    expect(host.sockets.length).toBeGreaterThan(1)
+    c.disconnect()
+  })
+
+  it('a replayed ciphertext frame is rejected and closes the connection', async () => {
+    const host = new FakeHost()
+    const c = make(host)
+    c.connect()
+    await settle()
+    const sock = host.sockets[0]!
+    const frame = sock.hostChannel.seal({ t: 'pong', ts: 1 })
+    sock.injectBinary(frame)
+    expect(sock.closed).toBe(false)
+    sock.injectBinary(frame)
+    await settle(10)
+    expect(sock.closed).toBe(true)
+    c.disconnect()
   })
 
   it('other refusals keep retrying', async () => {

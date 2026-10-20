@@ -299,6 +299,9 @@ export class SecureChannel {
   /** Accept the peer's header, opening our inbound stream. */
   startReceive(header: Uint8Array): void {
     if (header.length !== NONCE_PREFIX_BYTES) throw new Error('bad stream header length')
+    // One header per connection, ever: a second one would reset the counter and
+    // let an attacker replay earlier ciphertext frames.
+    if (this.rxPrefix) throw new Error('stream header already received')
     this.rxPrefix = header
     this.rxCounter = 0n
   }

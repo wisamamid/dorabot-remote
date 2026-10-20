@@ -1,4 +1,5 @@
 import { memo, type ReactNode } from 'react'
+import { isSafeLinkHref } from '../lib/safe-link.js'
 
 /**
  * A small Markdown renderer for assistant replies.
@@ -153,7 +154,9 @@ function inline(text: string, keyPrefix = ''): ReactNode[] {
       )
     } else if (token.startsWith('[')) {
       const link = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(token)
-      out.push(
+      // Agent output must never be able to trigger an app link (dorabot-remote://ask?...) or any other scheme.
+      if (!isSafeLinkHref(link?.[2] ?? '')) out.push(<span key={key}>{link?.[1] ?? token}</span>)
+      else out.push(
         <a
           key={key}
           href={link?.[2] ?? '#'}
