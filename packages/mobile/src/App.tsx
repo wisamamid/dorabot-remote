@@ -1,6 +1,7 @@
 import { NOT_RECOGNISED_TEXT, type StoredSession } from '@dorabot-remote/protocol'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { keyOf } from './lib/connection.js'
+import { formatCountdown } from './lib/countdown.js'
 import { CodeScreen } from './components/CodeScreen.js'
 import { InboxScreen } from './components/InboxScreen.js'
 import { MoreScreen } from './components/MoreScreen.js'
@@ -258,6 +259,10 @@ function Shell(): ReactNode {
 
   if ((!conn.pairing && !conn.demo) || conn.adding) return <PairScreen onCancel={conn.adding ? conn.cancelAddMac : undefined} />
 
+  if (conn.state === 'pending' && conn.approvalExpiresAt !== null) {
+    return <PendingApprovalScreen approvalExpiresAt={conn.approvalExpiresAt} onUnpair={() => void conn.forget()} />
+  }
+
   const openSession = (session: StoredSession | null, sessionKey: string): void => {
     setOpen({ session, sessionKey, hostId: activeHostId })
     if (split) setTab('sessions')
@@ -484,5 +489,74 @@ function Tab({
       </span>
       <span className="text-[13px] font-medium">{label}</span>
     </button>
+  )
+}
+
+function PendingApprovalScreen({
+  approvalExpiresAt,
+  onUnpair,
+}: {
+  approvalExpiresAt: number
+  onUnpair: () => void
+}): ReactNode {
+  const [timeLeft, setTimeLeft] = useState(() => Math.max(0, approvalExpiresAt - Date.now()))
+  const [expired, setExpired] = useState(timeLeft <= 0)
+
+  useEffect(() => {
+    if (expired) return
+    const interval = setInterval(() => {
+      const remaining = Math.max(0, approvalExpiresAt - Date.now())
+      setTimeLeft(remaining)
+      if (remaining <= 0) {
+        setExpired(true)
+      }
+    }, 100)
+    return () => clearInterval(interval)
+  }, [approvalExpiresAt, expired])
+
+  return (
+    <div className="scroll h-full">
+      <div className="mx-auto flex min-h-full w-full max-w-md flex-col justify-center gap-7 px-6 py-10">
+        <div className="space-y-2">
+          <div className="mb-5 flex size-12 items-center justify-center rounded-2xl bg-amber-dim text-amber-glow">
+            <Spinner className="size-6" />
+          </div>
+          <h1 className="text-[26px] font-semibold leading-tight tracking-[-0.02em]">Waiting for approval</h1>
+          <p className="text-[15px] leading-relaxed text-ink-300">
+            Open the control page on your Mac and allow this phone. Run <span className="font-mono">npx dorabot-remote open</span> on the Mac if the page isn't open.
+          </p>
+        </div>
+
+        {expired ? (
+          <>
+            <div className="space-y-3">
+              <p className="text-[15px] leading-relaxed text-rose-glow">
+                This request expired. Pair again.
+              </p>
+            </div>
+            <Button variant="primary" onClick={onUnpair} className="w-full">
+              Pair again
+            </Button>
+          </>
+        ) : (
+          <>
+            <div className="space-y-2">
+              <p className="text-[13px] font-medium uppercase tracking-wider text-ink-400">Expires in</p>
+              <p className="text-[28px] font-semibold font-mono text-ink-200">
+                {formatCountdown(timeLeft)}
+              </p>
+            </div>
+            <div className="space-y-3">
+              <Button variant="primary" disabled className="w-full">
+                Waiting…
+              </Button>
+              <Button variant="ghost" onClick={onUnpair} className="w-full">
+                Cancel
+              </Button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
   )
 }
