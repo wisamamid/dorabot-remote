@@ -6,6 +6,7 @@ import { RemoteClient, decodePairingPayload, pairWithHost, type PairResult } fro
 import { WebSocket } from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Bridge } from './bridge.js'
+import { loadControlSecret } from './control-auth.js'
 import { DeviceConnection } from './connection.js'
 import { FakeGateway } from '../test/fake-gateway.js'
 import { loadSettings, readDorabotVersion, resolvePaths, type BridgePaths } from './config.js'
@@ -25,7 +26,9 @@ let paths: BridgePaths
 
 async function pair(scopes?: string[]): Promise<PairResult> {
   const { uri } = bridge.newPairingPayload(scopes as never)
-  return pairWithHost({ payload: decodePairingPayload(uri), deviceName: 'T', platform: 'ios', createSocket })
+  const res = await pairWithHost({ payload: decodePairingPayload(uri), deviceName: 'T', platform: 'ios', createSocket })
+  bridge.approveDevice(res.deviceId)
+  return res
 }
 type Ev = { event: string; data: any; seq?: number }
 async function connect(p: PairResult, extra: { lastSeq?: number } = {}): Promise<{ c: RemoteClient; ev: Ev[] }> {
@@ -193,7 +196,7 @@ describe('control page host/origin checks', () => {
   const get = (host: string, origin?: string) =>
     new Promise<number>((resolve, reject) => {
       const req = request(
-        { host: '127.0.0.1', port: PORT, path: '/api/state', headers: { host, ...(origin ? { origin } : {}) } },
+        { host: '127.0.0.1', port: PORT, path: '/api/state', headers: { host, authorization: `Bearer ${loadControlSecret(home)}`, ...(origin ? { origin } : {}) } },
         (res) => { res.resume(); resolve(res.statusCode ?? 0) },
       )
       req.on('error', reject)

@@ -59,6 +59,7 @@ export interface ConnectionHost {
   protectedPaths?(): string[]
   /** Folders shared with phones. Absent or empty means no file access at all. */
   allowedRoots?(): string[]
+  auditRpc?(conn: DeviceConnection, method: string, requestId: string | number | undefined, params: Record<string, unknown>): void // SEC-S3
 }
 
 /**
@@ -203,6 +204,8 @@ export class DeviceConnection {
         this.fail('revoked', 'access for this device was revoked')
         return
       }
+      if (device.pending) { this.fail('pending', 'waiting for approval on your Mac'); return } // SEC-S3
+
       this.device = device
 
       this.ephemeral = generateIdentity(s)
@@ -314,6 +317,7 @@ export class DeviceConnection {
     // without `terminal`). Done once, before anything is forwarded.
     params = sanitizeParams(env.method, params, this.device.scopes)
 
+    this.host.auditRpc?.(this, env.method, env.id, params) // SEC-S3: audit log hook
     try {
       // Subscriptions are served by the bridge, not the gateway. The bridge holds
       // one subscription upstream covering every session and keeps its own durable
