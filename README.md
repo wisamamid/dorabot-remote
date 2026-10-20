@@ -1,5 +1,7 @@
 # dorabot remote
 
+[![npm package](https://img.shields.io/npm/v/dorabot-remote.svg?label=npm&color=0c8de6)](https://www.npmjs.com/package/dorabot-remote)
+
 Pair your phone with your own [dorabot](https://github.com/suitedaces/dorabot) and
 run real work from it.
 
@@ -24,11 +26,11 @@ nothing is listening on a port.
 
 The cost is that when dorabot blocks waiting for you to approve a command, it
 blocks until you are physically back at that Mac. A tool approval has **no server
-side timeout at all** — the agent waits forever. A question gets five minutes and
+side timeout at all** - the agent waits forever. A question gets five minutes and
 then fails the whole turn.
 
 This project adds a small daemon beside dorabot that lets a phone you have
-explicitly paired answer those prompts, without changing a line of dorabot itself.
+explicitly paired answer those prompts without changing a line of dorabot itself.
 
 ## How it fits together
 
@@ -54,24 +56,37 @@ update underneath it.
 
 ## Install
 
-Needs Node 22.5 or newer, and dorabot already set up on the same machine.
+One command to get started (requires Node 22.13 or newer and dorabot installed and running):
+
+```bash
+npx dorabot-remote setup
+```
+
+This installs the bridge and runs it at login. To update to the latest version:
+
+```bash
+npx dorabot-remote@latest update
+```
+
+To uninstall:
+
+```bash
+npx dorabot-remote uninstall
+# Add --purge to also delete keys and paired devices
+```
+
+**From source** (for development or if you prefer to build):
 
 ```bash
 git clone https://github.com/wisamamid/dorabot-remote
 cd dorabot-remote
 npm install
 npm run build
-```
-
-Start the bridge:
-
-```bash
 npm run bridge
-# or, once linked:  dorabot-remote start --open
 ```
 
 It prints the addresses your phone can reach the Mac on and opens a control page
-at `http://127.0.0.1:7788`. That page is bound to loopback only — the LAN can
+at `http://127.0.0.1:7788`. That page is bound to loopback only - the LAN can
 reach the pairing and connection sockets, never the control surface.
 
 ## Pairing
@@ -95,8 +110,8 @@ half. **The dorabot gateway token never leaves the Mac.**
 
 ## Working from anywhere
 
-The QR lists every address the Mac is reachable on — each LAN IP, the `.local`
-name, and any Tailscale address — and the app races them all on every connect.
+The QR lists every address the Mac is reachable on - each LAN IP, the `.local`
+name, and any Tailscale address - and the app races them all on every connect.
 
 So "same wifi" and "anywhere over Tailscale" are the same code path. Walk out of
 the house with Tailscale on and the app re-races, finds the Tailnet address and
@@ -157,7 +172,7 @@ destroy credentials and have no business being reachable from a phone.
 Off by default, and the app says so plainly rather than hiding the feature.
 
 This is not decoration. The gateway broadcasts `shell.data` to **every**
-authenticated client, carrying a `shellId` but no session key — meaning the raw
+authenticated client, carrying a `shellId` but no session key - meaning the raw
 byte stream of every terminal open on the machine, including ones you opened
 yourself, with no filtering of any kind.
 
@@ -191,7 +206,7 @@ master    = BLAKE2b-64(ss_eph ‖ ss_static ‖ transcript)
 `ss_eph` gives forward secrecy, so stealing a long term key later does not decrypt
 recorded traffic. `ss_static` gives mutual authentication, since an attacker with
 only the public keys cannot compute it. If a device presents the wrong long term
-key, the derived keys differ and its very first frame fails to decrypt — that
+key, the derived keys differ and its very first frame fails to decrypt - that
 failure *is* the authentication.
 
 **Why plain `ws://` and not TLS.** The bridge lives at an address that moves with
@@ -219,7 +234,7 @@ phone that was in a tunnel for an hour would reconnect to nothing.
 The bridge keeps its own SQLite log (a week by default) and replays from it in
 paced chunks. That pacing matters for a second reason: the gateway's own replay
 path does not check backpressure but its live broadcast path does, closing any
-client over 2 MiB buffered — so asking it for a large replay gets you disconnected
+client over 2 MiB buffered - so asking it for a large replay gets you disconnected
 by the very data you asked for. The bridge absorbs that.
 
 ## Commands
