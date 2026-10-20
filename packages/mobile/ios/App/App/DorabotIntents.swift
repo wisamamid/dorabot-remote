@@ -39,13 +39,13 @@ struct DorabotIntentError: Error, CustomLocalizedStringResourceConvertible {
 @available(iOS 16.0, *)
 struct AskDorabotIntent: AppIntent {
     static var title: LocalizedStringResource = "Ask dorabot"
-    static var description = IntentDescription("Start a new dorabot session on your Mac with a prompt.")
+    static var description = IntentDescription("Start a new dorabot session on your computer with a prompt.")
     static var openAppWhenRun: Bool = true
 
     @Parameter(title: "Prompt", requestValueDialog: "What should dorabot do?")
     var prompt: String
 
-    @Parameter(title: "Mac", description: "The name of a paired Mac. Leave empty to use the active Mac.")
+    @Parameter(title: "Computer", description: "The name of a paired computer. Leave empty to use the active computer.")
     var mac: String?
 
     static var parameterSummary: some ParameterSummary {
