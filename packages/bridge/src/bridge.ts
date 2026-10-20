@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http'
 import type { Socket } from 'node:net'
 import {
@@ -7,7 +8,10 @@ import {
   encodePairingPayload,
   fingerprint,
   fromB64,
+  deriveRelayToken,
   isRelayUrlConfigured,
+  newRelayToken,
+  relayTokenHash,
   relayIdFromPublicKey,
   openSealedJson,
   sealJson,
@@ -44,6 +48,13 @@ import type { DeviceSocket } from './device-socket.js'
 import { PushNotifier, PUSH_TOKEN_RE } from './push.js'
 import { parsePushKey } from './push-content.js'
 import { RelayClient, type RelayState } from './relay-client.js'
+
+// [SEC-RELAY] Relay access control. See docs on enforcement in syncRelayAccess().
+const RELAY_DELIVERED_KEY = 'relay.tokensDelivered'
+const RELAY_ENFORCE_KEY = 'relay.enforce'
+const RELAY_SINCE_KEY = 'relay.accessSince'
+/** Enforcement turns on at the latest this long after the first start with tokens, even if an old phone never reconnected. */
+export const RELAY_ENFORCE_AFTER_MS = 14 * 24 * 60 * 60 * 1000
 import { CONTROL_PAGE } from './control-page.js'
 import { GatewayClient } from './gateway-client.js'
 import { applyEventToSnapshots } from './snapshot-state.js'
@@ -85,6 +96,10 @@ export class Bridge implements ConnectionHost {
   private idleTimer: NodeJS.Timeout | null = null
   private relay: RelayClient | null = null
   private relayInfo: RelayInfo | null = null
+  /** [SEC-RELAY] Secret the per-device relay tokens are derived from (HMAC), itself derived from the host signing key. */
+  private relaySecret: Uint8Array | null = null
+  /** [SEC-RELAY] Live single-use pairing tickets by pairing code. */
+  private relayTickets = new Map<string, { tok: string; exp: number }>()
   private pusher: PushNotifier | null = null
   readonly logLines: string[] = []
 
@@ -114,6 +129,7 @@ export class Bridge implements ConnectionHost {
     if (this.settings.relay.enabled && isRelayUrlConfigured(this.settings.relay.url)) {
       const key = loadSigningKey(this.paths)
       this.relayInfo = { u: this.settings.relay.url.replace(/\/+$/, ''), i: relayIdFromPublicKey(key.publicKey) }
+      this.relaySecret = new Uint8Array(createHash('sha256').update('dorabot-relay-token-secret/v1').update(key.privateKey).digest())
       this.pusher = new PushNotifier({
         store: this.store,
         relay: { url: this.relayInfo.u, id: this.relayInfo.i },
@@ -152,12 +168,15 @@ export class Bridge implements ConnectionHost {
     await this.listen()
     if (this.relay) {
       this.relay.on('state', (s) => this.broadcastBridgeEvent('remote.relay_state', { state: s }))
+      this.syncRelayAccess()
       this.relay.start()
     }
 
     // The CLI revokes and grants from another process, straight into the DB.
     this.deviceTimer = setInterval(() => {
       for (const c of [...this.connections]) c.recheckDevice()
+      // Also picks up CLI revocations, which write straight into the DB.
+      this.syncRelayAccess()
     }, 5000)
 
     this.idleTimer = setInterval(() => this.sweepIdle(), IDLE_SWEEP_MS)
@@ -475,7 +494,7 @@ export class Bridge implements ConnectionHost {
   ): Promise<unknown> {
     switch (method) {
       case 'remote.hello':
-        return { host: this.hostSummary, device: conn.device ? this.deviceSummary(conn.device) : null }
+        return { host: conn.device ? this.hostSummaryFor(conn.device) : this.hostSummary, device: conn.device ? this.deviceSummary(conn.device) : null }
 
       case 'remote.health':
         return {
@@ -498,6 +517,7 @@ export class Bridge implements ConnectionHost {
         for (const c of this.connections) {
           if (c.device?.id === id) c.close('revoked')
         }
+        this.syncRelayAccess() // [SEC-RELAY] drop its relay token hash now
         return { revoked: ok }
       }
 
@@ -617,11 +637,75 @@ export class Bridge implements ConnectionHost {
   }
 
   // -------------------------------------------------------------------------
+  // [SEC-RELAY] Relay access control
+  // -------------------------------------------------------------------------
+
+  private relayTokenFor(deviceId: string): string {
+    return deriveRelayToken(this.relaySecret!, deviceId)
+  }
+
+  /** Records that a device now holds its relay token (it was sent over the E2E channel). */
+  private markRelayTokenDelivered(deviceId: string): void {
+    const d = this.store.getMeta<string[]>(RELAY_DELIVERED_KEY, [])
+    if (d.includes(deviceId)) return
+    this.store.setMeta(RELAY_DELIVERED_KEY, [...d, deviceId])
+    this.syncRelayAccess()
+  }
+
+  hostSummaryFor(device: { id: string }): HostSummary {
+    if (!this.relayInfo || !this.relaySecret) return this.hostSummary
+    this.markRelayTokenDelivered(device.id)
+    return { ...this.hostSummary, relay: { ...this.relayInfo, tok: this.relayTokenFor(device.id) } }
+  }
+
+  /**
+   * Tell the relay who may open a device socket: the hash of every non-revoked device's token plus the live
+   * pairing tickets (revoking a device drops its hash on the next sync, at most 5s later, at once via the
+   * control page). Sent in full each time; the relay ignores identical sets.
+   *
+   * Enforcement rule: the relay lets token-less (legacy) devices in until `enforce` is true. It becomes true,
+   * and then stays true (persisted), as soon as EVERY non-revoked device has been sent its token (i.e. has
+   * connected once with this bridge version), or 14 days after this feature first ran, whichever is first.
+   * A fresh install with no devices enforces at once; new phones get in with the QR's pairing ticket.
+   */
+  private syncRelayAccess(): void {
+    if (!this.relay || !this.relaySecret) return
+    const now = Date.now()
+    for (const [code, t] of this.relayTickets) if (t.exp <= now) this.relayTickets.delete(code)
+    const devices = this.store.listDevices().filter((d) => !d.revoked)
+    const delivered = new Set(this.store.getMeta<string[]>(RELAY_DELIVERED_KEY, []))
+    let since = this.store.getMeta<number>(RELAY_SINCE_KEY, 0)
+    if (!since) {
+      since = now
+      this.store.setMeta(RELAY_SINCE_KEY, since)
+    }
+    let enforce = this.store.getMeta<boolean>(RELAY_ENFORCE_KEY, false)
+    if (!enforce && (devices.every((d) => delivered.has(d.id)) || now - since >= RELAY_ENFORCE_AFTER_MS)) {
+      enforce = true
+      this.store.setMeta(RELAY_ENFORCE_KEY, true)
+      this.log('relay: access tokens are now enforced')
+    }
+    this.relay.setAccess({
+      tokens: devices.map((d) => relayTokenHash(this.relayTokenFor(d.id))),
+      tickets: [...this.relayTickets.values()].map((t) => relayTokenHash(t.tok)),
+      enforce,
+    })
+  }
+
+  // -------------------------------------------------------------------------
   // Pairing
   // -------------------------------------------------------------------------
 
   newPairingPayload(scopes: Scope[] = SCOPE_DEFAULTS): { payload: PairingPayload; uri: string; code: string } {
     const { code, expiresAt } = this.store.createPairing(this.settings.pairingTtlMs, scopes)
+    // [SEC-RELAY] A single-use ticket lets this one phone open the relay socket to pair; it lives as long as the code.
+    let relay: RelayInfo | null = this.relayInfo
+    if (this.relayInfo && this.relaySecret) {
+      const tok = newRelayToken()
+      this.relayTickets.set(code, { tok, exp: expiresAt })
+      relay = { ...this.relayInfo, tk: tok }
+      this.syncRelayAccess()
+    }
     const payload: PairingPayload = {
       v: PROTOCOL_VERSION,
       h: this.hostSummary.id,
@@ -630,7 +714,7 @@ export class Bridge implements ConnectionHost {
       c: code,
       a: candidateAddresses(this.settings.port, this.settings.extraAddresses, this.settings.bind).map((c) => c.address),
       e: expiresAt,
-      ...(this.relayInfo ? { r: this.relayInfo } : {}),
+      ...(relay ? { r: relay } : {}),
     }
     return { payload, uri: encodePairingPayload(payload), code }
   }
@@ -665,6 +749,11 @@ export class Bridge implements ConnectionHost {
           hostName: this.hostSummary.name,
           scopes,
           hostPublicKey: toB64(this.sodium, this.hostIdentity.publicKey),
+          ...(this.relaySecret ? { relayTok: this.relayTokenFor(device.id) } : {}), // [SEC-RELAY]
+        }
+        if (this.relaySecret) {
+          this.relayTickets.delete(req.code)
+          this.markRelayTokenDelivered(device.id)
         }
         const devicePk = fromB64(null, req.devicePublicKey)
         ws.send(JSON.stringify({ t: 'pair_ok', v: PROTOCOL_VERSION, sealed: sealJson(this.sodium, devicePk, response) }))
@@ -857,6 +946,7 @@ export class Bridge implements ConnectionHost {
           }
         }
       }
+      this.syncRelayAccess() // [SEC-RELAY] revoke/restore/delete change who may use the relay
       json(200, { ok })
       return
     }

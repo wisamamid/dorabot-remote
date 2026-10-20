@@ -19,14 +19,27 @@ import {
   encodeMux,
   encodeMuxClose,
   encodeMuxText,
+  newRelayToken,
+  relayAuthFrame,
   relayDeviceUrl,
   relayHostUrl,
   relayIdFromPublicKey,
+  relayTokenHash,
   signChallenge,
 } from '@dorabot-remote/protocol'
 import type { SigningKeyPair } from '@dorabot-remote/protocol'
 import WebSocket from 'ws'
 import type { DeviceSocket } from './device-socket.js'
+
+/**
+ * What the relay is told about who may open a device socket. Hashes only (see relayTokenHash).
+ * `enforce` false = the transition period: token-less (legacy) devices are still let in.
+ */
+export interface RelayAccess {
+  tokens: string[]
+  tickets: string[]
+  enforce: boolean
+}
 
 export type RelayState = 'connecting' | 'online' | 'offline'
 
@@ -164,6 +177,10 @@ export class RelayClient extends EventEmitter {
   selfTestsPassed = 0
   opensReceived = 0
   private authed = false
+  /** Random per process; its hash is always in the set sent to the relay so the self-test can get in. */
+  private readonly selfTestToken = newRelayToken()
+  private access: RelayAccess = { tokens: [], tickets: [], enforce: false }
+  private lastSent = ''
   /** Set by a close code that wants a long wait before the next try. */
   private slowRetry = false
 
@@ -175,6 +192,31 @@ export class RelayClient extends EventEmitter {
 
   get connectedDevices(): number {
     return this.sockets.size
+  }
+
+  /**
+   * Replace the relay's access set (full replacement). Sent now if the link is authenticated, and again after
+   * every reconnect. Call whenever devices or pairing tickets change; identical sets are not re-sent.
+   */
+  setAccess(access: RelayAccess): void {
+    this.access = access
+    if (this.authed && this.ws) this.sendAccess(this.ws)
+  }
+
+  private sendAccess(ws: WebSocket, force = false): void {
+    const frame = JSON.stringify({
+      t: 'tokens',
+      set: [...new Set([relayTokenHash(this.selfTestToken), ...this.access.tokens])],
+      tickets: this.access.tickets,
+      enforce: this.access.enforce,
+    })
+    if (!force && frame === this.lastSent) return
+    try {
+      ws.send(frame)
+      this.lastSent = frame
+    } catch {
+      // The link is dying; the reconnect resends.
+    }
   }
 
   start(): void {
@@ -324,6 +366,8 @@ export class RelayClient extends EventEmitter {
     this.authTimer = null
     this.authed = true
     this.slowRetry = false
+    // Before anything else: a device that arrives during startup must be judged against the current set.
+    this.sendAccess(ws, true)
     this.opts.log(`relay: online as ${this.relayId}`)
     this.setState('online')
     // Backoff resets only once the link has proven stable, so a relay that accepts
@@ -413,6 +457,8 @@ export class RelayClient extends EventEmitter {
     this.pendingSelfTest.probe = probe
     probe.on('open', () => {
       try {
+        // Present the dedicated self-test token like any phone would, then the probe.
+        probe!.send(relayAuthFrame(this.selfTestToken))
         probe!.send(JSON.stringify({ t: 'selftest', n }))
       } catch {
         // The timer reports it.

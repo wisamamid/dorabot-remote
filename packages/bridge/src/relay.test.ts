@@ -13,7 +13,9 @@ import {
   decodePairingPayload,
   generateSigningKey,
   pairWithHost,
+  relayAuthFrame,
   relayIdFromPublicKey,
+  relayTokenHash,
   type PairResult,
 } from '@dorabot-remote/protocol'
 import { WebSocket } from 'ws'
@@ -228,6 +230,40 @@ describe('relay liveness', () => {
     expect(relay.hostAttempts).toBe(1)
   })
 
+  it('syncs the access set on auth, on change and after a reconnect, always including the self-test hash', async () => {
+    const { client } = await make({ selfTest: false })
+    client.setAccess({ tokens: ['a'.repeat(64)], tickets: ['b'.repeat(64)], enforce: false })
+    client.start()
+    await until(() => relay.tokensFrames.length === 1, 5000, 'first tokens frame')
+    const first = relay.tokensFrames[0]!
+    expect(first.set).toContain('a'.repeat(64))
+    expect(first.set).toHaveLength(2) // + the self-test token's hash
+    expect(first.tickets).toEqual(['b'.repeat(64)])
+    expect(first.enforce).toBe(false)
+
+    client.setAccess({ tokens: [], tickets: [], enforce: true })
+    await until(() => relay.tokensFrames.length === 2, 5000, 'replacement frame')
+    expect(relay.tokensFrames[1]!.set).toHaveLength(1)
+    expect(relay.enforce).toBe(true)
+    // Unchanged set is not re-sent.
+    client.setAccess({ tokens: [], tickets: [], enforce: true })
+    await new Promise((r) => setTimeout(r, 100))
+    expect(relay.tokensFrames).toHaveLength(2)
+
+    relay.dropHost()
+    await until(() => relay.tokensFrames.length === 3, 10_000, 'resend after reconnect')
+    expect(relay.tokensFrames[2]!.enforce).toBe(true)
+  })
+
+  it('self-test presents its token and passes while the relay enforces', async () => {
+    const { client } = await make({ selfTestTimeoutMs: 2000, selfTestIntervalMs: 60_000 })
+    client.setAccess({ tokens: [], tickets: [], enforce: true })
+    client.start()
+    await until(() => client.selfTestsPassed === 1, 5000, 'self-test under enforcement')
+    expect(relay.enforce).toBe(true)
+    expect(relay.unauthorized).toBe(0)
+  })
+
   it('BLACK HOLE: the room answers heartbeats and pings but delivers nothing; self-test detects it and reconnects', async () => {
     const { client, logs } = await make({ selfTestTimeoutMs: 400, selfTestIntervalMs: 60_000, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 80 })
     relay.blackHole = true
@@ -405,7 +441,26 @@ describe('bridge through the relay', () => {
     const payload = decodePairingPayload(rig.bridge.newPairingPayload().uri)
     expect(payload.r?.u).toBe(relay.url)
     expect(payload.r?.i).toMatch(/^[A-Za-z0-9_-]{22}$/)
-    expect(rig.bridge.hostSummary.relay).toEqual(payload.r)
+    expect(rig.bridge.hostSummary.relay).toEqual({ u: payload.r!.u, i: payload.r!.i })
+    // The QR carries a single-use ticket whose hash the relay has been told about; never the host summary.
+    expect(payload.r?.tk).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(payload.r?.tok).toBeUndefined()
+  })
+
+  it('syncs token hashes to the relay: enforcing, ticket listed, paired device added, revoke removes it', async () => {
+    const payload = decodePairingPayload(rig.bridge.newPairingPayload().uri)
+    await until(() => relay.tickets.size >= 1, 3000, 'ticket pushed')
+    expect(relay.enforce).toBe(true)
+    const pair = await rig.pair()
+    expect(pair.relay?.tok).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(payload.r?.tk).not.toBe(pair.relay?.tok)
+    const before = relay.tokenSet.size
+    expect(relay.tokenSet.has(relayTokenHash(pair.relay!.tok!))).toBe(true)
+    const b = rig.bridge as unknown as { store: { setRevoked(id: string, r: boolean): boolean }; syncRelayAccess(): void }
+    b.store.setRevoked(pair.deviceId, true)
+    b.syncRelayAccess()
+    await until(() => !relay.tokenSet.has(relayTokenHash(pair.relay!.tok!)), 3000, 'revoked hash dropped')
+    expect(relay.tokenSet.size).toBe(before - 1)
   })
 
   it('pairs over the relay', async () => {
@@ -463,11 +518,22 @@ describe('bridge through the relay', () => {
     client.disconnect()
   }, 45_000)
 
+  it('refuses a device with no token once the bridge enforces (relay-side, 4401)', async () => {
+    const id = rig.bridge.hostSummary.relay!.i
+    const ws = new WebSocket(`${relay.url}/d/${id}`)
+    await new Promise((r) => ws.on('open', r))
+    const closed = new Promise<number>((r) => ws.on('close', (c) => r(c)))
+    ws.send(JSON.stringify({ t: 'hello' }))
+    expect(await closed).toBe(4401)
+  })
+
   it('closes a virtual socket whose first frame is neither pair nor hello', async () => {
     const id = rig.bridge.hostSummary.relay!.i
     const ws = new WebSocket(`${relay.url}/d/${id}`)
     await new Promise((r) => ws.on('open', r))
     const closed = new Promise<number>((r) => ws.on('close', (c) => r(c)))
+    // Past the relay (valid ticket) but not a pair/hello frame: the bridge's own check.
+    ws.send(relayAuthFrame(decodePairingPayload(rig.bridge.newPairingPayload().uri).r!.tk!))
     ws.send(JSON.stringify({ t: 'nonsense' }))
     expect(await closed).toBe(4400)
   })

@@ -39,6 +39,8 @@ export default {
         fetch: (input, init) => fetch(input, init),
         now: () => Date.now(),
         rateLimit: async () => (await stub.fetch(`https://room/rate/${relayId}`, { method: 'POST' })).status === 204,
+        dedupe: async (k) => (await stub.fetch(`https://room/dedupe/${relayId}`, { method: 'POST', body: JSON.stringify({ k }) })).status === 204,
+        forget: async (k) => void (await stub.fetch(`https://room/dedupe/${relayId}`, { method: 'POST', body: JSON.stringify({ k, forget: true }) })),
       })
     }
 

@@ -13,8 +13,8 @@ export class Peer {
   closed: { code: number; reason: string } | null = null
   private waiters: Array<() => void> = []
 
-  constructor(url: string) {
-    this.ws = new WebSocket(url)
+  constructor(url: string, opts: { headers?: Record<string, string>; protocols?: string[] } = {}) {
+    this.ws = new WebSocket(url, opts.protocols ?? [], { headers: opts.headers })
     this.ws.on('message', (raw: Buffer, isBinary: boolean) => {
       this.queue.push({ data: isBinary ? new Uint8Array(raw) : raw.toString(), isBinary })
       this.wake()

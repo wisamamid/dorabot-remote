@@ -31,8 +31,10 @@ afterAll(async () => {
 })
 
 const host = async (id = newIdentity()) => ({ id, peer: track(await connectHost(dev.ws, id)) })
+let ipSeq = 0
+/** Each test device gets its own CF-Connecting-IP so the per-IP caps (see access.test.ts) do not apply. */
 const device = async (relayId: string): Promise<Peer> => {
-  const d = track(new Peer(`${dev.ws}/d/${relayId}`))
+  const d = track(new Peer(`${dev.ws}/d/${relayId}`, { headers: { 'CF-Connecting-IP': `10.1.${(ipSeq >> 8) & 255}.${ipSeq++ & 255}` } }))
   await d.opened()
   return d
 }
