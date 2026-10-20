@@ -28,6 +28,7 @@ const ALLOW: Record<string, Allow[]> = {
   'chat.dismissElicitation': ['elicitationId', 'sessionKey'],
   'sessions.rename': ['sessionId', 'name', 'channel'],
   'sessions.setModel': ['sessionId', 'model'],
+  'sessions.get': ['sessionId', 'before', 'limit'],
   'agent.setModel': ['sessionKey', 'model'],
   'agent.run_background': ['prompt', 'sessionKey', 'model'],
   'shell.spawn': ['shellId', 'cols', 'rows', 'sessionKey'],
@@ -64,7 +65,17 @@ export function sanitizeParams(method: string, params: Record<string, unknown>, 
   for (const rule of rules) {
     const key = typeof rule === 'string' ? rule : rule.key
     if (typeof rule !== 'string' && !scopes.includes(rule.scope)) continue
-    if (Object.prototype.hasOwnProperty.call(params, key)) out[key] = params[key]
+    if (Object.prototype.hasOwnProperty.call(params, key)) {
+      const value = params[key]
+      // Validate numeric parameters for sessions.get pagination
+      if (method === 'sessions.get') {
+        if (key === 'before' || key === 'limit') {
+          if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) continue
+          if (key === 'limit' && value > 500) continue
+        }
+      }
+      out[key] = value
+    }
   }
   return out
 }

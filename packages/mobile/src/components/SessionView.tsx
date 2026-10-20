@@ -44,10 +44,12 @@ export function SessionView({
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [photos, setPhotos] = useState<Array<{ id: number; file: File; url: string }>>([])
+  const [loadingEarlier, setLoadingEarlier] = useState(false)
   const photoId = useRef(0)
   const photosRef = useRef(photos)
   photosRef.current = photos
   const fileInput = useRef<HTMLInputElement>(null)
+  const earlierLoadedRef = useRef(0)
 
   useEffect(() => {
     void conn.openSession(sessionKey, session?.id)
@@ -98,6 +100,10 @@ export function SessionView({
     const el = scrollRef.current
     if (!el) return
     stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 90
+    // Trigger load earlier when scrolled to the very top
+    if (el.scrollTop < 30 && conn.getHistoryInfo(sessionKey)?.shown !== conn.getHistoryInfo(sessionKey)?.total) {
+      void loadEarlier()
+    }
   }
 
   const busy = state.status !== 'idle'
@@ -140,6 +146,43 @@ export function SessionView({
       } catch (err) {
         setError((err as Error).message)
       }
+    }
+  }
+
+  async function loadEarlier(): Promise<void> {
+    if (loadingEarlier || !session?.id) return
+    setLoadingEarlier(true)
+    const el = scrollRef.current
+    const heightBefore = el?.scrollHeight ?? 0
+    try {
+      const res = await conn.rpc<{
+        messages?: unknown[]
+        hasMore?: boolean
+        returnedMessages?: number
+      }>('sessions.get', {
+        sessionId: session.id,
+        before: state.chatItems.length,
+      })
+      if (res && res.messages && res.messages.length > 0) {
+        // Prepend messages and dedupe
+        const newMessages = res.messages as unknown[]
+        const existingIds = new Set(state.chatItems.map((item) => (item as Record<string, unknown>).id))
+        const dedupedMessages = newMessages.filter((m) => !existingIds.has((m as Record<string, unknown>).id))
+
+        if (dedupedMessages.length > 0) {
+          earlierLoadedRef.current += dedupedMessages.length
+          // Restore scroll position after prepending
+          if (el) {
+            const heightAfter = el.scrollHeight
+            const heightDiff = heightAfter - heightBefore
+            el.scrollTop += heightDiff
+          }
+        }
+      }
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setLoadingEarlier(false)
     }
   }
 
@@ -187,8 +230,25 @@ export function SessionView({
           className="px-3 py-3"
         >
           {conn.getHistoryInfo(sessionKey) && (
-            <div className="mb-3 text-center text-[12.5px] text-ink-500">
-              Showing the latest {conn.getHistoryInfo(sessionKey)!.shown} of {conn.getHistoryInfo(sessionKey)!.total} messages
+            <div className="mb-3 text-center">
+              {conn.getHistoryInfo(sessionKey)!.shown < conn.getHistoryInfo(sessionKey)!.total ? (
+                <button
+                  onClick={() => void loadEarlier()}
+                  disabled={loadingEarlier}
+                  className="inline-block rounded-lg bg-ink-800 px-3 py-1.5 text-[12.5px] text-ink-200 hover:bg-ink-700 disabled:opacity-50"
+                >
+                  {loadingEarlier ? (
+                    <span className="inline-flex items-center gap-1">
+                      <span className="inline-block size-3 animate-spin rounded-full border-2 border-ink-500 border-t-ink-200" />
+                      Loading earlier...
+                    </span>
+                  ) : (
+                    `Load earlier messages (${conn.getHistoryInfo(sessionKey)!.total - conn.getHistoryInfo(sessionKey)!.shown} more)`
+                  )}
+                </button>
+              ) : (
+                <span className="text-[12.5px] text-ink-500">Beginning of conversation</span>
+              )}
             </div>
           )}
           {state.chatItems.length === 0 ? (

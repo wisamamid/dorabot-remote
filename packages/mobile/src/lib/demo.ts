@@ -303,7 +303,25 @@ export function createDemoClient(handlers: DemoHandlers, now: () => number = Dat
       case 'sessions.get': {
         const s = sessions.find((x) => x.id === params.sessionId)
         const key = s ? `${s.channel}:${s.chatType}:${s.chatId}` : ''
-        return { messages: history[key] ?? [] }
+        const allMessages = history[key] ?? []
+        const before = typeof params.before === 'number' ? params.before : 0
+        const limit = typeof params.limit === 'number' ? Math.min(params.limit, 500) : 500
+
+        if (before > 0 || limit < allMessages.length) {
+          const total = allMessages.length
+          const startIdx = Math.max(0, total - before - Math.min(limit, total - before))
+          const endIdx = total - before
+          const sliced = allMessages.slice(startIdx, endIdx)
+          return {
+            messages: sliced,
+            totalMessages: total,
+            returnedMessages: sliced.length,
+            startIndex: startIdx,
+            hasMore: startIdx > 0,
+          }
+        }
+
+        return { messages: allMessages }
       }
       case 'remote.pins.list':
         return pins

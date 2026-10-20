@@ -389,7 +389,11 @@ export class DeviceConnection {
       }
 
       const result = await this.host.callGateway(env.method, params)
-      reply(trimHistoryResult(env.method, filterSearchResult(env.method, result, guardCtx), this.ws.maxFrameBytes))
+      reply(trimHistoryResult(env.method, filterSearchResult(env.method, result, guardCtx), this.ws.maxFrameBytes, {
+        sessionId: typeof params.sessionId === 'string' ? params.sessionId : undefined,
+        before: typeof params.before === 'number' ? params.before : undefined,
+        limit: typeof params.limit === 'number' ? params.limit : undefined,
+      }))
     } catch (err) {
       fail((err as Error).message)
     }
