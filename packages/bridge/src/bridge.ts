@@ -1044,6 +1044,7 @@ export class Bridge implements ConnectionHost {
    */
   private routeRelaySocket(sock: DeviceSocket, remote: string): void {
     let routed = false
+    let strayAuthSeen = false
     const openedAt = Date.now()
     const timer = setTimeout(() => {
       if (!routed) {
@@ -1058,8 +1059,6 @@ export class Bridge implements ConnectionHost {
     })
     sock.on('message', (raw: Buffer, isBinary: boolean) => {
       if (routed) return
-      routed = true
-      clearTimeout(timer)
       let t: unknown
       let n: unknown
       try {
@@ -1071,6 +1070,14 @@ export class Bridge implements ConnectionHost {
       } catch {
         // Falls through to the unknown-frame close.
       }
+      // The relay consumes a device's {t:'auth'} frame itself. One that reaches us anyway (an older Room
+      // still running, or a relay that forwards it) is not the device's first real frame: drop it and wait.
+      if (t === 'auth' && !strayAuthSeen) {
+        strayAuthSeen = true
+        return
+      }
+      routed = true
+      clearTimeout(timer)
       if (t === 'selftest') {
         // Our own probe through the relay: proof that opens reach us. Never routed.
         this.relay?.confirmSelfTest(n)

@@ -34,7 +34,8 @@ type HostAtt = { role: 'host'; rid: string; n: string; authed: boolean; t0: numb
  * `dropped` marks a device the room closed because its host went away; no one needs telling.
  * `auth`: 'pending' = connected, no valid token yet, the host has NOT been told about it;
  * 'tok' / 'ticket' = presented a valid token / single-use ticket; 'legacy' = connected with no
- * token while the host had not enforced yet. `h` is the hash it authenticated with (for revocation).
+ * token while the host had not enforced yet (decided by its FIRST frame: while the host is not enforcing, a
+ * device is held 'pending' until that frame, so one that presents a token is checked before the host hears of it). `h` is the hash it authenticated with (for revocation).
  */
 type DevAtt = {
   role: 'dev'
@@ -43,6 +44,8 @@ type DevAtt = {
   t0?: number
   dropped?: boolean
   auth: 'pending' | 'legacy' | 'tok' | 'ticket'
+  /** Pending, but allowed to become 'legacy' if its first frame is not an auth frame (host not enforcing at accept time). */
+  lg?: boolean
   h?: string
   ip?: string
 }
@@ -217,7 +220,7 @@ export class Room extends DurableObject<Env> {
     }
     const devices = this.devices()
     const atts = devices.map((d) => d.deserializeAttachment() as DevAtt | null)
-    const joined = atts.filter((a) => a && a.auth !== 'pending').length
+    const joined = atts.filter((a) => a && (a.auth !== 'pending' || a.lg)).length
     if (joined >= LIMITS.maxDevices) {
       rlog('device_rejected', relayId, { reason: 'too_many_devices' })
       rejectSoon(ws, RELAY_CLOSE.rateLimited, 'too_many_devices')
@@ -252,12 +255,15 @@ export class Room extends DurableObject<Env> {
       att.auth = c.via
       att.h = c.h
     } else if (!this.access.enforce) {
-      att.auth = 'legacy'
+      // Transition period: a token-less device may come in, but whether this one is token-less is only known
+      // from its first frame, so it is not announced to the host until then.
+      att.lg = true
     }
     ws.serializeAttachment(att)
     if (att.auth === 'pending') {
-      // Not announced to the host: it learns about a device only once the device has authenticated.
-      void this.armAlarm(att.t0! + LIMITS.deviceAuthTimeoutMs)
+      // Not announced to the host: it learns about a device only once the device has authenticated (or, in the
+      // transition period, has stayed silent through the grace period or sent a non-auth first frame).
+      void this.armAlarm(att.t0! + (att.lg ? LIMITS.legacyGraceMs : LIMITS.deviceAuthTimeoutMs))
       return
     }
     this.admit(ws, att, host)
@@ -484,15 +490,11 @@ export class Room extends DurableObject<Env> {
       tryClose(ws, RELAY_CLOSE.hostOffline, 'host_offline')
       return
     }
-    if (att.auth === 'pending' || att.auth === 'legacy') {
-      // Pending: the first frame must be {t:'auth',tok}. Legacy (host not enforcing yet): a token frame
-      // is consumed too, but anything else is ordinary traffic.
+    if (att.auth === 'pending') {
+      // The first frame decides. A valid {t:'auth',tok} is consumed (never forwarded) and admits the device. A
+      // bad token is refused without the host ever hearing of the device. Any other first frame is only
+      // acceptable from a token-less device while the host is not enforcing (the transition period).
       const cred = this.parseAuthFrame(message)
-      if (att.auth === 'pending' && cred === undefined) {
-        rlog('device_rejected', att.rid ?? '', { reason: 'no_token', conn: att.connId })
-        tryClose(ws, RELAY_CLOSE.unauthorized, 'unauthorized')
-        return
-      }
       if (cred !== undefined) {
         const c = this.checkCredential(cred)
         if (!c) {
@@ -500,10 +502,33 @@ export class Room extends DurableObject<Env> {
           tryClose(ws, RELAY_CLOSE.unauthorized, 'unauthorized')
           return
         }
-        const wasPending = att.auth === 'pending'
         const next: DevAtt = { ...att, auth: c.via, h: c.h }
+        delete next.lg
         ws.serializeAttachment(next)
-        if (wasPending) this.admit(ws, next, host)
+        this.admit(ws, next, host)
+        return
+      }
+      if (!att.lg || this.access.enforce) {
+        rlog('device_rejected', att.rid ?? '', { reason: 'no_token', conn: att.connId })
+        tryClose(ws, RELAY_CLOSE.unauthorized, 'unauthorized')
+        return
+      }
+      const legacy: DevAtt = { ...att, auth: 'legacy' }
+      delete legacy.lg
+      ws.serializeAttachment(legacy)
+      this.admit(ws, legacy, host)
+      att = legacy
+    } else if (att.auth === 'legacy') {
+      // Legacy devices admitted by an earlier Room version may still present a token; consume it.
+      const cred = this.parseAuthFrame(message)
+      if (cred !== undefined) {
+        const c = this.checkCredential(cred)
+        if (!c) {
+          rlog('device_rejected', att.rid ?? '', { reason: 'bad_token', conn: att.connId })
+          tryClose(ws, RELAY_CLOSE.unauthorized, 'unauthorized')
+          return
+        }
+        ws.serializeAttachment({ ...att, auth: c.via, h: c.h } satisfies DevAtt)
         return
       }
     }
@@ -571,6 +596,18 @@ export class Room extends DurableObject<Env> {
         if (deadline <= now + 50) {
           rlog('host_auth_fail', att.rid, { reason: 'auth_timeout' })
           tryClose(w, RELAY_CLOSE.unauthorized, 'auth_timeout')
+        } else consider(deadline)
+      } else if (att.auth === 'pending' && att.lg && !this.access.enforce) {
+        // Silent through the grace period: a token-less (legacy) device, announced now.
+        const deadline = (att.t0 ?? now) + LIMITS.legacyGraceMs
+        if (deadline <= now + 50) {
+          const host = this.authedHost()
+          if (host && w.readyState === OPEN) {
+            const legacy: DevAtt = { ...att, auth: 'legacy' }
+            delete legacy.lg
+            w.serializeAttachment(legacy)
+            this.admit(w, legacy, host)
+          } else tryClose(w, RELAY_CLOSE.hostOffline, 'host_offline')
         } else consider(deadline)
       } else if (att.auth === 'pending') {
         const deadline = (att.t0 ?? now) + LIMITS.deviceAuthTimeoutMs

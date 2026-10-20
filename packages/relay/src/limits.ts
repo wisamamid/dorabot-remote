@@ -49,6 +49,8 @@ export const LIMITS = {
   /** Sockets that have connected but not yet presented a token. */
   maxPendingDevices: 32,
   deviceAuthTimeoutMs: 5000,
+  /** Transition period: how long a device that has sent nothing is held back before it is admitted as token-less (legacy). */
+  legacyGraceMs: 300,
   /** Per client IP (CF-Connecting-IP), per room. */
   ipConnsPerWindow: 20,
   ipWindowMs: 60_000,
