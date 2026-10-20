@@ -37,6 +37,8 @@ export interface ConnectionHost {
   sodium: Sodium
   hostIdentity: KeyPair
   hostSummary: HostSummary
+  /** [SEC-RELAY] hostSummary plus this device's relay token (and records that it was delivered). */
+  hostSummaryFor(device: { id: string }): HostSummary
   getDevice(id: string): DeviceRecord | null
   touchDevice(id: string): void
   deviceSummary(device: DeviceRecord): DeviceSummary
@@ -264,7 +266,7 @@ export class DeviceConnection {
         this.send({
           t: 'ready',
           device: this.host.deviceSummary(device),
-          host: this.host.hostSummary,
+          host: this.host.hostSummaryFor(device), // [SEC-RELAY] carries this device's relay token
           allowed: methodsForScopes(device.scopes),
           seq: this.host.currentSeq(),
           gatewayConnected: this.host.gatewayConnected(),

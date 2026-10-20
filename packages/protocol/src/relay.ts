@@ -9,6 +9,8 @@
  */
 import { ed25519 } from '@noble/curves/ed25519.js'
 import { blake2b } from '@noble/hashes/blake2.js'
+import { hmac } from '@noble/hashes/hmac.js'
+import { sha256 } from '@noble/hashes/sha2.js'
 import { randomBytes } from '@noble/hashes/utils.js'
 import { fromB64, toB64, utf8 } from './crypto.js'
 
@@ -27,6 +29,10 @@ export interface RelayInfo {
   u: string
   /** relayId of the host. */
   i: string
+  /** This device's relay access token. Sent to the relay as the first frame (see relayAuthFrame). Persist it with the pairing. */
+  tok?: string
+  /** Single-use pairing ticket, only ever present in the QR payload. Accepted by the relay once, for the pairing connection. */
+  tk?: string
 }
 
 /** Close codes shared by relay, bridge and phone. */
@@ -47,6 +53,14 @@ export const RELAY_MAX_FRAME_BYTES = 1024 * 1024
 export const RELAY_HB_REQUEST = '{"t":"hb"}'
 export const RELAY_HB_RESPONSE = '{"t":"hb_ack"}'
 export const RELAY_MAX_DEVICES = 32
+/** A device socket that has not presented a valid token within this long is closed 4401. */
+export const RELAY_DEVICE_AUTH_MS = 5000
+/** Prefix of the Sec-WebSocket-Protocol value that carries a token instead of a first frame. */
+export const RELAY_TOKEN_PROTOCOL_PREFIX = 'dorabot.tok.'
+export const RELAY_TOKEN_RE = /^[A-Za-z0-9_-]{16,64}$/
+export const RELAY_HASH_RE = /^[0-9a-f]{64}$/
+export const RELAY_MAX_TOKENS = 200
+export const RELAY_MAX_TICKETS = 16
 /** The phone gives LAN candidates this long to answer before it also tries the relay. */
 export const RELAY_HEAD_START_MS = 1200
 
@@ -82,6 +96,45 @@ export function relayHostUrl(info: RelayInfo): string {
 
 export function relayDeviceUrl(info: RelayInfo): string {
   return `${info.u.replace(/\/+$/, '')}/d/${info.i}`
+}
+
+// ---------------------------------------------------------------------------
+// Access tokens. The relay stores only SHA-256 hashes; the bridge tells it the
+// current set over the authenticated host link: {t:'tokens', set, tickets, enforce}.
+// ---------------------------------------------------------------------------
+
+/** A fresh random 32-byte token, base64url. */
+export function newRelayToken(): string {
+  return toB64(null, randomBytes(32))
+}
+
+/** Deterministic per-device token: HMAC(secret, "dorabot-relay-token/v1|deviceId"), base64url. */
+export function deriveRelayToken(secret: Uint8Array, deviceId: string): string {
+  return toB64(null, hmac(sha256, secret, utf8(null, `dorabot-relay-token/v1|${deviceId}`)))
+}
+
+/** Lowercase hex SHA-256 of the token string; what the relay stores and compares. */
+export function relayTokenHash(token: string): string {
+  return Array.from(sha256(utf8(null, token)), (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** First frame a device sends on /d/<relayId>. */
+export function relayAuthFrame(token: string): string {
+  return JSON.stringify({ t: 'auth', tok: token })
+}
+
+/** The Sec-WebSocket-Protocol alternative to relayAuthFrame. */
+export function relayTokenProtocol(token: string): string {
+  return `${RELAY_TOKEN_PROTOCOL_PREFIX}${token}`
+}
+
+/** Host -> relay: replaces the access state. `set` = device/self-test token hashes, `tickets` = single-use pairing tickets. */
+export interface RelayTokensFrame {
+  t: 'tokens'
+  set: string[]
+  tickets?: string[]
+  /** When true, a device with no valid token is refused. Until then, token-less (legacy) devices still connect. */
+  enforce: boolean
 }
 
 // ---------------------------------------------------------------------------

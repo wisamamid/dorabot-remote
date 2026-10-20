@@ -18,7 +18,7 @@ import {
   toB64,
 } from './crypto.js'
 import { openSealedJson } from './crypto.js'
-import { RELAY_HEAD_START_MS, relayDeviceUrl, type RelayInfo } from './relay.js'
+import { RELAY_HEAD_START_MS, relayAuthFrame, relayDeviceUrl, type RelayInfo } from './relay.js'
 import { methodsForScopes } from './policy.js'
 import type { DeviceSummary, Envelope, HostSummary, PairingPayload, Scope } from './wire.js'
 
@@ -190,6 +190,8 @@ export async function pairWithHost(args: {
 
       bind(socket, {
         open: () => {
+          // [SEC-RELAY] Over the relay, the QR's single-use ticket is the first frame.
+          if (transport === 'relay' && args.payload.r?.tk) socket.send(relayAuthFrame(args.payload.r.tk))
           const request: PairingRequest = {
             v: PROTOCOL_VERSION,
             code: args.payload.c,
@@ -226,7 +228,8 @@ export async function pairWithHost(args: {
               // Keep every candidate: the phone will move between WiFi and
               // Tailscale and should re-race them rather than re-pair.
               addresses: [...(transport === 'lan' ? [address] : []), ...args.payload.a.filter((a) => a !== address)],
-              relay: args.payload.r,
+              // [SEC-RELAY] The ticket is spent; keep the long-lived token the host sealed to us.
+              relay: args.payload.r ? { u: args.payload.r.u, i: args.payload.r.i, ...(res.relayTok ? { tok: res.relayTok } : {}) } : undefined,
               transport,
             })
           } catch (err) {
@@ -631,6 +634,8 @@ export class RemoteClient {
               else lose('no handshake response')
             }, RELAY_HANDSHAKE_WATCHDOG_MS)
           }
+          // [SEC-RELAY] The relay wants the device token before it will forward anything.
+          if (transport === 'relay' && this.relay?.tok) socket.send(relayAuthFrame(this.relay.tok))
           socket.send(
             JSON.stringify({
               t: 'hello',
@@ -764,7 +769,7 @@ export class RemoteClient {
         // An already-paired phone learns the relay the first time it reaches the
         // host over LAN, with no re-pairing.
         if (env.host.relay) {
-          const changed = !this.relay || this.relay.u !== env.host.relay.u || this.relay.i !== env.host.relay.i
+          const changed = !this.relay || this.relay.u !== env.host.relay.u || this.relay.i !== env.host.relay.i || this.relay.tok !== env.host.relay.tok // [SEC-RELAY] token changes persist too
           this.relay = env.host.relay
           if (changed) {
             this.log(`relay learned from host: ${env.host.relay.u} id=${env.host.relay.i.slice(0, 6)}`)

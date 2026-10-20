@@ -30,6 +30,7 @@ function harness(status = 200, reason?: string, over: Partial<PushDeps> = {}) {
     serviceAccount: undefined,
     now: () => Date.now(),
     rateLimit: async () => true,
+    dedupe: async () => true,
     apns: { keyP8, keyId: 'KEY1234567', teamId: 'TEAM123456' },
     apnsCache,
     fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {

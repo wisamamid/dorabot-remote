@@ -7,7 +7,12 @@ import {
   encodeMuxClose,
   encodeMuxText,
   generateSigningKey,
+  deriveRelayToken,
   isRelayId,
+  newRelayToken,
+  relayAuthFrame,
+  relayTokenHash,
+  relayTokenProtocol,
   newChallengeNonce,
   relayDeviceUrl,
   relayHostUrl,
@@ -127,5 +132,31 @@ describe('challenge signatures', () => {
     const { pk, sig } = signBytes(k, body)
     expect(verifyForRelayId(id, pk, sig, body)).toBe(true)
     expect(verifyForRelayId(id, pk, sig, new TextEncoder().encode('{"a":2}'))).toBe(false)
+  })
+})
+
+describe('relay access tokens', () => {
+  it('newRelayToken is 32 random bytes in base64url', () => {
+    const t = newRelayToken()
+    expect(t).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(newRelayToken()).not.toBe(t)
+  })
+
+  it('hashes to lowercase hex SHA-256 of the token text', () => {
+    expect(relayTokenHash('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+  })
+
+  it('derives a stable per-device token that differs per device and per secret', () => {
+    const secret = new Uint8Array(32).fill(7)
+    const a = deriveRelayToken(secret, 'dev-1')
+    expect(a).toBe(deriveRelayToken(secret, 'dev-1'))
+    expect(a).not.toBe(deriveRelayToken(secret, 'dev-2'))
+    expect(a).not.toBe(deriveRelayToken(new Uint8Array(32).fill(8), 'dev-1'))
+    expect(a).toMatch(/^[A-Za-z0-9_-]{43}$/)
+  })
+
+  it('frames the token for the first frame and for Sec-WebSocket-Protocol', () => {
+    expect(JSON.parse(relayAuthFrame('t'.repeat(20)))).toEqual({ t: 'auth', tok: 't'.repeat(20) })
+    expect(relayTokenProtocol('abc')).toBe('dorabot.tok.abc')
   })
 })

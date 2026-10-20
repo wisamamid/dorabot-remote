@@ -222,10 +222,23 @@ export interface PushDeps {
   now: () => number
   /** True if this relayId is still within its push budget. */
   rateLimit: () => Promise<boolean>
+  /**
+   * Replay guard: true the first time `key` is seen within the dedupe window (and records it),
+   * false for a repeat. `forget` un-records it after a failed send so a retry is not refused.
+   */
+  dedupe: (key: string) => Promise<boolean>
+  forget?: (key: string) => Promise<void>
   cache?: TokenCache
   /** APNs credentials (Worker secrets); absent means iOS push is off. */
   apns?: { keyP8?: string; keyId?: string; teamId?: string; topic?: string }
   apnsCache?: ApnsCache
+}
+
+/** (rid, kind, device token) when there is a rid; otherwise the exact body, which carries its own ts. */
+async function dedupeKey(body: PushBody, raw: Uint8Array): Promise<string> {
+  const material = body.rid ? new TextEncoder().encode(`${body.rid}\n${body.kind}\n${body.platform}\n${body.token}`) : raw
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', material))
+  return Array.from(d.subarray(0, 16), (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 const json = (status: number, body: unknown): Response =>
@@ -252,10 +265,22 @@ export async function handlePush(request: Request, relayId: string, deps: PushDe
   if (!body) return json(400, { error: 'bad_request' })
   if (Math.abs(deps.now() - body.ts) >= LIMITS.pushMaxAgeMs) return json(400, { error: 'stale_timestamp' })
 
+  // A signed body is valid for 60s, so without this a captured one could be replayed (and re-sent to the
+  // phone) for that whole minute. Keyed per device token, so one event fanned out to several phones is fine.
+  const key = await dedupeKey(body, raw)
+  if (!(await deps.dedupe(key))) return json(409, { error: 'duplicate' })
+  const forget = (): Promise<void> => deps.forget?.(key) ?? Promise.resolve()
+
   if (body.platform === 'ios') {
     const a = deps.apns
-    if (!a?.keyP8 || !a.keyId || !a.teamId) return json(503, { error: 'push_not_configured' })
-    if (!(await deps.rateLimit())) return json(429, { error: 'rate_limited' })
+    if (!a?.keyP8 || !a.keyId || !a.teamId) {
+      await forget()
+      return json(503, { error: 'push_not_configured' })
+    }
+    if (!(await deps.rateLimit())) {
+      await forget()
+      return json(429, { error: 'rate_limited' })
+    }
     try {
       const r = await sendApns(
         body,
@@ -264,22 +289,37 @@ export async function handlePush(request: Request, relayId: string, deps: PushDe
         deps.now(),
         deps.apnsCache,
       )
+      if (r.status >= 500) await forget()
       return r.status === 204 ? new Response(null, { status: 204 }) : json(r.status, r.body)
     } catch {
+      await forget()
       return json(502, { error: 'push_failed' })
     }
   }
 
-  if (!deps.serviceAccount) return json(503, { error: 'push_not_configured' })
+  if (!deps.serviceAccount) {
+
+    await forget()
+
+    return json(503, { error: 'push_not_configured' })
+
+  }
   let sa: ServiceAccount
   try {
     sa = JSON.parse(deps.serviceAccount) as ServiceAccount
     if (!sa.client_email || !sa.private_key || !sa.project_id) throw new Error('incomplete')
   } catch {
+    await forget()
     return json(503, { error: 'push_not_configured' })
   }
 
-  if (!(await deps.rateLimit())) return json(429, { error: 'rate_limited' })
+  if (!(await deps.rateLimit())) {
+
+    await forget()
+
+    return json(429, { error: 'rate_limited' })
+
+  }
 
   try {
     const accessToken = await getAccessToken(sa, deps.fetch, deps.now(), deps.cache)
@@ -291,8 +331,10 @@ export async function handlePush(request: Request, relayId: string, deps: PushDe
     if (res.ok) return json(200, { ok: true })
     // 404 (UNREGISTERED) and 400 INVALID_ARGUMENT both mean this token is dead.
     if (res.status === 404 || res.status === 400) return json(410, { error: 'token_invalid' })
+    await forget()
     return json(502, { error: 'push_failed', status: res.status })
   } catch {
+    await forget()
     return json(502, { error: 'push_failed' })
   }
 }

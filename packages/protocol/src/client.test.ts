@@ -435,6 +435,42 @@ describe('listeners and scopes', () => {
 
 const RELAY = { u: 'wss://relay.test', i: 'AAAAAAAAAAAAAAAAAAAAAA' }
 
+describe('relay access token', () => {
+  it('sends the device token as the first frame on a relay socket, and never on LAN', async () => {
+    const host = new FakeHost()
+    const sent: Array<{ url: string; frame: string }> = []
+    const factory = host.factory
+    host.factory = (url) => {
+      const s = factory(url)
+      const orig = s.send.bind(s)
+      s.send = (d) => {
+        if (typeof d === 'string') sent.push({ url, frame: d })
+        orig(d)
+      }
+      return s
+    }
+    const c = make(host, { addresses: [], relay: { ...RELAY, tok: 'tok-tok-tok-tok-tok-tok' } })
+    c.connect()
+    await settle(300)
+    const relayFrames = sent.filter((x) => x.url.startsWith('wss://')).map((x) => JSON.parse(x.frame).t)
+    expect(relayFrames[0]).toBe('auth')
+    expect(relayFrames[1]).toBe('hello')
+    expect(JSON.parse(sent[0]!.frame)).toEqual({ t: 'auth', tok: 'tok-tok-tok-tok-tok-tok' })
+    c.disconnect()
+  })
+
+  it('persists a changed token the host sends in ready (onRelay fires)', async () => {
+    const host = new FakeHost()
+    host.relayInfo = { ...RELAY, tok: 'new-token-new-token-1' } as typeof host.relayInfo
+    const seen: Array<{ tok?: string }> = []
+    const c = make(host, { relay: RELAY, onRelay: (r) => seen.push(r) })
+    c.connect()
+    await settle(1500)
+    expect(seen.map((r) => r.tok)).toEqual(['new-token-new-token-1'])
+    c.disconnect()
+  })
+})
+
 describe('relay on cellular', () => {
   it('LAN attempts that hang forever still let the relay win', async () => {
     const host = new FakeHost()

@@ -46,6 +46,19 @@ export const LIMITS = {
   deviceWindowMs: 10_000,
   hostAuthTimeoutMs: 10_000,
   maxPendingHosts: 4,
+  /** Sockets that have connected but not yet presented a token. */
+  maxPendingDevices: 32,
+  deviceAuthTimeoutMs: 5000,
+  /** Per client IP (CF-Connecting-IP), per room. */
+  ipConnsPerWindow: 20,
+  ipWindowMs: 60_000,
+  ipMaxDevices: 8,
+  /** Cap on stored token hashes / live pairing tickets. */
+  maxTokens: 200,
+  maxTickets: 16,
+  ticketTtlMs: 10 * 60_000,
+  pushDedupeMs: 10 * 60_000,
+  pushDedupeMax: 4000,
   pushPerMinute: 60,
   pushWindowMs: 60_000,
   pushMaxAgeMs: 60_000,

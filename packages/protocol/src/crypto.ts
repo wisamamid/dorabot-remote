@@ -187,6 +187,8 @@ export interface PairingResponse {
   scopes: string[]
   /** Echoed so the phone can confirm it reached the key it scanned. */
   hostPublicKey: string
+  /** [SEC-RELAY] This device's relay access token, sent E2E so the phone can reconnect through the relay. */
+  relayTok?: string
 }
 
 const SEAL_CONTEXT = utf8(null, 'dorabot-remote/seal/v1')
