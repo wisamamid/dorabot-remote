@@ -579,6 +579,63 @@ describe('bridge through the relay', () => {
   }, 90_000)
 })
 
+describe('relay enforcement waits for confirmed tokens', () => {
+  let relay: FakeRelay
+  let rig: Rig
+  type Internals = {
+    store: { setMeta(k: string, v: unknown): void; getMeta<T>(k: string, d: T): T }
+    syncRelayAccess(): void
+    relayTokAck(id: string, h: unknown): boolean
+    hostSummaryFor(d: { id: string }): unknown
+  }
+  const b = (): Internals => rig.bridge as unknown as Internals
+
+  beforeAll(async () => {
+    relay = new FakeRelay()
+    await relay.start()
+    rig = await startRig(relay.url, 7873)
+    await until(() => relay.authedHost !== undefined, 8000, 'bridge online at relay')
+  }, 30_000)
+  afterAll(async () => {
+    await rig?.stop()
+    await relay?.stop()
+  })
+
+  it('does not enforce on merely sending the token; enforces once the phone acks it', async () => {
+    // A phone paired before the upgrade: pairing alone on a fresh install enforces at once, so reset to the
+    // upgrade situation (enforcement off, one unconfirmed device).
+    const pair = await rig.pair()
+    b().store.setMeta('relay.enforce', false)
+    b().syncRelayAccess()
+    await until(() => relay.enforce === false, 3000, 'enforcement off')
+    // Being sent the token (hello summary) is not a confirmation.
+    b().hostSummaryFor({ id: pair.deviceId })
+    await sleep(300)
+    expect(relay.enforce).toBe(false)
+    // A wrong proof does not count either.
+    expect(b().relayTokAck(pair.deviceId, 'f'.repeat(64))).toBe(false)
+    expect(b().relayTokAck(pair.deviceId, undefined)).toBe(false)
+    await sleep(100)
+    expect(relay.enforce).toBe(false)
+    // The new client persists the token (it came in the pairing) and acks after ready.
+    const client = await rig.connect(pair)
+    await until(() => relay.enforce === true, 5000, 'enforcement after ack')
+    client.disconnect()
+  })
+
+  it('14-day fallback enforces and warns once per device that will be locked out', async () => {
+    const pair = await rig.pair() // never acks
+    b().store.setMeta('relay.enforce', false)
+    b().store.setMeta('relay.accessSince', Date.now() - 15 * 24 * 60 * 60 * 1000)
+    b().syncRelayAccess()
+    await until(() => relay.enforce === true, 5000, 'fallback enforcement')
+    const warnings = rig.bridge.logLines.filter((l) => l.includes('WARNING') && l.includes('locked out'))
+    expect(warnings.length).toBeGreaterThanOrEqual(1)
+    expect(warnings.some((l) => l.includes('Relay Phone'))).toBe(true)
+    expect(relay.tokenSet.has(relayTokenHash(pair.relay!.tok!))).toBe(true)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Live relay, opt-in
 // ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@
  * transport (live client for the active Mac, a short-lived one for the others)
  * is supplied by the caller.
  */
-import { RemoteClient, fromB64, identityFromB64 } from '@dorabot-remote/protocol'
+import { NOT_RECOGNISED_TEXT, RemoteClient, fromB64, identityFromB64 } from '@dorabot-remote/protocol'
 import type { HostPairing } from './hosts.js'
 import { storage } from './platform.js'
 import { pushKeyId } from './push-keys.js'
@@ -87,9 +87,9 @@ export async function withTempClient<T>(p: HostPairing, fn: (rpc: (method: strin
       lastSeq: 0,
       clientVersion: '0.1.0',
       onState: (s, detail) => {
-        if (s === 'revoked') {
+        if (s === 'pending' || (s === 'disconnected' && detail === NOT_RECOGNISED_TEXT)) {
           clearTimeout(timer)
-          reject(new Error(detail || 'access removed'))
+          reject(new Error(s === 'pending' ? 'waiting for approval on your Mac' : NOT_RECOGNISED_TEXT))
         }
       },
       onReady: () => {

@@ -44,7 +44,7 @@ async function harness(scopes: Scope[], roots: string[] = []) {
       return gatewayResults.get(method) ?? { ok: true }
     },
     handleBridgeMethod: async () => ({}), log() {}, onClosed() {},
-    protectedPaths: () => [] as string[], allowedRoots: () => roots,
+    protectedPaths: () => [] as string[], allowedRoots: () => roots, hostSummaryFor: () => ({ id: 'h', name: 'Mac' }) as never,
   } as unknown as ConnectionHost
 
   const handlers: Record<string, (...a: never[]) => void> = {}

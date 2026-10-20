@@ -37,7 +37,7 @@ export interface ConnectionHost {
   sodium: Sodium
   hostIdentity: KeyPair
   hostSummary: HostSummary
-  /** [SEC-RELAY] hostSummary plus this device's relay token (and records that it was delivered). */
+  /** [SEC-RELAY] hostSummary plus this device's relay token. */
   hostSummaryFor(device: { id: string }): HostSummary
   getDevice(id: string): DeviceRecord | null
   touchDevice(id: string): void
@@ -61,6 +61,8 @@ export interface ConnectionHost {
   protectedPaths?(): string[]
   /** Folders shared with phones. Absent or empty means no file access at all. */
   allowedRoots?(): string[]
+  /** When an unapproved device's pairing lapses (epoch ms). Display hint for the phone. */
+  pendingExpiresAt?(device: DeviceRecord): number | undefined
   auditRpc?(conn: DeviceConnection, method: string, requestId: string | number | undefined, params: Record<string, unknown>): void // SEC-S3
 }
 
@@ -141,13 +143,13 @@ export class DeviceConnection {
 
   private failedWith: string | null = null
 
-  private fail(code: string, message: string): void {
+  private fail(code: string, message: string, extra: Record<string, unknown> = {}): void {
     if (!this.authed) {
       this.failedWith = code
       this.host.log?.(`device socket from ${this.remoteAddress} failed before auth: ${code} (${message})`)
     }
     try {
-      this.ws.send(JSON.stringify({ t: 'err', code, message }))
+      this.ws.send(JSON.stringify({ t: 'err', code, message, ...extra }))
     } catch {
       // Socket already gone.
     }
@@ -206,7 +208,11 @@ export class DeviceConnection {
         this.fail('revoked', 'access for this device was revoked')
         return
       }
-      if (device.pending) { this.fail('pending', 'waiting for approval on your Mac'); return } // SEC-S3
+      if (device.pending) { // SEC-S3
+        const exp = this.host.pendingExpiresAt?.(device)
+        this.fail('pending', 'waiting for approval on your Mac', exp ? { approvalExpiresAt: exp } : {})
+        return
+      }
 
       this.device = device
 

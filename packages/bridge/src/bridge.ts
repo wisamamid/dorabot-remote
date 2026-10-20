@@ -54,7 +54,7 @@ import { parsePushKey } from './push-content.js'
 import { RelayClient, type RelayState } from './relay-client.js'
 
 // [SEC-RELAY] Relay access control. See docs on enforcement in syncRelayAccess().
-const RELAY_DELIVERED_KEY = 'relay.tokensDelivered'
+const RELAY_ACKED_KEY = 'relay.tokensAcked'
 const RELAY_ENFORCE_KEY = 'relay.enforce'
 const RELAY_SINCE_KEY = 'relay.accessSince'
 /** Enforcement turns on at the latest this long after the first start with tokens, even if an old phone never reconnected. */
@@ -645,6 +645,10 @@ export class Bridge implements ConnectionHost {
     })
   }
 
+  pendingExpiresAt(device: DeviceRecord): number | undefined {
+    return (device.pendingSince ?? device.createdAt) + PENDING_TTL_MS
+  }
+
   touchDevice(id: string): void {
     this.store.touchDevice(id)
   }
@@ -705,6 +709,9 @@ export class Bridge implements ConnectionHost {
     switch (method) {
       case 'remote.hello':
         return { host: conn.device ? this.hostSummaryFor(conn.device) : this.hostSummary, device: conn.device ? this.deviceSummary(conn.device) : null }
+
+      case 'remote.relayTokAck':
+        return { ok: conn.device ? this.relayTokAck(conn.device.id, params.tokHash) : false }
 
       case 'remote.health':
         return {
@@ -858,17 +865,28 @@ export class Bridge implements ConnectionHost {
     return deriveRelayToken(this.relaySecret!, deviceId)
   }
 
-  /** Records that a device now holds its relay token (it was sent over the E2E channel). */
-  private markRelayTokenDelivered(deviceId: string): void {
-    const d = this.store.getMeta<string[]>(RELAY_DELIVERED_KEY, [])
+  /**
+   * A phone confirms it has PERSISTED its relay token (remote.relayTokAck, over the encrypted channel, carrying
+   * the token's hash as proof it holds it). Only this, never merely having been sent the token, makes the
+   * device count towards enforcement: old app builds ignore the token and would be locked out.
+   */
+  private markRelayTokenAcked(deviceId: string): void {
+    const d = this.store.getMeta<string[]>(RELAY_ACKED_KEY, [])
     if (d.includes(deviceId)) return
-    this.store.setMeta(RELAY_DELIVERED_KEY, [...d, deviceId])
+    this.store.setMeta(RELAY_ACKED_KEY, [...d, deviceId])
+    this.log(`relay: device ${deviceId.slice(0, 8)} confirmed it stored its relay token`)
     this.syncRelayAccess()
+  }
+
+  relayTokAck(deviceId: string, tokHash: unknown): boolean {
+    if (!this.relaySecret || typeof tokHash !== 'string') return false
+    if (tokHash !== relayTokenHash(this.relayTokenFor(deviceId))) return false
+    this.markRelayTokenAcked(deviceId)
+    return true
   }
 
   hostSummaryFor(device: { id: string }): HostSummary {
     if (!this.relayInfo || !this.relaySecret) return this.hostSummary
-    this.markRelayTokenDelivered(device.id)
     return { ...this.hostSummary, relay: { ...this.relayInfo, tok: this.relayTokenFor(device.id) } }
   }
 
@@ -878,8 +896,7 @@ export class Bridge implements ConnectionHost {
    * control page). Sent in full each time; the relay ignores identical sets.
    *
    * Enforcement rule: the relay lets token-less (legacy) devices in until `enforce` is true. It becomes true,
-   * and then stays true (persisted), as soon as EVERY non-revoked device has been sent its token (i.e. has
-   * connected once with this bridge version), or 14 days after this feature first ran, whichever is first.
+   * and then stays true (persisted), as soon as EVERY non-revoked device has CONFIRMED it stored its token (remote.relayTokAck), or 14 days after this feature first ran, whichever is first.
    * A fresh install with no devices enforces at once; new phones get in with the QR's pairing ticket.
    */
   private syncRelayAccess(): void {
@@ -887,15 +904,21 @@ export class Bridge implements ConnectionHost {
     const now = Date.now()
     for (const [code, t] of this.relayTickets) if (t.exp <= now) this.relayTickets.delete(code)
     const devices = this.store.listDevices().filter((d) => !d.revoked)
-    const delivered = new Set(this.store.getMeta<string[]>(RELAY_DELIVERED_KEY, []))
+    const acked = new Set(this.store.getMeta<string[]>(RELAY_ACKED_KEY, []))
     let since = this.store.getMeta<number>(RELAY_SINCE_KEY, 0)
     if (!since) {
       since = now
       this.store.setMeta(RELAY_SINCE_KEY, since)
     }
     let enforce = this.store.getMeta<boolean>(RELAY_ENFORCE_KEY, false)
-    if (!enforce && (devices.every((d) => delivered.has(d.id)) || now - since >= RELAY_ENFORCE_AFTER_MS)) {
+    const allAcked = devices.every((d) => acked.has(d.id))
+    if (!enforce && (allAcked || now - since >= RELAY_ENFORCE_AFTER_MS)) {
       enforce = true
+      if (!allAcked) {
+        for (const d of devices.filter((x) => !acked.has(x.id))) {
+          this.log(`relay: WARNING enforcing after the ${RELAY_ENFORCE_AFTER_MS / 86_400_000}-day fallback; "${d.name}" never confirmed its relay token and is locked out of the relay until it connects over the LAN once (update the app) or is re-paired`)
+        }
+      }
       this.store.setMeta(RELAY_ENFORCE_KEY, true)
       this.log('relay: access tokens are now enforced')
     }
@@ -993,7 +1016,7 @@ export class Bridge implements ConnectionHost {
         }
         if (this.relaySecret) {
           this.relayTickets.delete(req.code)
-          this.markRelayTokenDelivered(device.id)
+          this.syncRelayAccess() // the new device's token hash must reach the relay before it reconnects
         }
         const devicePk = fromB64(null, req.devicePublicKey)
         ws.send(JSON.stringify({ t: 'pair_ok', v: PROTOCOL_VERSION, sealed: sealJson(this.sodium, devicePk, response) }))

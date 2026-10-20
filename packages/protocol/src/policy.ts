@@ -211,6 +211,7 @@ export const BRIDGE_METHODS = new Set([
   'remote.requestScope',
   'remote.scopeRequests',
   'remote.health',
+  'remote.relayTokAck',
   'remote.events',
   'remote.registerPush',
   'remote.unregisterPush',

@@ -13,7 +13,7 @@ export function bannerFor(input: {
   justReconnected: boolean
 }): Banner {
   const { state, online, transport, justReconnected } = input
-  if (state === 'revoked' || state === 'idle') return null
+  if (state === 'pending' || state === 'idle') return null
   if (state === 'ready') {
     return justReconnected && transport === 'relay' ? { tone: 'good', text: 'Connected via relay' } : null
   }

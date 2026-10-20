@@ -185,7 +185,7 @@ describe('live device record', () => {
 
 describe('path guard (end to end)', () => {
   it('refuses everything until a folder is shared', async () => {
-    const { c } = await connect(await pair())
+    const { c } = await connect(await pair(['sessions', 'files']))
     await expect(c.rpc('fs.read', { path: join(home, 'host-key.json') })).rejects.toThrow(/isn't shared/)
     await expect(c.rpc('fs.list', { path: home })).rejects.toThrow(/isn't shared/)
     c.disconnect()

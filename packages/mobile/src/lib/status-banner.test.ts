@@ -18,7 +18,7 @@ describe('bannerFor', () => {
     expect(bannerFor({ ...base, state: 'ready', transport: 'relay', justReconnected: true })?.text).toBe('Connected via relay')
     expect(bannerFor({ ...base, state: 'ready', transport: 'lan', justReconnected: true })).toBeNull()
   })
-  it('leaves revoked to its own banner', () => {
-    expect(bannerFor({ ...base, state: 'revoked' })).toBeNull()
+  it('leaves pending to its own UI', () => {
+    expect(bannerFor({ ...base, state: 'pending' })).toBeNull()
   })
 })

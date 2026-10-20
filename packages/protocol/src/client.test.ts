@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { NOT_RECOGNISED_TEXT, RemoteClient, type SocketLike } from './client.js'
+import { NOT_RECOGNISED_TEXT, PENDING_RETRY_MS, RemoteClient, type SocketLike } from './client.js'
+import { relayTokenHash } from './relay.js'
 import {
   SecureChannel,
   deriveSessionKeys,
@@ -79,7 +80,7 @@ class FakeSocket implements SocketLike {
       if (f.t === 'hello') {
         if (this.host.silent(this.url, this.host.sockets.indexOf(this))) return
         if (this.host.refuse) {
-          this.pushText({ t: 'err', code: this.host.refuse, message: `refused: ${this.host.refuse}` })
+          this.pushText({ t: 'err', code: this.host.refuse, message: `refused: ${this.host.refuse}`, ...this.host.refuseExtra })
           return
         }
         const keys = deriveSessionKeys(null, 'host', {
@@ -107,6 +108,9 @@ class FakeSocket implements SocketLike {
         seq: 0,
         gatewayConnected: true,
       } as unknown as Envelope)
+    } else if (env.t === 'rpc') {
+      this.host.rpcs.push({ method: env.method, params: env.params })
+      this.push({ t: 'rpc_res', id: env.id, result: { ok: true } } as unknown as Envelope)
     } else if (env.t === 'ping' && !this.host.mute) {
       this.push({ t: 'pong', ts: env.ts })
     }
@@ -119,10 +123,12 @@ class FakeHost {
   sockets: FakeSocket[] = []
   mute = false
   refuse: string | null = null
+  refuseExtra: Record<string, unknown> = {}
+  rpcs: Array<{ method: string; params: unknown }> = []
   hang: (url: string) => boolean = () => false
   /** Opens fine but never answers `hello` (a relay wired to a host link that is not delivering). */
   silent: (url: string, index: number) => boolean = () => false
-  relayInfo: { u: string; i: string } | null = null
+  relayInfo: { u: string; i: string; tok?: string } | null = null
   factory = (url: string): SocketLike => {
     const s = new FakeSocket(this, url)
     this.sockets.push(s)
@@ -309,6 +315,42 @@ describe('connect races', () => {
   })
 })
 
+describe('relay token ack', () => {
+  const info = { u: 'wss://r.example', i: 'abcdef123456', tok: 'T'.repeat(32) }
+  it('acks a token it held from storage, with the token hash as proof', async () => {
+    const host = new FakeHost()
+    host.relayInfo = info
+    const c = make(host, { relay: info })
+    c.connect()
+    await settle(200)
+    const ack = host.rpcs.find((r) => r.method === 'remote.relayTokAck')
+    expect(ack?.params).toEqual({ tokHash: relayTokenHash(info.tok) })
+    c.disconnect()
+  })
+  it('does not ack a token it learned until onRelay (persist) has resolved', async () => {
+    const host = new FakeHost()
+    host.relayInfo = info
+    let release!: () => void
+    const c = make(host, { onRelay: () => new Promise<void>((r) => (release = r)) })
+    c.connect()
+    await settle(200)
+    expect(host.rpcs.some((r) => r.method === 'remote.relayTokAck')).toBe(false)
+    release()
+    await settle(50)
+    expect(host.rpcs.some((r) => r.method === 'remote.relayTokAck')).toBe(true)
+    c.disconnect()
+  })
+  it('does not ack when persisting fails', async () => {
+    const host = new FakeHost()
+    host.relayInfo = info
+    const c = make(host, { onRelay: () => Promise.reject(new Error('disk')) })
+    c.connect()
+    await settle(200)
+    expect(host.rpcs.some((r) => r.method === 'remote.relayTokAck')).toBe(false)
+    c.disconnect()
+  })
+})
+
 describe('plaintext frames and refusals', () => {
   it('a plaintext revoked is only a soft failure: long backoff, fixed text, never the revoked state', async () => {
     const host = new FakeHost()
@@ -326,6 +368,43 @@ describe('plaintext frames and refusals', () => {
     await settle(5 * 60_000 + 1000)
     expect(host.sockets.length).toBe(2)
     expect(c.state).toBe('ready')
+    c.disconnect()
+  })
+
+  it('pending: distinct state, hello retried every ~5s, approvalExpiresAt exposed, then ready', async () => {
+    const host = new FakeHost()
+    host.refuse = 'pending'
+    host.refuseExtra = { approvalExpiresAt: 1_900_000_000_000 }
+    const states: string[] = []
+    const c = make(host, { onState: (s) => states.push(s) })
+    c.connect()
+    await settle(100)
+    expect(c.state).toBe('pending')
+    expect(c.approvalExpiresAt).toBe(1_900_000_000_000)
+    await settle(PENDING_RETRY_MS * 3 + 500)
+    expect(host.sockets.length).toBeGreaterThanOrEqual(4)
+    // No flicker through connecting/handshaking between retries.
+    expect(states.slice(states.indexOf('pending'))).not.toContain('handshaking')
+    host.refuse = null
+    await settle(PENDING_RETRY_MS + 500)
+    expect(c.state).toBe('ready')
+    expect(c.approvalExpiresAt).toBeNull()
+    c.disconnect()
+  })
+
+  it('unknown_device after pending takes the soft path (long backoff, fixed text)', async () => {
+    const host = new FakeHost()
+    host.refuse = 'pending'
+    const c = make(host)
+    c.connect()
+    await settle(100)
+    expect(c.state).toBe('pending')
+    host.refuse = 'unknown_device'
+    await settle(PENDING_RETRY_MS + 500)
+    expect(c.state).toBe('disconnected')
+    const n = host.sockets.length
+    await settle(60_000)
+    expect(host.sockets.length).toBe(n)
     c.disconnect()
   })
 

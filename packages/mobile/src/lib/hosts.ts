@@ -34,6 +34,8 @@ export interface HostPairing extends StoredPairing {
   addedAt: number
   /** Local nickname; the Mac's own name stays in hostName. */
   alias?: string
+  /** Set when paired but not yet approved on the Mac: when the Mac discards the request (epoch ms). */
+  approvalExpiresAt?: number
 }
 
 export interface PairingsFile {
@@ -74,6 +76,7 @@ export function toHostPairing(v: unknown, now = Date.now()): HostPairing | null 
     pairedAt,
     addedAt: typeof p.addedAt === 'number' ? p.addedAt : pairedAt,
     ...(typeof p.alias === 'string' && p.alias ? { alias: p.alias } : {}),
+    ...(typeof p.approvalExpiresAt === 'number' ? { approvalExpiresAt: p.approvalExpiresAt } : {}),
   }
 }
 

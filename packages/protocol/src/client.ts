@@ -18,13 +18,16 @@ import {
   toB64,
 } from './crypto.js'
 import { openSealedJson } from './crypto.js'
-import { RELAY_HEAD_START_MS, relayAuthFrame, relayDeviceUrl, type RelayInfo } from './relay.js'
+import { RELAY_HEAD_START_MS, relayAuthFrame, relayDeviceUrl, relayTokenHash, type RelayInfo } from './relay.js'
 import { methodsForScopes } from './policy.js'
 import type { DeviceSummary, Envelope, HostSummary, PairingPayload, Scope } from './wire.js'
 
 export type Transport = 'lan' | 'relay'
 
-export type ConnectionState = 'idle' | 'connecting' | 'handshaking' | 'ready' | 'disconnected' | 'revoked'
+export type ConnectionState = 'idle' | 'connecting' | 'handshaking' | 'ready' | 'disconnected' | 'pending'
+
+/** While the Mac has not approved this phone yet, hello is retried at this pace (no long backoff). */
+export const PENDING_RETRY_MS = 5000
 
 /**
  * Plaintext refusals before the encrypted channel exists are unauthenticated: anyone on
@@ -58,13 +61,15 @@ export interface RemoteClientOptions {
   /** Fired when the winning transport changes, for a LAN/relay badge. */
   onTransport?: (transport: Transport | null) => void
   /** Fired when the host reports a relay that differs from the one we hold, so the caller can persist it. */
-  onRelay?: (relay: RelayInfo) => void
+  onRelay?: (relay: RelayInfo) => void | Promise<void>
   createSocket: SocketFactory
   /** Highest bridge seq already applied, for gap-free resume. */
   lastSeq?: number
   clientVersion?: string
   onEvent?: (event: string, data: unknown, seq: number | undefined, sessionKey?: string) => void
   onState?: (state: ConnectionState, detail?: string) => void
+  /** Known deadline (epoch ms) for the Mac to approve this phone, from the pairing reply. Display only. */
+  approvalExpiresAt?: number | null
   onReady?: (info: { device: DeviceSummary; host: HostSummary; allowed: string[]; seq: number; gatewayConnected: boolean }) => void
   log?: (msg: string) => void
 }
@@ -82,6 +87,10 @@ export interface PairResult {
   addresses: string[]
   /** Relay from the QR, to persist so the phone can reach the host off-LAN. */
   relay?: RelayInfo
+  /** True when the Mac must still approve this phone. Connect anyway: the client waits in state 'pending'. */
+  pending?: boolean
+  /** Epoch ms when the unapproved pairing expires. */
+  approvalExpiresAt?: number
   transport: Transport
 }
 
@@ -230,6 +239,8 @@ export async function pairWithHost(args: {
               addresses: [...(transport === 'lan' ? [address] : []), ...args.payload.a.filter((a) => a !== address)],
               // [SEC-RELAY] The ticket is spent; keep the long-lived token the host sealed to us.
               relay: args.payload.r ? { u: args.payload.r.u, i: args.payload.r.i, ...(res.relayTok ? { tok: res.relayTok } : {}) } : undefined,
+              ...(res.pending ? { pending: true } : {}),
+              ...(typeof res.approvalExpiresAt === 'number' ? { approvalExpiresAt: res.approvalExpiresAt } : {}),
               transport,
             })
           } catch (err) {
@@ -330,6 +341,12 @@ export class RemoteClient {
   private stopped = false
   /** A plaintext 'revoked' / 'unknown_device' was seen; back off long and show fixed text. */
   private notRecognised = false
+  /** The host said 'pending': the Mac has not approved this phone yet. Retry hello every PENDING_RETRY_MS. */
+  private pendingApproval = false
+  /** The relay token the app has confirmed it persisted (from storage at start, or after onRelay completed). */
+  private persistedTok: string | null
+  /** While state is 'pending': when the Mac will discard the request (epoch ms), if known. Display only. */
+  approvalExpiresAt: number | null
   /** One-shot: the next race starts the relay at once (network just changed, LAN is unlikely). */
   private skipLanHeadStart = false
   /** Phone is on cellular: LAN candidates are unlikely, so the relay never waits for them. */
@@ -339,6 +356,9 @@ export class RemoteClient {
   constructor(private readonly opts: RemoteClientOptions) {
     this.lastSeq = opts.lastSeq ?? 0
     this.relay = opts.relay ?? null
+    // A token handed in at construction came out of the app's storage.
+    this.persistedTok = opts.relay?.tok ?? null
+    this.approvalExpiresAt = opts.approvalExpiresAt ?? null
   }
 
   /** Tell the client what kind of network the phone is on. Cellular starts the relay without a LAN head start. */
@@ -357,6 +377,8 @@ export class RemoteClient {
   }
 
   private setState(state: ConnectionState, detail?: string): void {
+    // Between pending retries stay in 'pending' rather than flickering through connecting/handshaking.
+    if (this.pendingApproval && (state === 'connecting' || state === 'handshaking')) return
     if (this.state === state) return
     this.state = state
     this.safe(() => this.opts.onState?.(state, detail), 'onState')
@@ -413,7 +435,6 @@ export class RemoteClient {
    * with no backoff, racing the relay straight away.
    */
   forceReconnect(): void {
-    if (this.state === 'revoked') return
     this.stopped = false
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
@@ -427,6 +448,7 @@ export class RemoteClient {
 
   disconnect(): void {
     this.stopped = true
+    this.pendingApproval = false
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
     this.teardown()
@@ -453,7 +475,7 @@ export class RemoteClient {
    * at once. If we are not ready, just reconnect now (skipping backoff).
    */
   checkAlive(timeoutMs = 3000): void {
-    if (this.stopped || this.state === 'revoked') return
+    if (this.stopped) return
     if (this.state !== 'ready' || !this.socket) {
       this.connect()
       return
@@ -541,6 +563,8 @@ export class RemoteClient {
       this.raceSockets.clear()
       this.rxCount = 0
       this.notRecognised = false
+      this.pendingApproval = false
+      this.approvalExpiresAt = null
       this.socket = socket
       this.channel = channel
       this.host = host
@@ -656,7 +680,17 @@ export class RemoteClient {
               if (frame.t === 'err') {
                 clearTimeout(timer)
                 this.log(`attempt ${transport} ${target} host refused: ${String(frame.code ?? '')}`)
-                if (!stale() && typeof frame.code === 'string' && SOFT_REFUSAL_CODES.has(frame.code)) this.notRecognised = true
+                if (!stale() && frame.code === 'pending') {
+                  // Unauthenticated, so only ever a display hint plus a quick retry; it grants nothing.
+                  this.pendingApproval = true
+                  this.notRecognised = false
+                  if (typeof frame.approvalExpiresAt === 'number' && Number.isFinite(frame.approvalExpiresAt)) this.approvalExpiresAt = frame.approvalExpiresAt
+                } else if (!stale() && typeof frame.code === 'string' && SOFT_REFUSAL_CODES.has(frame.code)) {
+                  // Approval refused or expired (unknown_device after pending) lands here: the soft path.
+                  this.notRecognised = true
+                  this.pendingApproval = false
+                  this.approvalExpiresAt = null
+                }
                 this.closeQuietly(socket)
                 return
               }
@@ -762,6 +796,7 @@ export class RemoteClient {
   private onEnvelope(env: Envelope): void {
     switch (env.t) {
       case 'ready': {
+        let persisted: Promise<unknown> | undefined
         this.device = env.device
         this.host = env.host
         this.allowed = env.allowed
@@ -774,10 +809,13 @@ export class RemoteClient {
           if (changed) {
             this.log(`relay learned from host: ${env.host.relay.u} id=${env.host.relay.i.slice(0, 6)}`)
             const r = env.host.relay
-            this.safe(() => this.opts.onRelay?.(r), 'onRelay')
+            this.safe(() => {
+              persisted = Promise.resolve(this.opts.onRelay?.(r))
+            }, 'onRelay')
           }
         }
         this.setState('ready')
+        void this.ackRelayToken(persisted)
         this.startPing()
         this.safe(() => this.opts.onReady?.(env), 'onReady')
         // Re-assert subscriptions after a reconnect so the stream resumes without
@@ -858,6 +896,30 @@ export class RemoteClient {
     return this.device?.scopes.includes(scope) ?? false
   }
 
+  /**
+   * Tell the Mac this phone has PERSISTED its relay token, with the token's hash as proof. Until every
+   * device has done so the relay does not start refusing token-less sockets (old builds would be locked out).
+   * Only acts on a token the app confirmed it stored: held from storage, or after onRelay completed.
+   */
+  private async ackRelayToken(persist?: Promise<unknown>): Promise<void> {
+    const tok = this.relay?.tok
+    if (!tok) return
+    if (persist) {
+      try {
+        await persist
+      } catch {
+        return
+      }
+      this.persistedTok = tok
+    }
+    if (this.persistedTok !== tok) return
+    try {
+      await this.rpc('remote.relayTokAck', { tokHash: relayTokenHash(tok) })
+    } catch {
+      // An older bridge does not know the method; it does not enforce either.
+    }
+  }
+
   private startPing(): void {
     this.stopPing()
     this.pingTimer = setInterval(() => this.probe(PONG_TIMEOUT_MS, false), PING_INTERVAL_MS)
@@ -881,7 +943,10 @@ export class RemoteClient {
   private scheduleReconnect(reason: string): void {
     if (this.stopped || this.reconnectTimer) return
     let delay = Math.min(1000 * 2 ** Math.min(this.attempt, 4), 20_000) + Math.floor(Math.random() * 400)
-    if (this.notRecognised) {
+    if (this.pendingApproval) {
+      delay = PENDING_RETRY_MS
+      this.setState('pending')
+    } else if (this.notRecognised) {
       delay = SOFT_REFUSAL_BACKOFF_MS
       this.setState('disconnected', NOT_RECOGNISED_TEXT)
     }

@@ -189,6 +189,10 @@ export interface PairingResponse {
   hostPublicKey: string
   /** [SEC-RELAY] This device's relay access token, sent E2E so the phone can reconnect through the relay. */
   relayTok?: string
+  /** [SEC-CONTROL] True when the Mac still has to approve this phone before it can connect. */
+  pending?: boolean
+  /** Epoch ms after which an unapproved pairing is discarded. Display only. */
+  approvalExpiresAt?: number
 }
 
 const SEAL_CONTEXT = utf8(null, 'dorabot-remote/seal/v1')
