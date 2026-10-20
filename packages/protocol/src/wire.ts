@@ -37,7 +37,7 @@ export interface HeaderFrame {
 
 export interface HandshakeErrorFrame {
   t: 'err'
-  code: 'bad_version' | 'unknown_device' | 'revoked' | 'bad_handshake' | 'rate_limited' | 'internal'
+  code: 'bad_version' | 'unknown_device' | 'revoked' | 'pending' | 'bad_handshake' | 'rate_limited' | 'internal'
   message: string
 }
 
@@ -143,12 +143,12 @@ export const SCOPES = ['sessions', 'chat', 'approvals', 'work', 'files', 'git', 
 export type Scope = (typeof SCOPES)[number]
 
 /**
- * What a freshly paired device gets. Reading files and git state is on because a
- * phone that cannot show you what the agent changed is not much of a remote.
- * Anything that writes to the Mac (git_write), opens a shell (terminal) or changes
- * settings (admin) stays off until a human grants it on the Mac.
+ * What a freshly paired device gets: watch and steer sessions, answer approvals.
+ * Everything that reads the Mac's files or project data (work, files, git) or
+ * writes to it (git_write, terminal, admin) stays off until a human grants it per
+ * device on the Mac's control page.
  */
-export const SCOPE_DEFAULTS: Scope[] = ['sessions', 'chat', 'approvals', 'work', 'files', 'git']
+export const SCOPE_DEFAULTS: Scope[] = ['sessions', 'chat', 'approvals']
 
 export const SCOPE_LABELS: Record<Scope, string> = {
   sessions: 'Sessions',
@@ -183,6 +183,10 @@ export interface DeviceSummary {
   lastSeenAt: number | null
   revoked: boolean
   fingerprint: string
+  /** Paired but not yet approved on the Mac. Such a device can do nothing. */
+  pending?: boolean
+  /** Why it was revoked automatically, e.g. 'expired' (unseen for 90 days). */
+  revokedReason?: string | null
 }
 
 export interface HostSummary {

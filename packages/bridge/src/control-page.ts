@@ -71,6 +71,11 @@ export const CONTROL_PAGE = `<!doctype html>
   .request + .request { margin-top: 10px; }
   pre.log { background: #0e1013; border: 1px solid var(--line); border-radius: 10px; padding: 14px;
             max-height: 240px; overflow: auto; font-size: 12px; color: var(--muted); margin: 0; }
+  input[type=text], select { font: inherit; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+  table.audit { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.audit td, table.audit th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  table.audit th { color: var(--muted); font-weight: 500; }
   .empty { color: var(--muted); font-size: 13px; padding: 10px 0; }
 </style>
 </head>
@@ -90,6 +95,8 @@ export const CONTROL_PAGE = `<!doctype html>
     </div>
   </div>
 
+  <div id="pending"></div>
+
   <h2>Pair a device</h2>
   <div class="card" id="pair-card">
     <div class="row">
@@ -105,6 +112,26 @@ export const CONTROL_PAGE = `<!doctype html>
   <h2>Paired devices</h2>
   <div id="devices"></div>
 
+  <h2>Shared folders</h2>
+  <div class="card">
+    <div class="small muted" style="margin-bottom:10px">Folders your phone may browse (with the files permission). Nothing outside these is shared.</div>
+    <div id="roots"></div>
+    <div class="row" style="margin-top:12px;gap:8px">
+      <input id="root-path" type="text" placeholder="/Users/you/Projects" style="flex:1" />
+      <button class="small primary" onclick="addRoot()">Add</button>
+    </div>
+    <div id="root-msg" class="small" style="margin-top:8px;color:var(--danger)"></div>
+  </div>
+
+  <h2>Audit log</h2>
+  <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <div class="small muted">Last 200 security-relevant actions. Prompts and file contents are never logged.</div>
+      <select id="audit-filter" onchange="loadAudit()"><option value="">All devices</option></select>
+    </div>
+    <div id="audit" style="overflow:auto;max-height:340px"></div>
+  </div>
+
   <h2>Activity</h2>
   <pre class="log" id="log"></pre>
 </main>
@@ -114,10 +141,37 @@ const SCOPES = ['sessions','chat','approvals','work','files','git','git_write','
 const RISKY = new Set(['terminal','admin','git_write']);
 let state = null;
 
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? undefined : { method: 'POST', body: JSON.stringify(body) });
+  if (r.status === 401) {
+    document.body.innerHTML = '<main><h1>dorabot remote</h1><p class="sub">Your session ended. Run <code>dorabot-remote open</code> in a terminal on this Mac.</p></main>';
+    throw new Error('logged out');
+  }
+  return r;
+}
+
 async function load() {
-  const r = await fetch('/api/state');
+  const r = await api('/api/state');
   state = await r.json();
   render();
+  loadAudit();
+}
+
+async function loadAudit() {
+  const sel = document.getElementById('audit-filter');
+  const dev = sel.value;
+  const r = await api('/api/audit?limit=200' + (dev ? '&device=' + encodeURIComponent(dev) : ''));
+  const { entries } = await r.json();
+  const known = new Map(state.devices.map(d => [d.id, d.name]));
+  const opts = ['<option value="">All devices</option>'].concat(
+    [...known].map(([id, n]) => '<option value="' + esc(id) + '"' + (id === dev ? ' selected' : '') + '>' + esc(n) + '</option>'));
+  if (sel.dataset.sig !== opts.join('')) { sel.innerHTML = opts.join(''); sel.dataset.sig = opts.join(''); sel.value = dev; }
+  document.getElementById('audit').innerHTML = entries.length
+    ? '<table class="audit"><tr><th>Time</th><th>Device</th><th>Action</th><th>Detail</th><th>Via</th></tr>' +
+      entries.map(e => '<tr><td>' + esc(new Date(e.at).toLocaleString()) + '</td><td>' + esc(e.deviceName || (e.deviceId ? e.deviceId.slice(0, 8) : 'this Mac')) +
+        '</td><td class="mono">' + esc(e.action === 'rpc' ? e.method : e.action) + '</td><td>' + esc([e.summary, e.requestId ? 'req ' + e.requestId : ''].filter(Boolean).join(' · ')) +
+        '</td><td>' + esc(e.transport || '') + '</td></tr>').join('') + '</table>'
+    : '<div class="empty">Nothing recorded yet.</div>';
 }
 
 function render() {
@@ -135,6 +189,27 @@ function render() {
   } else {
     rl.style.display = 'none';
   }
+
+  const pend = state.pendingDevices || [];
+  document.getElementById('pending').innerHTML = pend.map(d => \`
+    <div class="request" style="margin-top:28px">
+      <div class="row">
+        <div>
+          <div><strong>Allow "\${esc(d.name)}" (fingerprint \${esc(d.fingerprint)}) to control dorabot?</strong></div>
+          <div class="small muted">\${esc(d.platform)} · will get: \${esc(d.scopes.join(', '))} · expires \${new Date(d.expiresAt).toLocaleTimeString()}.
+            Only allow this if you just paired your own phone.</div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="small danger" onclick="device('\${d.id}','reject')">Reject</button>
+          <button class="small primary" onclick="device('\${d.id}','approve')">Allow</button>
+        </div>
+      </div>
+    </div>\`).join('');
+
+  const roots = document.getElementById('roots');
+  roots.innerHTML = state.roots && state.roots.length
+    ? state.roots.map(r => '<div class="row" style="padding:4px 0"><code>' + esc(r) + '</code><button class="small danger" data-root="' + esc(r) + '" onclick="removeRoot(this.dataset.root)">Remove</button></div>').join('')
+    : '<div class="empty">No folders shared.</div>';
 
   const reqs = document.getElementById('requests');
   if (!state.scopeRequests.length) {
@@ -165,7 +240,7 @@ function render() {
         <div class="row">
           <div>
             <div><strong>\${esc(d.name)}</strong>
-              <span class="pill \${d.revoked ? 'off' : (online ? 'on' : '')}">\${d.revoked ? 'revoked' : (online ? 'connected' : 'offline')}</span>
+              <span class="pill \${d.revoked ? 'off' : (online ? 'on' : '')}">\${d.pending ? 'waiting for approval' : d.revoked ? (d.revokedReason === 'expired' ? 'revoked: unseen for 90 days' : 'revoked') : (online ? 'connected' : 'offline')}</span>
             </div>
             <div class="small muted mono">\${esc(d.platform)} · \${esc(d.fingerprint)} · \${d.lastSeenAt ? 'last seen ' + new Date(d.lastSeenAt).toLocaleString() : 'never connected'}</div>
           </div>
@@ -190,7 +265,7 @@ function render() {
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 async function newPairing() {
-  const r = await fetch('/api/pair', { method: 'POST' });
+  const r = await api('/api/pair', {});
   const p = await r.json();
   document.getElementById('pair-out').innerHTML = \`
     <div class="qr">
@@ -209,13 +284,27 @@ async function newPairing() {
 }
 
 async function scope(requestId, approve) {
-  await fetch('/api/scope', { method: 'POST', body: JSON.stringify({ requestId, approve }) });
+  await api('/api/scope', { requestId, approve });
+  load();
+}
+
+async function addRoot() {
+  const input = document.getElementById('root-path');
+  const r = await api('/api/roots', { action: 'add', path: input.value.trim() });
+  const j = await r.json();
+  document.getElementById('root-msg').textContent = j.ok ? '' : (j.error || 'Could not add that folder');
+  if (j.ok) input.value = '';
+  load();
+}
+
+async function removeRoot(path) {
+  await api('/api/roots', { action: 'remove', path });
   load();
 }
 
 async function device(deviceId, action) {
   if (action === 'delete' && !confirm('Remove this device? It will need to pair again.')) return;
-  await fetch('/api/device', { method: 'POST', body: JSON.stringify({ deviceId, action }) });
+  await api('/api/device', { deviceId, action });
   load();
 }
 
@@ -226,7 +315,7 @@ async function toggleScope(deviceId, scope) {
   if (!d.scopes.includes(scope) && RISKY.has(scope)
       && !confirm('Grant "' + scope + '" to ' + d.name + '?\\n\\n' +
                   (scope === 'terminal' ? 'This gives the device a real shell on this Mac.' : 'This is a powerful permission.'))) return;
-  await fetch('/api/device', { method: 'POST', body: JSON.stringify({ deviceId, action: 'scopes', scopes: next }) });
+  await api('/api/device', { deviceId, action: 'scopes', scopes: next });
   load();
 }
 

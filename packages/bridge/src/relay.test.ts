@@ -353,7 +353,10 @@ async function startRig(relayUrl: string, port: number): Promise<Rig> {
   const pair = () => {
     const payload = decodePairingPayload(bridge.newPairingPayload().uri)
     payload.a = []
-    return pairWithHost({ payload, deviceName: 'Relay Phone', platform: 'ios', createSocket })
+    return pairWithHost({ payload, deviceName: 'Relay Phone', platform: 'ios', createSocket }).then((r) => {
+      bridge.approveDevice(r.deviceId)
+      return r
+    })
   }
   const connect: Rig['connect'] = async (p, extra = {}) => {
     const client = new RemoteClient({

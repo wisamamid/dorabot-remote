@@ -1,5 +1,5 @@
-import { randomBytes, randomUUID } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { chmodSync, existsSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { DeviceSummary, Scope } from '@dorabot-remote/protocol'
@@ -23,6 +23,38 @@ export interface DeviceRecord {
   pushOnResult?: boolean
   /** base64 32-byte key the phone generated; encrypts push content. Never logged or sent anywhere but used locally. */
   pushKey?: string | null
+  /** Paired, but the user has not approved it on the Mac yet. Must never act. */
+  pending?: boolean
+  pendingSince?: number | null
+  /** Set when the bridge (not the user) revoked it, e.g. 'expired'. */
+  revokedReason?: string | null
+}
+
+export interface AuditEntry {
+  /** Device that acted, or null for actions taken on the Mac itself. */
+  deviceId?: string | null
+  deviceName?: string | null
+  /** e.g. pair, approve, reject, revoke, scopes, rpc */
+  action: string
+  /** RPC method for action 'rpc'. */
+  method?: string | null
+  requestId?: string | null
+  /** Short, non-sensitive description. Never prompt text or file contents. */
+  summary?: string | null
+  /** direct | relay | mac | local */
+  transport?: string | null
+}
+
+export interface AuditRecord {
+  id: number
+  at: number
+  deviceId: string | null
+  deviceName: string | null
+  action: string
+  method: string | null
+  requestId: string | null
+  summary: string | null
+  transport: string | null
 }
 
 export interface ScopeRequest {
@@ -64,9 +96,21 @@ export class Store {
   constructor(path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.db = new DatabaseSync(path)
+    if (path !== ':memory:') this.lockDownFiles(path)
     this.db.exec('PRAGMA journal_mode = WAL')
     this.db.exec('PRAGMA foreign_keys = ON')
     this.migrate()
+  }
+
+  /** The DB holds device keys' public halves, push tokens and the audit log: owner only. */
+  private lockDownFiles(path: string): void {
+    for (const f of [path, `${path}-wal`, `${path}-shm`]) {
+      try {
+        if (existsSync(f)) chmodSync(f, 0o600)
+      } catch {
+        // Not ours to chmod; nothing more we can do.
+      }
+    }
   }
 
   private migrate(): void {
@@ -119,6 +163,30 @@ export class Store {
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS login_tokens (
+        hash       TEXT PRIMARY KEY,
+        expires_at INTEGER NOT NULL,
+        used_at    INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        at          INTEGER NOT NULL,
+        device_id   TEXT,
+        device_name TEXT,
+        action      TEXT NOT NULL,
+        method      TEXT,
+        request_id  TEXT,
+        summary     TEXT,
+        transport   TEXT
+      );
+      CREATE INDEX IF NOT EXISTS audit_device ON audit_log (device_id, id);
+      -- Append-only: rows can be neither edited nor removed.
+      CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit_log
+        BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_log
+        BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
     `)
     // Added after the first release, so existing databases need the columns grafted on.
     const cols = (this.db.prepare('PRAGMA table_info(devices)').all() as Array<{ name: string }>).map((c) => c.name)
@@ -126,6 +194,9 @@ export class Store {
     if (!cols.includes('push_platform')) this.db.exec('ALTER TABLE devices ADD COLUMN push_platform TEXT')
     if (!cols.includes('push_env')) this.db.exec("ALTER TABLE devices ADD COLUMN push_env TEXT NOT NULL DEFAULT 'production'")
     if (!cols.includes('push_key')) this.db.exec('ALTER TABLE devices ADD COLUMN push_key TEXT')
+    if (!cols.includes('pending')) this.db.exec('ALTER TABLE devices ADD COLUMN pending INTEGER NOT NULL DEFAULT 0')
+    if (!cols.includes('pending_since')) this.db.exec('ALTER TABLE devices ADD COLUMN pending_since INTEGER')
+    if (!cols.includes('revoked_reason')) this.db.exec('ALTER TABLE devices ADD COLUMN revoked_reason TEXT')
     if (!cols.includes('push_on_result')) this.db.exec('ALTER TABLE devices ADD COLUMN push_on_result INTEGER NOT NULL DEFAULT 0')
   }
 
@@ -226,7 +297,7 @@ export class Store {
   // Devices
   // -------------------------------------------------------------------------
 
-  createDevice(args: { name: string; platform: string; publicKey: string; scopes: Scope[] }): DeviceRecord {
+  createDevice(args: { name: string; platform: string; publicKey: string; scopes: Scope[]; pending?: boolean }): DeviceRecord {
     const now = Date.now()
     const id = randomUUID()
     // Re-pairing the same physical device replaces the old record rather than
@@ -234,9 +305,9 @@ export class Store {
     this.db.prepare('DELETE FROM devices WHERE public_key = ?').run(args.publicKey)
     this.db
       .prepare(
-        'INSERT INTO devices (id, name, platform, public_key, scopes, created_at, last_seen_at, revoked) VALUES (?,?,?,?,?,?,NULL,0)',
+        'INSERT INTO devices (id, name, platform, public_key, scopes, created_at, last_seen_at, revoked, pending, pending_since) VALUES (?,?,?,?,?,?,NULL,0,?,?)',
       )
-      .run(id, args.name, args.platform, args.publicKey, JSON.stringify(args.scopes), now)
+      .run(id, args.name, args.platform, args.publicKey, JSON.stringify(args.scopes), now, args.pending ? 1 : 0, args.pending ? now : null)
     return {
       id,
       name: args.name,
@@ -246,6 +317,9 @@ export class Store {
       createdAt: now,
       lastSeenAt: null,
       revoked: false,
+      pending: Boolean(args.pending),
+      pendingSince: args.pending ? now : null,
+      revokedReason: null,
     }
   }
 
@@ -265,6 +339,9 @@ export class Store {
       pushEnv: row.push_env === 'sandbox' ? 'sandbox' : 'production',
       pushOnResult: Boolean(row.push_on_result),
       pushKey: (row.push_key as string | null) ?? null,
+      pending: Boolean(row.pending),
+      pendingSince: (row.pending_since as number | null) ?? null,
+      revokedReason: (row.revoked_reason as string | null) ?? null,
     }
   }
 
@@ -282,9 +359,103 @@ export class Store {
   }
 
   /** Revoking also drops the push token: a revoked device must never be notified. */
-  setRevoked(id: string, revoked: boolean): boolean {
+  setRevoked(id: string, revoked: boolean, reason: string | null = null): boolean {
     if (revoked) this.db.prepare('UPDATE devices SET push_token = NULL, push_platform = NULL, push_key = NULL WHERE id = ?').run(id)
-    return this.db.prepare('UPDATE devices SET revoked = ? WHERE id = ?').run(revoked ? 1 : 0, id).changes > 0n
+    return (
+      this.db.prepare('UPDATE devices SET revoked = ?, revoked_reason = ? WHERE id = ?').run(revoked ? 1 : 0, revoked ? reason : null, id).changes > 0
+    )
+  }
+
+  listPending(): DeviceRecord[] {
+    const rows = this.db.prepare('SELECT * FROM devices WHERE pending = 1 ORDER BY created_at DESC').all() as Record<string, unknown>[]
+    return rows.map((r) => this.hydrate(r)!)
+  }
+
+  /** Activate a pending device. False if it is not (or no longer) pending. */
+  approveDevice(id: string): boolean {
+    return this.db.prepare('UPDATE devices SET pending = 0, pending_since = NULL WHERE id = ? AND pending = 1').run(id).changes > 0
+  }
+
+  /** Delete a pending device. Only ever touches pending rows. */
+  rejectDevice(id: string): boolean {
+    return this.db.prepare('DELETE FROM devices WHERE id = ? AND pending = 1').run(id).changes > 0
+  }
+
+  /** Delete pending devices nobody approved in time. Returns them (for logging/audit). */
+  expirePending(maxAgeMs: number, now = Date.now()): DeviceRecord[] {
+    const stale = this.listPending().filter((d) => (d.pendingSince ?? d.createdAt) < now - maxAgeMs)
+    for (const d of stale) this.rejectDevice(d.id)
+    return stale
+  }
+
+  /** Revoke active devices unseen for maxAgeMs (never-connected devices count from creation). */
+  expireStaleDevices(maxAgeMs: number, now = Date.now()): DeviceRecord[] {
+    const stale = this.listDevices().filter(
+      (d) => !d.revoked && !d.pending && (d.lastSeenAt ?? d.createdAt) < now - maxAgeMs,
+    )
+    for (const d of stale) this.setRevoked(d.id, true, 'expired')
+    return stale
+  }
+
+  // -------------------------------------------------------------------------
+  // One-time login tokens for the local control page
+  // -------------------------------------------------------------------------
+
+  /** Returns a fresh single-use token; only its hash is stored. */
+  createLoginToken(ttlMs = 5 * 60 * 1000): string {
+    const token = randomBytes(32).toString('base64url')
+    const now = Date.now()
+    this.db.prepare('DELETE FROM login_tokens WHERE expires_at < ?').run(now)
+    this.db.prepare('INSERT INTO login_tokens (hash, expires_at) VALUES (?, ?)').run(sha256(token), now + ttlMs)
+    return token
+  }
+
+  consumeLoginToken(token: string): boolean {
+    if (!token || token.length > 200) return false
+    const res = this.db
+      .prepare('UPDATE login_tokens SET used_at = ? WHERE hash = ? AND used_at IS NULL AND expires_at >= ?')
+      .run(Date.now(), sha256(token), Date.now())
+    return res.changes === 1
+  }
+
+  // -------------------------------------------------------------------------
+  // Audit log (append-only; enforced by triggers)
+  // -------------------------------------------------------------------------
+
+  recordAudit(e: AuditEntry): void {
+    this.db
+      .prepare('INSERT INTO audit_log (at, device_id, device_name, action, method, request_id, summary, transport) VALUES (?,?,?,?,?,?,?,?)')
+      .run(
+        Date.now(),
+        e.deviceId ?? null,
+        e.deviceName ?? null,
+        e.action,
+        e.method ?? null,
+        e.requestId ?? null,
+        e.summary ? e.summary.slice(0, 200) : null,
+        e.transport ?? null,
+      )
+  }
+
+  /** Newest first. */
+  listAudit(opts: { limit?: number; deviceId?: string } = {}): AuditRecord[] {
+    const limit = Math.max(1, Math.min(opts.limit ?? 200, 1000))
+    const rows = (
+      opts.deviceId
+        ? this.db.prepare('SELECT * FROM audit_log WHERE device_id = ? ORDER BY id DESC LIMIT ?').all(opts.deviceId, limit)
+        : this.db.prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT ?').all(limit)
+    ) as Record<string, unknown>[]
+    return rows.map((r) => ({
+      id: Number(r.id),
+      at: Number(r.at),
+      deviceId: (r.device_id as string | null) ?? null,
+      deviceName: (r.device_name as string | null) ?? null,
+      action: r.action as string,
+      method: (r.method as string | null) ?? null,
+      requestId: (r.request_id as string | null) ?? null,
+      summary: (r.summary as string | null) ?? null,
+      transport: (r.transport as string | null) ?? null,
+    }))
   }
 
   setScopes(id: string, scopes: Scope[]): boolean {
@@ -440,6 +611,12 @@ export class Store {
       lastSeenAt: device.lastSeenAt,
       revoked: device.revoked,
       fingerprint,
+      ...(device.pending ? { pending: true } : {}),
+      ...(device.revokedReason ? { revokedReason: device.revokedReason } : {}),
     }
   }
+}
+
+function sha256(s: string): string {
+  return createHash('sha256').update(s).digest('hex')
 }

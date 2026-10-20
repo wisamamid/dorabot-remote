@@ -13,8 +13,8 @@ describe('scope split', () => {
     }
   })
 
-  it('turns git and file reads on by default, and every write off', () => {
-    expect(SCOPE_DEFAULTS).toEqual(['sessions', 'chat', 'approvals', 'work', 'files', 'git'])
+  it('grants only sessions, chat and approvals by default', () => {
+    expect(SCOPE_DEFAULTS).toEqual(['sessions', 'chat', 'approvals'])
     for (const s of ['git_write', 'terminal', 'admin'] as Scope[]) expect(SCOPE_DEFAULTS).not.toContain(s)
   })
 
