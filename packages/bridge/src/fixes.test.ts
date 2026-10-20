@@ -10,7 +10,6 @@ import { DeviceConnection } from './connection.js'
 import { FakeGateway } from '../test/fake-gateway.js'
 import { loadSettings, readDorabotVersion, resolvePaths, type BridgePaths } from './config.js'
 import { mdnsName } from './addresses.js'
-import { checkPathParams } from './path-guard.js'
 import { trimHistoryResult } from './history-trim.js'
 import { applyEventToSnapshots } from './snapshot-state.js'
 
@@ -181,32 +180,11 @@ describe('live device record', () => {
   })
 })
 
-describe('path guard', () => {
-  const h = homedir()
-  it('blocks secrets and escapes, allows normal files', () => {
-    const extra = [home]
-    expect(checkPathParams('fs.read', { path: join(home, 'host-key.json') }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: '~/.ssh/id_rsa' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.list', { path: '~/Documents/../.aws' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: '../.config/gh/hosts.yml' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: 'Desktop/../../x' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: '.config/gh/hosts.yml' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: join(h, 'proj/.env') }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: join(h, 'proj/a.pem') }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('search.files', { path: h, query: 'x' }, extra)).toMatch(/blocked/)
-    expect(checkPathParams('fs.read', { path: join(h, 'proj/readme.md') }, extra)).toBeNull()
-    expect(checkPathParams('git.log', { path: '~/.ssh' }, extra)).toBeNull()
-  })
-  it('follows symlinks', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'pg-'))
-    mkdirSync(join(dir, 'secret'))
-    symlinkSync(join(dir, 'secret'), join(dir, 'link'))
-    expect(checkPathParams('fs.read', { path: join(dir, 'link/x') }, [join(dir, 'secret')])).toMatch(/blocked/)
-    rmSync(dir, { recursive: true, force: true })
-  })
-  it('is enforced on forwarded RPCs', async () => {
+describe('path guard (end to end)', () => {
+  it('refuses everything until a folder is shared', async () => {
     const { c } = await connect(await pair())
-    await expect(c.rpc('fs.read', { path: join(home, 'host-key.json') })).rejects.toThrow(/blocked/)
+    await expect(c.rpc('fs.read', { path: join(home, 'host-key.json') })).rejects.toThrow(/isn't shared/)
+    await expect(c.rpc('fs.list', { path: home })).rejects.toThrow(/isn't shared/)
     c.disconnect()
   })
 })
