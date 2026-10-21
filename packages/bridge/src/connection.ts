@@ -91,10 +91,6 @@ export class DeviceConnection {
   get isAuthed(): boolean {
     return this.authed && !this.closed
   }
-  /** Whether the peer supports deflate compression (set by compress branch). */
-  get peerDeflate(): boolean {
-    return false // TODO: connect to actual capability from compress branch
-  }
   private closed = false
   /** Last time any frame arrived from the phone. A suspended app stops sending, even if the socket stays open. */
   lastInboundAt = Date.now()
@@ -116,7 +112,13 @@ export class DeviceConnection {
   /** The one plaintext `hdr` this connection may receive. */
   private gotHdr = false
   /** The phone advertised 'deflate' in its encrypted auth envelope. */
-  private peerDeflate = false
+  private _peerDeflate = false
+  get peerDeflate(): boolean {
+    return this._peerDeflate
+  }
+  set peerDeflate(value: boolean) {
+    this._peerDeflate = value
+  }
 
   constructor(
     private readonly ws: DeviceSocket,
