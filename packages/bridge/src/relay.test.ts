@@ -4,6 +4,7 @@
  * relay. RELAY_LIVE_URL, when set, repeats pairing + connect + RPC against a real
  * deployed relay.
  */
+import { randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -552,13 +553,25 @@ describe('bridge through the relay', () => {
 
   it('replaces an oversize response with an error and keeps the connection', async () => {
     const client = await rig.connect(await rig.pair())
-    rig.gateway.overrides.set('sessions.list', 'x'.repeat(2 * 1024 * 1024))
+    // Incompressible on purpose: compression would otherwise make a 2 MiB string fit.
+    rig.gateway.overrides.set('sessions.list', randomBytes(2 * 1024 * 1024).toString('base64'))
     await expect(client.rpc('sessions.list', {})).rejects.toThrow(/too large/)
     rig.gateway.overrides.delete('sessions.list')
     // Stream is still in sync after the substitution.
     expect(await client.rpc('chat.send', { prompt: 'again' })).toMatchObject({ queued: true })
     expect(relay.maxHostFrame).toBeLessThanOrEqual(1024 * 1024)
     expect(relay.hostCloseCodes).not.toContain(1009)
+    client.disconnect()
+  })
+
+  it('delivers a large compressible response through the relay (phone advertises deflate)', async () => {
+    const client = await rig.connect(await rig.pair())
+    const big = { rows: Array.from({ length: 30000 }, (_, i) => ({ id: i, text: 'lorem ipsum dolor sit amet' })) }
+    expect(JSON.stringify(big).length).toBeGreaterThan(1024 * 1024)
+    rig.gateway.overrides.set('sessions.list', big)
+    expect(await client.rpc('sessions.list', {})).toEqual(big)
+    rig.gateway.overrides.delete('sessions.list')
+    expect(relay.maxHostFrame).toBeLessThanOrEqual(1024 * 1024)
     client.disconnect()
   })
 
