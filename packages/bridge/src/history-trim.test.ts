@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import {
   HISTORY_BUDGET_BYTES,
+  HISTORY_COMPRESSED_BUDGET_BYTES,
   HISTORY_LAN_CAP_BYTES,
   trimHistoryResult,
   getCachedHistory,
@@ -259,6 +260,66 @@ describe('history-trim', () => {
         expect((clipped.content as string).length).toBeLessThan(largeString.length)
         expect(clipped.content).toContain('[... truncated')
       }
+    })
+  })
+
+  describe('budget selection', () => {
+    it('accepts budget parameter and uses it for trimming', () => {
+      const messages = Array.from({ length: 10000 }, (_, i) => ({
+        id: i,
+        text: `message content that is long enough to exceed normal budgets when multiplied ${i}`,
+      }))
+      const result = { messages }
+
+      // Use a small frameLimit to force the result to be too large
+      const smallFrameLimit = 100_000 // 100KB frameLimit
+
+      // With small budget - should get fewer messages
+      const trimmedSmall = trimHistoryResult(
+        'sessions.get',
+        result,
+        smallFrameLimit,
+        { sessionId: 'sess-1' },
+        50_000 // 50KB budget
+      ) as Record<string, unknown>
+
+      // With large budget - should get more messages
+      const trimmedLarge = trimHistoryResult(
+        'sessions.get',
+        result,
+        smallFrameLimit,
+        { sessionId: 'sess-2' },
+        500_000 // 500KB budget
+      ) as Record<string, unknown>
+
+      // Larger budget should result in more messages returned
+      const smallCount = trimmedSmall.returnedMessages as number
+      const largeCount = trimmedLarge.returnedMessages as number
+      expect(smallCount > 0).toBe(true)
+      expect(largeCount > smallCount).toBe(true)
+    })
+
+    it('supports compressed budget parameter (2.5 MB)', () => {
+      const messages = Array.from({ length: 20000 }, (_, i) => ({
+        id: i,
+        text: `message with lots of content to make sure we definitely exceed the 2.5MB compressed budget threshold ${i}`.repeat(2),
+      }))
+      const result = { messages }
+
+      // With compressed budget
+      const trimmedCompressed = trimHistoryResult(
+        'sessions.get',
+        result,
+        HISTORY_LAN_CAP_BYTES,
+        { sessionId: 'sess-1' },
+        HISTORY_COMPRESSED_BUDGET_BYTES
+      ) as Record<string, unknown>
+
+      // Verify it's using the compressed budget
+      expect(trimmedCompressed.truncated).toBe(true)
+      expect((trimmedCompressed.returnedMessages as number) > 0).toBe(true)
+      // With 2.5MB budget, should allow substantial data
+      expect((trimmedCompressed.returnedMessages as number) > 100).toBe(true)
     })
   })
 })

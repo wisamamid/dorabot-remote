@@ -89,6 +89,10 @@ export class DeviceConnection {
   get isAuthed(): boolean {
     return this.authed && !this.closed
   }
+  /** Whether the peer supports deflate compression (set by compress branch). */
+  get peerDeflate(): boolean {
+    return false // TODO: connect to actual capability from compress branch
+  }
   private closed = false
   /** Last time any frame arrived from the phone. A suspended app stops sending, even if the socket stays open. */
   lastInboundAt = Date.now()
@@ -389,11 +393,15 @@ export class DeviceConnection {
       }
 
       const result = await this.host.callGateway(env.method, params)
+      // Use larger budget for compressed connections (pre-compression raw JSON size)
+      const budget = this.peerDeflate
+        ? (2.5 * 1024 * 1024) // 2.5 MB for compressed, will shrink ~2.5-4x
+        : undefined // Use default based on frameLimit
       reply(trimHistoryResult(env.method, filterSearchResult(env.method, result, guardCtx), this.ws.maxFrameBytes, {
         sessionId: typeof params.sessionId === 'string' ? params.sessionId : undefined,
         before: typeof params.before === 'number' ? params.before : undefined,
         limit: typeof params.limit === 'number' ? params.limit : undefined,
-      }))
+      }, budget))
     } catch (err) {
       fail((err as Error).message)
     }

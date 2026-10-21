@@ -4,6 +4,8 @@
  * result cannot cross the relay, so trim to the newest messages that fit.
  */
 export const HISTORY_BUDGET_BYTES = 700 * 1024
+/** Budget when compression is available (pre-compression raw JSON size). */
+export const HISTORY_COMPRESSED_BUDGET_BYTES = 2.5 * 1024 * 1024
 /** Cap applied on transports with no frame limit (LAN). */
 export const HISTORY_LAN_CAP_BYTES = 4 * 1024 * 1024
 const MAX_STRING_BYTES = 50 * 1024
@@ -80,12 +82,16 @@ function sliceMessages(
   return [kept, startIdx, startIdx > 0]
 }
 
-/** Returns the result unchanged when it is small enough for the transport. */
+/**
+ * Returns the result unchanged when it is small enough for the transport.
+ * If budget is provided, uses that for trimming; otherwise uses HISTORY_BUDGET_BYTES.
+ */
 export function trimHistoryResult(
   method: string,
   result: unknown,
   frameLimit: number | undefined,
-  params?: { before?: number; limit?: number; sessionId?: string }
+  params?: { before?: number; limit?: number; sessionId?: string },
+  budget?: number
 ): unknown {
   if (method !== 'sessions.get' && method !== 'chat.history') return result
 
@@ -96,12 +102,13 @@ export function trimHistoryResult(
   // If pagination is explicitly requested, always process it
   const hasExplicitPagination = before !== undefined
 
-  const limit = frameLimit !== undefined ? frameLimit - 4096 : HISTORY_LAN_CAP_BYTES
+  // Determine the frame budget for early exit check
+  const frameBudget = frameLimit !== undefined ? frameLimit - 4096 : HISTORY_LAN_CAP_BYTES
 
   // If result is small and no explicit pagination, return unchanged
-  if (size(result) <= limit && !hasExplicitPagination) return result
+  if (size(result) <= frameBudget && !hasExplicitPagination) return result
 
-  if (Array.isArray(result)) return trimMessages(result)
+  if (Array.isArray(result)) return trimMessages(result, budget ?? HISTORY_BUDGET_BYTES)
   const r = result as { messages?: unknown }
   if (r && Array.isArray(r.messages)) {
     // Cache the full history for pagination requests or when trimming
@@ -126,8 +133,9 @@ export function trimHistoryResult(
       }
     }
 
-    // Normal trimming for first load
-    const kept = trimMessages(r.messages)
+    // Normal trimming for first load: use budget if provided, otherwise use default
+    const trimBudget = budget ?? HISTORY_BUDGET_BYTES
+    const kept = trimMessages(r.messages, trimBudget)
     return { ...r, messages: kept, truncated: true, totalMessages: r.messages.length, returnedMessages: kept.length }
   }
   return result
