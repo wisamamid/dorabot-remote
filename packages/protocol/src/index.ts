@@ -1,4 +1,5 @@
 export * from './crypto.js'
+export * from './compress.js'
 export * from './wire.js'
 export * from './relay.js'
 export * from './policy.js'

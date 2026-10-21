@@ -108,6 +108,8 @@ export interface AuthEnvelope {
   /** Resume point: highest bridge seq the device already has. */
   lastSeq?: number
   clientVersion?: string
+  /** Optional features this phone understands, e.g. 'deflate' (see compress.ts). Absent on old phones. */
+  caps?: string[]
 }
 
 export interface ReadyEnvelope {
