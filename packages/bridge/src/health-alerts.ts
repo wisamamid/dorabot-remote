@@ -39,7 +39,7 @@ interface AlertWindow {
  */
 export class HealthAlerts {
   private health: RelayHealth
-  private consecutiveHbMisses = 0
+  private consecutiveSelfTestFailures = 0
   private linkDownAt: number | null = null
   private recoveryStartAt: number | null = null
   private alertWindows = new Map<string, AlertWindow>()
@@ -47,6 +47,7 @@ export class HealthAlerts {
   private readonly log: (msg: string) => void
   private readonly pusher?: PushNotifier
   private readonly now: () => number
+  private evalTimer: NodeJS.Timeout | null = null
 
   constructor(opts: HealthAlertsOptions) {
     this.notify = opts.notify
@@ -56,20 +57,31 @@ export class HealthAlerts {
     this.health = { state: 'ok', since: this.now() }
   }
 
+  start(): void {
+    if (this.evalTimer) return
+    this.evalTimer = setInterval(() => this.evaluate(), 15_000)
+    this.evalTimer.unref?.()
+  }
+
+  stop(): void {
+    if (this.evalTimer) clearInterval(this.evalTimer)
+    this.evalTimer = null
+  }
+
   /**
-   * Call after a relay state change (online/offline) or heartbeat result.
+   * Call after a relay state change (online/offline) or self-test result.
    *
-   * - heartbeat: passed (true) or missed (false)
+   * - selfTest: passed (true) or failed (false, only on genuine failures)
    * - relayState: 'online', 'offline', or 'connecting'
    */
-  update(opts: { heartbeat?: boolean; relayState?: string }): void {
+  update(opts: { selfTest?: boolean; relayState?: string }): void {
     const now = this.now()
 
-    // Track heartbeat misses. Reset to 0 on successful heartbeat.
-    if (opts.heartbeat === true) {
-      this.consecutiveHbMisses = 0
-    } else if (opts.heartbeat === false) {
-      this.consecutiveHbMisses++
+    // Track self-test failures. Reset to 0 on successful self-test.
+    if (opts.selfTest === true) {
+      this.consecutiveSelfTestFailures = 0
+    } else if (opts.selfTest === false) {
+      this.consecutiveSelfTestFailures++
     }
 
     // Track link state. Online = link is up. Offline/connecting = link is down.
@@ -85,10 +97,16 @@ export class HealthAlerts {
       this.recoveryStartAt = null // Reset recovery timer when link goes down again.
     }
 
+    this.evaluate()
+  }
+
+  private evaluate(): void {
+    const now = this.now()
+
     // Assess health.
     const linkDownMs = this.linkDownAt ? now - this.linkDownAt : 0
     const isUnhealthy =
-      this.consecutiveHbMisses >= 3 || // 3+ consecutive heartbeat misses
+      this.consecutiveSelfTestFailures >= 3 || // 3+ consecutive self-test failures
       linkDownMs > 3 * 60 * 1000 // link down for 3+ minutes
 
     // State transitions and alerts.
@@ -149,17 +167,18 @@ export class HealthAlerts {
 
   private getUnhealthyReason(): string {
     const reasons = []
-    if (this.consecutiveHbMisses >= 3) reasons.push(`${this.consecutiveHbMisses} heartbeat misses`)
-    if (this.linkDownAt) reasons.push(`link down for ${Math.round((Date.now() - this.linkDownAt) / 1000)}s`)
+    if (this.consecutiveSelfTestFailures >= 3) reasons.push(`${this.consecutiveSelfTestFailures} self-test failures`)
+    if (this.linkDownAt) reasons.push(`link down for ${Math.round((this.now() - this.linkDownAt) / 1000)}s`)
     return reasons.join(', ') || 'unknown'
   }
 
   private sendAlertPush(body: string): void {
-    // This would integrate with the PushNotifier to send an 'alert' kind push.
-    // For now, log it. In the real implementation, call:
-    // this.pusher?.sendAlert(body)
-    // But PushNotifier doesn't have this method yet; we'd need to add it.
-    this.log(`relay: alert push would be sent: "${body}"`)
+    if (!this.pusher) return
+    // Send alert push. Recovered alerts skip push to avoid noise (macOS notification only).
+    if (body.includes('reconnected')) return
+    void this.pusher.sendAlert().catch((err) => {
+      this.log(`relay: alert push failed: ${(err as Error).message}`)
+    })
   }
 
   getHealth(): RelayHealth {
@@ -168,7 +187,7 @@ export class HealthAlerts {
 
   reset(): void {
     this.health = { state: 'ok', since: this.now() }
-    this.consecutiveHbMisses = 0
+    this.consecutiveSelfTestFailures = 0
     this.linkDownAt = null
     this.recoveryStartAt = null
     this.alertWindows.clear()

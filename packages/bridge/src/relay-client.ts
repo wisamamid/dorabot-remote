@@ -153,6 +153,7 @@ export interface RelayClientOptions {
 
 export declare interface RelayClient {
   on(event: 'state', listener: (state: RelayState) => void): this
+  on(event: 'selftest', listener: (ok: boolean) => void): this
 }
 
 export class RelayClient extends EventEmitter {
@@ -470,6 +471,8 @@ export class RelayClient extends EventEmitter {
       const why = `probe closed by the relay (${code}${reason.length ? ` ${reason.toString()}` : ''})`
       if (code === RELAY_CLOSE.hostOffline) {
         // The room has no live host link for us: a genuine delivery failure.
+        this.abortSelfTest()
+        this.emit('selftest', false)
         fail(why)
         return
       }
@@ -502,6 +505,7 @@ export class RelayClient extends EventEmitter {
     if (!p || typeof n !== 'string' || p.n !== n) return false
     this.selfTestsPassed++
     this.abortSelfTest()
+    this.emit('selftest', true)
     return true
   }
 

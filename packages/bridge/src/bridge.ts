@@ -272,9 +272,16 @@ export class Bridge implements ConnectionHost {
         // Update health alerts on relay state changes.
         if (this.healthAlerts) this.healthAlerts.update({ relayState: s })
       })
+      this.relay.on('selftest', (ok) => {
+        // Wire self-test results to health alerts (only genuine failures, not inconclusive).
+        if (this.healthAlerts) this.healthAlerts.update({ selfTest: ok })
+      })
       this.syncRelayAccess()
       this.relay.start()
     }
+
+    // Start health alerts timer.
+    if (this.healthAlerts) this.healthAlerts.start()
 
     // The CLI revokes and grants from another process, straight into the DB.
     this.deviceTimer = setInterval(() => {
@@ -307,6 +314,7 @@ export class Bridge implements ConnectionHost {
     if (this.pendingTimer) clearInterval(this.pendingTimer)
     if (this.expiryTimer) clearInterval(this.expiryTimer)
     for (const c of this.connections) c.close('bridge shutting down')
+    this.healthAlerts?.stop()
     this.relay?.stop()
     this.gateway?.stop()
     await new Promise<void>((resolve) => {

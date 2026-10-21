@@ -120,10 +120,12 @@ export async function sendApns(body: PushBody, cfg: ApnsConfig, fetchFn: typeof 
   if (body.kind === 'withdraw') return { status: 204, body: {} }
   const host = body.env === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com'
   const jwt = await getApnsJwt(cfg, now, cache)
+  // After filtering 'withdraw', kind is one of the TEXT keys
+  const kind = body.kind as keyof typeof TEXT
   const res = await fetchFn(`https://${host}/3/device/${encodeURIComponent(body.token)}`, {
     method: 'POST',
-    headers: apnsHeaders(body.kind, body.rid, jwt, cfg.topic, Math.floor(now / 1000)),
-    body: JSON.stringify(buildApnsPayload(body.kind, body.rid, body.enc, body.kid)),
+    headers: apnsHeaders(kind, body.rid, jwt, cfg.topic, Math.floor(now / 1000)),
+    body: JSON.stringify(buildApnsPayload(kind, body.rid, body.enc, body.kid)),
   })
   if (res.ok) return { status: 200, body: { ok: true } }
   let reason = ''

@@ -8,7 +8,7 @@ import { isRelayId, verifyForRelayId } from '@dorabot-remote/protocol'
 import { APNS_DEFAULT_TOPIC, sendApns, type ApnsCache } from './apns.js'
 import { LIMITS } from './limits.js'
 
-export const PUSH_KINDS = ['question', 'approval', 'result', 'error', 'withdraw'] as const
+export const PUSH_KINDS = ['question', 'approval', 'result', 'error', 'alert', 'withdraw'] as const
 export type PushKind = (typeof PUSH_KINDS)[number]
 
 export interface PushBody {
@@ -74,6 +74,7 @@ const TEXT: Record<Exclude<PushKind, 'withdraw'>, { title: string; body: string 
   approval: { title: 'dorabot needs approval', body: 'Tap to review' },
   result: { title: 'Run finished', body: 'Tap to view' },
   error: { title: 'Run failed', body: 'Tap to view' },
+  alert: { title: 'dorabot remote', body: 'Your Mac lost its connection to the relay' },
 }
 
 const CHANNEL: Record<Exclude<PushKind, 'withdraw'>, string> = {
@@ -81,6 +82,7 @@ const CHANNEL: Record<Exclude<PushKind, 'withdraw'>, string> = {
   approval: 'approvals',
   result: 'activity',
   error: 'activity',
+  alert: 'activity',
 }
 
 const IOS: Record<Exclude<PushKind, 'withdraw'>, { priority: string; level: string; category?: string }> = {
@@ -88,6 +90,7 @@ const IOS: Record<Exclude<PushKind, 'withdraw'>, { priority: string; level: stri
   approval: { priority: '10', level: 'active', category: 'DR_APPROVAL' },
   result: { priority: '5', level: 'passive' },
   error: { priority: '5', level: 'passive' },
+  alert: { priority: '10', level: 'active', category: 'ACTIVITY' },
 }
 
 /** apns-collapse-id may not exceed 64 bytes. */
