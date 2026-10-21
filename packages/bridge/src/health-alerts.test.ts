@@ -181,6 +181,36 @@ describe('HealthAlerts state machine', () => {
     alerts.stop()
   })
 
+  it('3 consecutive timeouts with reconnects drive to degraded (zombie-link case)', () => {
+    const { alerts, notifications, tick } = setup()
+    alerts.start()
+    // Timeout 1: fail
+    alerts.update({ selfTest: false })
+    expect(alerts.getHealth().state).toBe('ok')
+    // Simulate quick reconnect and online
+    tick(500)
+    alerts.update({ relayState: 'offline' })
+    alerts.update({ relayState: 'online' })
+
+    // Timeout 2: fail again
+    tick(1000)
+    alerts.update({ selfTest: false })
+    expect(alerts.getHealth().state).toBe('ok')
+    // Quick reconnect
+    tick(500)
+    alerts.update({ relayState: 'offline' })
+    alerts.update({ relayState: 'online' })
+
+    // Timeout 3: go degraded
+    tick(1000)
+    alerts.update({ selfTest: false })
+    expect(alerts.getHealth().state).toBe('degraded')
+    expect(notifications).toHaveLength(1) // Exactly one alert
+    expect(notifications[0]!.body).toContain('lost its connection')
+
+    alerts.stop()
+  })
+
   it('logs health transitions', () => {
     const { alerts, logs } = setup()
     alerts.update({ selfTest: false })

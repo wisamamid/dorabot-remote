@@ -447,7 +447,10 @@ export class RelayClient extends EventEmitter {
       this.opts.log(`relay self-test failed: ${why} (after ${Date.now() - started}ms); reconnecting the host link`)
       ws.terminate()
     }
-    const timer = setTimeout(() => fail('the room never delivered our probe to the host link'), timeoutMs)
+    const timer = setTimeout(() => {
+      this.emit('selftest', false)
+      fail('the room never delivered our probe to the host link')
+    }, timeoutMs)
     this.pendingSelfTest = { n, probe: null, timer, ws }
     try {
       const url = relayDeviceUrl({ u: this.opts.url, i: this.relayId })
