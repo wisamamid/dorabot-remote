@@ -60,7 +60,9 @@ const RELAY_SINCE_KEY = 'relay.accessSince'
 /** Enforcement turns on at the latest this long after the first start with tokens, even if an old phone never reconnected. */
 export const RELAY_ENFORCE_AFTER_MS = 14 * 24 * 60 * 60 * 1000
 import { CONTROL_PAGE } from './control-page.js'
+import { CompatChecker } from './compat-check.js'
 import { GatewayClient } from './gateway-client.js'
+import { HealthAlerts } from './health-alerts.js'
 import { applyEventToSnapshots } from './snapshot-state.js'
 import { Store, type AuditEntry, type DeviceRecord } from './store.js'
 import { isControlAuthorized, loadControlSecret, sessionSetCookie } from './control-auth.js'
@@ -162,6 +164,8 @@ export class Bridge implements ConnectionHost {
   /** [SEC-RELAY] Live single-use pairing tickets by pairing code. */
   private relayTickets = new Map<string, { tok: string; exp: number }>()
   private pusher: PushNotifier | null = null
+  private healthAlerts: HealthAlerts | null = null
+  private compatChecker: CompatChecker | null = null
   readonly logLines: string[] = []
   private controlSecret = ''
   private pendingTimer: NodeJS.Timeout | null = null
@@ -227,15 +231,29 @@ export class Bridge implements ConnectionHost {
         onDeviceSocket: (sock, label) => this.routeRelaySocket(sock, label),
       })
     }
+    const dorabotVersion = readDorabotVersion(this.paths)
     this.hostSummary = {
       id: this.settings.hostId,
       name: this.settings.hostName,
       fingerprint: fingerprint(this.sodium, this.hostIdentity.publicKey),
       version: BRIDGE_VERSION,
-      dorabotVersion: readDorabotVersion(this.paths),
+      dorabotVersion,
       ...(this.relayInfo ? { relay: this.relayInfo } : {}),
     }
     this.gatewayCursor = this.store.getMeta<Record<string, number>>(GATEWAY_CURSOR_KEY, {})
+
+    // Initialize health alerts and compat checker.
+    if (this.relay) {
+      this.healthAlerts = new HealthAlerts({
+        notify: this.notify,
+        log: (m) => this.log(m),
+        pusher: this.pusher ?? undefined,
+      })
+    }
+    this.compatChecker = new CompatChecker({
+      log: (m) => this.log(m),
+      notify: this.notify,
+    })
 
     this.gateway = new GatewayClient({
       socketPath: this.paths.gatewaySocket,
@@ -249,10 +267,21 @@ export class Bridge implements ConnectionHost {
 
     await this.listen()
     if (this.relay) {
-      this.relay.on('state', (s) => this.broadcastBridgeEvent('remote.relay_state', { state: s }))
+      this.relay.on('state', (s) => {
+        this.broadcastBridgeEvent('remote.relay_state', { state: s })
+        // Update health alerts on relay state changes.
+        if (this.healthAlerts) this.healthAlerts.update({ relayState: s })
+      })
+      this.relay.on('selftest', (ok) => {
+        // Wire self-test results to health alerts (only genuine failures, not inconclusive).
+        if (this.healthAlerts) this.healthAlerts.update({ selfTest: ok })
+      })
       this.syncRelayAccess()
       this.relay.start()
     }
+
+    // Start health alerts timer.
+    if (this.healthAlerts) this.healthAlerts.start()
 
     // The CLI revokes and grants from another process, straight into the DB.
     this.deviceTimer = setInterval(() => {
@@ -285,6 +314,7 @@ export class Bridge implements ConnectionHost {
     if (this.pendingTimer) clearInterval(this.pendingTimer)
     if (this.expiryTimer) clearInterval(this.expiryTimer)
     for (const c of this.connections) c.close('bridge shutting down')
+    this.healthAlerts?.stop()
     this.relay?.stop()
     this.gateway?.stop()
     await new Promise<void>((resolve) => {
@@ -432,6 +462,13 @@ export class Bridge implements ConnectionHost {
       const status = (await this.gateway.rpc('status')) as StatusUpdate
       this.absorbStatus(status)
       await this.subscribeToAllSessions()
+      // Check dorabot compatibility.
+      if (this.compatChecker) {
+        await this.compatChecker.check({
+          dorabotVersion: this.hostSummary.dorabotVersion,
+          callGateway: (m, p) => this.gateway.rpc(m, p),
+        })
+      }
     } catch (err) {
       this.log(`failed to prime gateway state: ${(err as Error).message}`)
     }
@@ -1244,10 +1281,11 @@ export class Bridge implements ConnectionHost {
     if (url.pathname === '/api/state') {
       if (method !== 'GET') return json(405, { error: 'method not allowed' })
       const devices = this.store.listDevices().map((d) => this.deviceSummary(d))
-      json(200, {
+      const relayState = this.relay ? { state: this.relay.state, id: this.relayInfo?.i, url: this.relayInfo?.u } : null
+      const response: Record<string, unknown> = {
         host: this.hostSummary,
         gatewayConnected: this.gatewayConnected(),
-        relay: this.relay ? { state: this.relay.state, id: this.relayInfo?.i, url: this.relayInfo?.u } : null,
+        relay: relayState,
         devices,
         pendingDevices: this.store
           .listPending()
@@ -1257,7 +1295,14 @@ export class Bridge implements ConnectionHost {
         connections: [...this.connections].map((c) => ({ device: c.device?.name ?? null, address: c.remoteAddress })),
         roots: this.roots.listRoots(),
         log: this.logLines.slice(-80),
-      })
+      }
+      if (this.healthAlerts) {
+        response.health = { relay: this.healthAlerts.getHealth() }
+      }
+      if (this.compatChecker) {
+        response.compat = this.compatChecker.getStatus()
+      }
+      json(200, response)
       return
     }
 

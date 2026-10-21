@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import {
   BRIDGE_METHODS,
+  CAP_DEFLATE,
   SecureChannel,
   PROTOCOL_VERSION,
   deriveSessionKeys,
@@ -26,6 +27,7 @@ import type { DeviceRecord } from './store.js'
 import { trimHistoryResult } from './history-trim.js'
 import { checkPathParams, filterSearchResult } from './path-guard.js'
 import { sanitizeParams } from './param-allowlist.js'
+import { encodeOutbound } from './compress.js'
 
 /** Replay is paced against this so a long catch-up cannot blow the socket buffer. */
 const SEND_HIGH_WATER_BYTES = 512 * 1024
@@ -109,6 +111,14 @@ export class DeviceConnection {
   private handshakeTimer: NodeJS.Timeout | null = null
   /** The one plaintext `hdr` this connection may receive. */
   private gotHdr = false
+  /** The phone advertised 'deflate' in its encrypted auth envelope. */
+  private _peerDeflate = false
+  get peerDeflate(): boolean {
+    return this._peerDeflate
+  }
+  set peerDeflate(value: boolean) {
+    this._peerDeflate = value
+  }
 
   constructor(
     private readonly ws: DeviceSocket,
@@ -263,6 +273,7 @@ export class DeviceConnection {
       case 'auth': {
         if (this.authed) return
         this.authed = true
+        this.peerDeflate = Array.isArray(env.caps) && env.caps.includes(CAP_DEFLATE)
         if (this.handshakeTimer) clearTimeout(this.handshakeTimer)
         this.handshakeTimer = null
         const device = this.device!
@@ -389,7 +400,15 @@ export class DeviceConnection {
       }
 
       const result = await this.host.callGateway(env.method, params)
-      reply(trimHistoryResult(env.method, filterSearchResult(env.method, result, guardCtx), this.ws.maxFrameBytes))
+      // Use larger budget for compressed connections (pre-compression raw JSON size)
+      const budget = this.peerDeflate
+        ? (2.5 * 1024 * 1024) // 2.5 MB for compressed, will shrink ~2.5-4x
+        : undefined // Use default based on frameLimit
+      reply(trimHistoryResult(env.method, filterSearchResult(env.method, result, guardCtx), this.ws.maxFrameBytes, {
+        sessionId: typeof params.sessionId === 'string' ? params.sessionId : undefined,
+        before: typeof params.before === 'number' ? params.before : undefined,
+        limit: typeof params.limit === 'number' ? params.limit : undefined,
+      }, budget))
     } catch (err) {
       fail((err as Error).message)
     }
@@ -451,11 +470,14 @@ export class DeviceConnection {
       if (this.closed || !this.channel) return
       try {
         const limit = this.ws.maxFrameBytes
+        // Compress (if negotiated and large) before sealing; the relay budget applies to
+        // the compressed+sealed size.
+        let plain = encodeOutbound(env, this.peerDeflate)
         if (limit !== undefined) {
           // Sealing advances the stream counter, so an oversize frame cannot be
           // sealed and then discarded: the phone would lose sync. Size it first
-          // (ciphertext = JSON bytes + 16 byte tag) and substitute or drop.
-          const size = Buffer.byteLength(JSON.stringify(env)) + SEAL_OVERHEAD_BYTES
+          // (ciphertext = plaintext bytes + 16 byte tag) and substitute or drop.
+          const size = plain.length + SEAL_OVERHEAD_BYTES
           if (size > limit) {
             if (env.t === 'rpc_res') {
               this.host.log(`response of ${size} bytes is too large for the relay; replacing with an error`)
@@ -464,13 +486,14 @@ export class DeviceConnection {
                 id: env.id,
                 error: { message: `response too large to send over the relay (${size} bytes)`, code: 'too_large' },
               }
+              plain = encodeOutbound(env, this.peerDeflate)
             } else {
               this.host.log(`dropped a ${size} byte ${env.t} event: too large for the relay`)
               return
             }
           }
         }
-        const frame = this.channel.seal(env)
+        const frame = this.channel.sealBytes(plain)
         this.ws.send(Buffer.from(frame.buffer, frame.byteOffset, frame.byteLength))
         await this.waitForDrain()
       } catch (err) {

@@ -18,6 +18,7 @@ import {
   toB64,
 } from './crypto.js'
 import { openSealedJson } from './crypto.js'
+import { CAP_DEFLATE } from './compress.js'
 import { RELAY_HEAD_START_MS, relayAuthFrame, relayDeviceUrl, relayTokenHash, type RelayInfo } from './relay.js'
 import { methodsForScopes } from './policy.js'
 import type { DeviceSummary, Envelope, HostSummary, PairingPayload, Scope } from './wire.js'
@@ -572,7 +573,7 @@ export class RemoteClient {
       this.setTransport(transport)
       this.attempt = 0
       this.log(`race won by ${transport} ${this.describeTarget(address, transport)} after ${Date.now() - raceStart}ms`)
-      this.sendEnvelope({ t: 'auth', lastSeq: this.lastSeq, clientVersion: this.opts.clientVersion })
+      this.sendEnvelope({ t: 'auth', lastSeq: this.lastSeq, clientVersion: this.opts.clientVersion, caps: [CAP_DEFLATE] })
     }
 
     const lose = (reason: string): void => {
@@ -701,7 +702,7 @@ export class RemoteClient {
                   myStatic: this.opts.identity,
                   theirStaticPk: this.opts.hostPublicKey,
                 })
-                channel = SecureChannel.create(null, keys)
+                channel = SecureChannel.create(null, keys, { acceptCompressed: true })
                 socket.send(JSON.stringify({ t: 'hdr', hdr: toB64(null, channel.startSend()) }))
                 this.ephemeral = ephemeral
                 return

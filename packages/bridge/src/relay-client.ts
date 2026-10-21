@@ -153,6 +153,7 @@ export interface RelayClientOptions {
 
 export declare interface RelayClient {
   on(event: 'state', listener: (state: RelayState) => void): this
+  on(event: 'selftest', listener: (ok: boolean) => void): this
 }
 
 export class RelayClient extends EventEmitter {
@@ -446,7 +447,10 @@ export class RelayClient extends EventEmitter {
       this.opts.log(`relay self-test failed: ${why} (after ${Date.now() - started}ms); reconnecting the host link`)
       ws.terminate()
     }
-    const timer = setTimeout(() => fail('the room never delivered our probe to the host link'), timeoutMs)
+    const timer = setTimeout(() => {
+      this.emit('selftest', false)
+      fail('the room never delivered our probe to the host link')
+    }, timeoutMs)
     this.pendingSelfTest = { n, probe: null, timer, ws }
     try {
       const url = relayDeviceUrl({ u: this.opts.url, i: this.relayId })
@@ -470,6 +474,8 @@ export class RelayClient extends EventEmitter {
       const why = `probe closed by the relay (${code}${reason.length ? ` ${reason.toString()}` : ''})`
       if (code === RELAY_CLOSE.hostOffline) {
         // The room has no live host link for us: a genuine delivery failure.
+        this.abortSelfTest()
+        this.emit('selftest', false)
         fail(why)
         return
       }
@@ -502,6 +508,7 @@ export class RelayClient extends EventEmitter {
     if (!p || typeof n !== 'string' || p.n !== n) return false
     this.selfTestsPassed++
     this.abortSelfTest()
+    this.emit('selftest', true)
     return true
   }
 

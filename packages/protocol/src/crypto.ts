@@ -27,12 +27,14 @@
  *     transcript binds the keys to the identities, defeating key-misbinding.
  *
  * Wire format: handshake frames are JSON text. Every frame after that is one
- * binary AEAD message whose plaintext is UTF-8 JSON.
+ * binary AEAD message whose plaintext is UTF-8 JSON, or (host -> phone only, large
+ * frames, negotiated) a compressed form; see compress.ts.
  */
 import { xchacha20poly1305 } from '@noble/ciphers/chacha.js'
 import { x25519 } from '@noble/curves/ed25519.js'
 import { blake2b } from '@noble/hashes/blake2.js'
 import { randomBytes } from '@noble/hashes/utils.js'
+import { inflateFrame, isCompressedFrame } from './compress.js'
 
 export const PROTOCOL_VERSION = 1
 
@@ -289,10 +291,18 @@ export class SecureChannel {
   private txCounter = 0n
   private rxCounter = 0n
 
-  private constructor(private readonly keys: SessionKeys) {}
+  private constructor(
+    private readonly keys: SessionKeys,
+    private readonly acceptCompressed: boolean,
+  ) {}
 
-  static create(_s: unknown, keys: SessionKeys): SecureChannel {
-    return new SecureChannel(keys)
+  /**
+   * `acceptCompressed` is true only on the side that receives compressed frames (the
+   * phone). The bridge leaves it false, so a compressed frame from a phone is a
+   * decode failure and ends the connection: that direction is never compressed.
+   */
+  static create(_s: unknown, keys: SessionKeys, opts: { acceptCompressed?: boolean } = {}): SecureChannel {
+    return new SecureChannel(keys, opts.acceptCompressed === true)
   }
 
   /** Begin our outbound stream. The returned header must be sent to the peer. */
@@ -325,10 +335,15 @@ export class SecureChannel {
   }
 
   seal(value: unknown): Uint8Array {
+    return this.sealBytes(utf8(null, JSON.stringify(value)))
+  }
+
+  /** Seal an already-encoded plaintext (JSON bytes, or a compress.ts frame). Advances the counter. */
+  sealBytes(plain: Uint8Array): Uint8Array {
     if (!this.txPrefix) throw new Error('secure channel: send stream not started')
     const nonce = this.nonce(this.txPrefix, this.txCounter)
     this.txCounter += 1n
-    return xchacha20poly1305(this.keys.tx, nonce).encrypt(utf8(null, JSON.stringify(value)))
+    return xchacha20poly1305(this.keys.tx, nonce).encrypt(plain)
   }
 
   open<T = unknown>(frame: Uint8Array): T {
@@ -336,6 +351,10 @@ export class SecureChannel {
     const nonce = this.nonce(this.rxPrefix, this.rxCounter)
     const plain = xchacha20poly1305(this.keys.rx, nonce).decrypt(frame)
     this.rxCounter += 1n
+    if (isCompressedFrame(plain)) {
+      if (!this.acceptCompressed) throw new Error('unexpected compressed frame')
+      return JSON.parse(fromUtf8(null, inflateFrame(plain))) as T
+    }
     return JSON.parse(fromUtf8(null, plain)) as T
   }
 }

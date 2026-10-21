@@ -11,7 +11,7 @@ import { signBytes, type SigningKeyPair } from '@dorabot-remote/protocol'
 import { buildPushContent, encryptPushContent, parsePushKey, pushKeyId, type PushContent } from './push-content.js'
 import type { DeviceRecord, Store } from './store.js'
 
-export type PushKind = 'question' | 'approval' | 'result' | 'error'
+export type PushKind = 'question' | 'approval' | 'result' | 'error' | 'alert'
 
 export const PUSH_TOKEN_RE = /^[0-9a-fA-F]{64,200}$/
 export const APPROVAL_COALESCE_MS = 30_000
@@ -129,6 +129,22 @@ export class PushNotifier {
     } catch {
       return undefined
     }
+  }
+
+  /**
+   * Send a contentless alert push to all devices with push tokens (not revoked).
+   * Best-effort: failures are logged only.
+   */
+  async sendAlert(): Promise<void> {
+    if (!this.opts.relay) return
+    const promises: Promise<void>[] = []
+    for (const device of this.opts.store.listDevices()) {
+      if (device.revoked || !device.pushToken || !device.pushPlatform) continue
+      // Alert: contentless, no rid, no device offline check, no scope requirements.
+      const rid = `alert-${this.now().toString(36)}`
+      promises.push(this.send(device, 'alert', rid, null))
+    }
+    await Promise.all(promises)
   }
 
   private async send(device: DeviceRecord, kind: PushKind, rid: string, content: PushContent | null): Promise<void> {
