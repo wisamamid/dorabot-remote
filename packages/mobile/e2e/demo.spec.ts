@@ -105,6 +105,33 @@ test.describe('DoraBot Remote iOS - Demo Mode', () => {
     await expect(page.getByTestId('full-command').filter({ hasText: 'git push --force origin release/2.4' })).toBeVisible()
   })
 
+  test('Inbox: Always allow offers a confirmation sheet for a routine approval, never a risky one', async ({ page }) => {
+    await page.goto('/')
+    await page.waitForLoadState('networkidle')
+    await page.locator('button, a', { hasText: /Try a demo/ }).click()
+    await page.waitForLoadState('networkidle')
+    await page.locator('button, [role="tab"]', { hasText: /Inbox/ }).click()
+    await page.waitForTimeout(500)
+
+    // Only the routine approval (npm test) gets the option.
+    const always = page.getByRole('button', { name: /Always allow/ })
+    await expect(always).toHaveCount(1)
+    await expect(always).toContainText('this exact command')
+    await always.click()
+
+    const sheet = page.getByRole('dialog', { name: /Always allow/ })
+    await expect(sheet).toBeVisible()
+    await expect(sheet).toContainText('npm test')
+    await expect(sheet).toContainText(/Face ID/)
+    await sheet.getByRole('button', { name: 'Cancel' }).click()
+    await expect(sheet).toHaveCount(0)
+
+    // Confirm: the rule is saved (demo has no OS prompt), this request is approved, and Settings lists it.
+    await always.click()
+    await page.getByRole('dialog', { name: /Always allow/ }).getByRole('button', { name: 'Continue' }).click()
+    await expect(page.locator('text=/All.*tests pass|demo/i').first()).toBeVisible({ timeout: 5000 })
+  })
+
   test('Inbox: answer question by choosing an option', async ({ page }) => {
     await page.goto('/')
     await page.waitForLoadState('networkidle')

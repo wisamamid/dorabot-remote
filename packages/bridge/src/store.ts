@@ -72,6 +72,15 @@ export interface PinRecord {
   pinnedAt: number
 }
 
+export interface AllowRuleRecord {
+  id: string
+  kind: 'tool' | 'exact'
+  toolName: string
+  command: string | null
+  createdAt: number
+  createdBy: string | null
+}
+
 export interface StoredEvent {
   seq: number
   event: string
@@ -159,6 +168,16 @@ export class Store {
         pinned_at INTEGER NOT NULL
       );
 
+      -- Bridge-managed auto-approve rules ("always allow"). Never touches dorabot's own config.
+      CREATE TABLE IF NOT EXISTS allow_rules (
+        id         TEXT PRIMARY KEY,
+        kind       TEXT NOT NULL,
+        tool_name  TEXT NOT NULL,
+        command    TEXT,
+        created_at INTEGER NOT NULL,
+        created_by TEXT
+      );
+
       CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -243,6 +262,41 @@ export class Store {
       return this.db.prepare('INSERT OR IGNORE INTO pins (id, pinned_at) VALUES (?, ?)').run(id, Date.now()).changes > 0
     }
     return this.db.prepare('DELETE FROM pins WHERE id = ?').run(id).changes > 0
+  }
+
+  // -------------------------------------------------------------------------
+  // Always-allow rules
+  // -------------------------------------------------------------------------
+
+  listRules(): AllowRuleRecord[] {
+    const rows = this.db.prepare('SELECT * FROM allow_rules ORDER BY created_at DESC, id ASC').all() as Record<string, unknown>[]
+    return rows.map((r) => ({
+      id: String(r.id),
+      kind: r.kind === 'exact' ? 'exact' : 'tool',
+      toolName: String(r.tool_name),
+      command: (r.command as string | null) ?? null,
+      createdAt: Number(r.created_at),
+      createdBy: (r.created_by as string | null) ?? null,
+    }))
+  }
+
+  /** Adds a rule, or returns the existing identical one. */
+  addRule(rule: { kind: 'tool' | 'exact'; toolName: string; command?: string | null; createdBy?: string | null }): AllowRuleRecord {
+    const command = rule.kind === 'exact' ? (rule.command ?? '') : null
+    const dupe = this.listRules().find((r) => r.kind === rule.kind && r.toolName === rule.toolName && r.command === command)
+    if (dupe) return dupe
+    const id = randomBytes(5).toString('hex')
+    this.db
+      .prepare('INSERT INTO allow_rules (id, kind, tool_name, command, created_at, created_by) VALUES (?,?,?,?,?,?)')
+      .run(id, rule.kind, rule.toolName, command, Date.now(), rule.createdBy ?? null)
+    return this.listRules().find((r) => r.id === id)!
+  }
+
+  removeRule(id: string): AllowRuleRecord | null {
+    const rule = this.listRules().find((r) => r.id === id) ?? null
+    if (!rule) return null
+    this.db.prepare('DELETE FROM allow_rules WHERE id = ?').run(id)
+    return rule
   }
 
   /** Drop pins whose id is not in `keep`. Returns how many were removed. */

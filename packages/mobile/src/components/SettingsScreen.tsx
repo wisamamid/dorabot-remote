@@ -6,6 +6,7 @@ import { useAppLock } from '../lib/app-lock.js'
 import { usePush } from '../lib/push-context.js'
 import { ConnectionLogScreen } from './ConnectionLogScreen.js'
 import { MacsSection } from './MacsSection.js'
+import { RulesSection } from './RulesSection.js'
 import { displayName } from '../lib/hosts.js'
 import { Button, Card, Dot, Screen, cx } from './ui.js'
 
@@ -92,6 +93,8 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
             />
           </Card>
         </section>
+
+        {conn.hasScope('approvals') && <RulesSection />}
 
         {push.supported && conn.hasScope('approvals') && (
           <section className="space-y-2">

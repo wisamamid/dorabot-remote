@@ -42,6 +42,12 @@ export interface ApprovalAuthDeps {
 
 const defaultDeps: ApprovalAuthDeps = { fresh: (reason) => authenticate(reason, { fresh: true }), native: isNative }
 
+/** A fresh Face ID / passcode check for one specific action. Null means go ahead, else the message to show. */
+export async function requireFreshAuth(reason: string, deps: ApprovalAuthDeps = defaultDeps): Promise<string | null> {
+  const verdict = await deps.fresh(reason)
+  return verdictAllows(verdict, deps.native) ? null : verdictMessage(verdict)
+}
+
 /** Resolves to null when the approval may proceed, else the message to show. */
 export async function requireApprovalAuth(
   toolName: string | undefined,
@@ -50,6 +56,5 @@ export async function requireApprovalAuth(
   deps: ApprovalAuthDeps = defaultDeps,
 ): Promise<string | null> {
   if (authLevelFor(toolName, input, ctx) === 'none') return null
-  const verdict = await deps.fresh('Approve a risky action')
-  return verdictAllows(verdict, deps.native) ? null : verdictMessage(verdict)
+  return requireFreshAuth('Approve a risky action', deps)
 }

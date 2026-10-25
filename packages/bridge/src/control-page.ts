@@ -123,6 +123,12 @@ export const CONTROL_PAGE = `<!doctype html>
     <div id="root-msg" class="small" style="margin-top:8px;color:var(--danger)"></div>
   </div>
 
+  <h2>Always-allow rules</h2>
+  <div class="card">
+    <div class="small muted" style="margin-bottom:10px">Tool calls your phone chose to always approve. They are approved here, on the bridge, and recorded in the audit log. Risky actions are never covered. Rules can only be added from the phone (with Face ID).</div>
+    <div id="rules"></div>
+  </div>
+
   <h2>Audit log</h2>
   <div class="card">
     <div class="row" style="margin-bottom:10px">
@@ -210,6 +216,11 @@ function render() {
   roots.innerHTML = state.roots && state.roots.length
     ? state.roots.map(r => '<div class="row" style="padding:4px 0"><code>' + esc(r) + '</code><button class="small danger" data-root="' + esc(r) + '" onclick="removeRoot(this.dataset.root)">Remove</button></div>').join('')
     : '<div class="empty">No folders shared.</div>';
+
+  const rules = document.getElementById('rules');
+  rules.innerHTML = state.rules && state.rules.length
+    ? state.rules.map(r => '<div class="row" style="padding:4px 0"><span><code>' + esc(r.label) + '</code> <span class="muted small">' + esc(r.createdBy || '') + ' · ' + new Date(r.createdAt).toLocaleDateString() + '</span></span><button class="small danger" data-rule="' + esc(r.id) + '" onclick="removeRule(this.dataset.rule)">Remove</button></div>').join('')
+    : '<div class="empty">No rules. Every approval is asked.</div>';
 
   const reqs = document.getElementById('requests');
   if (!state.scopeRequests.length) {
@@ -299,6 +310,11 @@ async function addRoot() {
 
 async function removeRoot(path) {
   await api('/api/roots', { action: 'remove', path });
+  load();
+}
+
+async function removeRule(id) {
+  await api('/api/rules', { action: 'remove', id });
   load();
 }
 

@@ -55,6 +55,9 @@ const ALLOWED = [
   'agent.interrupt',
   'remote.pins.list',
   'remote.pins.set',
+  'remote.rules.list',
+  'remote.rules.add',
+  'remote.rules.remove',
   'chat.send',
   'chat.answerQuestion',
   'tool.approve',
@@ -182,6 +185,7 @@ export function createDemoClient(handlers: DemoHandlers, now: () => number = Dat
   let models: Record<string, string> = {}
   let names: Record<string, string> = {}
   let pins: Array<{ id: string; pinnedAt: number }> = []
+  let rules: Array<{ id: string; kind: 'tool' | 'exact'; toolName: string; command: string | null; createdAt: number; createdBy: string | null }> = []
   const history = transcripts(t0)
   const sessions: StoredSession[] = [
     {
@@ -336,6 +340,25 @@ export function createDemoClient(handlers: DemoHandlers, now: () => number = Dat
         }
 
         return { messages: allMessages }
+      }
+      case 'remote.rules.list':
+        return rules
+      case 'remote.rules.add': {
+        if (params.freshAuth !== true) throw new Error('adding an always-allow rule needs a fresh Face ID confirmation')
+        const kind = params.kind === 'exact' ? 'exact' : 'tool'
+        const command = kind === 'exact' ? String(params.command ?? '') : null
+        const toolName = String(params.toolName ?? '')
+        let rule = rules.find((r) => r.kind === kind && r.toolName === toolName && r.command === command)
+        if (!rule) {
+          rule = { id: `demo-rule-${rules.length + 1}`, kind, toolName, command, createdAt: now(), createdBy: 'This phone (demo)' }
+          rules = [rule, ...rules]
+        }
+        return { rule, rules }
+      }
+      case 'remote.rules.remove': {
+        const had = rules.some((r) => r.id === params.id)
+        rules = rules.filter((r) => r.id !== params.id)
+        return { removed: had, rules }
       }
       case 'remote.pins.list':
         return pins

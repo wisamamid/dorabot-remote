@@ -64,6 +64,7 @@ import { CompatChecker } from './compat-check.js'
 import { GatewayClient } from './gateway-client.js'
 import { HealthAlerts } from './health-alerts.js'
 import { applyEventToSnapshots } from './snapshot-state.js'
+import { MAX_RULES, describeRule, findMatchingRule, parseNewRule } from './rules.js'
 import { Store, type AuditEntry, type DeviceRecord } from './store.js'
 import { isControlAuthorized, loadControlSecret, sessionSetCookie } from './control-auth.js'
 
@@ -556,6 +557,8 @@ export class Bridge implements ConnectionHost {
 
     if (NEVER_FORWARD_EVENTS.has(name)) return
 
+    if (name === 'agent.tool_approval' && this.tryAutoApprove(d, () => this.onGatewayEvent(name, data, seq))) return
+
     if (name === 'session.snapshot') {
       const snap = data as SessionSnapshot
       if (snap?.sessionKey) {
@@ -643,6 +646,38 @@ export class Bridge implements ConnectionHost {
     const d = this.store.getDevice(id)
     // Defence in depth: whatever consumes a pending device sees no permissions at all.
     return d?.pending ? { ...d, scopes: [] } : d
+  }
+
+  /** Request ids whose auto-approve failed once: they are delivered to phones normally, never retried. */
+  private readonly autoApproveFailed = new Set<string>()
+
+  /**
+   * "Always allow" rules. When the gateway asks for approval and a rule covers it (and the
+   * input is not risky), approve it here with only {requestId}, audit it, and keep it off the
+   * phones. Returns true when the event was taken; `deliver` re-runs it as a normal event if
+   * the gateway refuses the approval.
+   */
+  private tryAutoApprove(d: Record<string, unknown>, deliver: () => void): boolean {
+    const requestId = typeof d.requestId === 'string' ? d.requestId : ''
+    if (!requestId || this.autoApproveFailed.has(requestId)) return false
+    const rule = findMatchingRule(this.store.listRules(), d.toolName, d.input, typeof d.blockedPath === 'string' ? { blockedPath: d.blockedPath } : {})
+    if (!rule) return false
+    const tool = String(d.toolName).replace(/[\u0000-\u001f]/g, ' ').slice(0, 60)
+    void this.gateway
+      .rpc('tool.approve', { requestId })
+      .then(() => {
+        this.auditLog.record({ action: 'auto_approve', method: 'tool.approve', requestId, summary: `tool=${tool} rule=${rule.id}`, transport: 'rule' })
+      })
+      .catch((err: Error) => {
+        this.log(`auto-approve of ${tool} failed (${err.message}); asking the phone instead`)
+        this.autoApproveFailed.add(requestId)
+        deliver()
+      })
+    return true
+  }
+
+  private broadcastRules(): void {
+    this.broadcastBridgeEvent('remote.rules_changed', { rules: this.store.listRules() })
   }
 
   /**
@@ -856,6 +891,29 @@ export class Bridge implements ConnectionHost {
         return { pins: this.store.listPins() }
       }
 
+      case 'remote.rules.list': {
+        this.requireScope(conn, 'approvals')
+        return this.store.listRules()
+      }
+
+      case 'remote.rules.add': {
+        this.requireScope(conn, 'approvals')
+        // The phone sets this only after a Face ID / passcode prompt for this very action.
+        if (params.freshAuth !== true) throw new Error('adding an always-allow rule needs a fresh Face ID confirmation')
+        const spec = parseNewRule(params)
+        if (this.store.listRules().length >= MAX_RULES) throw new Error(`you can keep at most ${MAX_RULES} rules`)
+        const rule = this.store.addRule({ ...spec, createdBy: conn.device?.name ?? null })
+        this.auditLog.record({ deviceId: conn.device?.id ?? null, deviceName: conn.device?.name ?? null, action: 'rule_add', summary: `rule=${rule.id} ${describeRule(rule)}`, transport: this.transports.get(conn) ?? 'direct' })
+        this.broadcastRules()
+        return { rule, rules: this.store.listRules() }
+      }
+
+      case 'remote.rules.remove': {
+        this.requireScope(conn, 'approvals')
+        const removed = this.removeRule(String(params.id ?? ''), conn.device ? { id: conn.device.id, name: conn.device.name } : null, this.transports.get(conn) ?? 'direct')
+        return { removed: removed !== null, rules: this.store.listRules() }
+      }
+
       case 'remote.events': {
         const after = Number(params.afterSeq ?? 0)
         const limit = Math.min(Number(params.limit ?? 200), 1000)
@@ -871,6 +929,15 @@ export class Bridge implements ConnectionHost {
       default:
         throw new Error(`unknown bridge method: ${method}`)
     }
+  }
+
+  /** Shared by the phone, the control page and (via the DB) the CLI. */
+  removeRule(id: string, by: { id: string; name: string } | null, transport: string): ReturnType<Store['removeRule']> {
+    const removed = this.store.removeRule(id)
+    if (!removed) return null
+    this.auditLog.record({ deviceId: by?.id ?? null, deviceName: by?.name ?? null, action: 'rule_remove', summary: `rule=${removed.id} ${describeRule(removed)}`, transport })
+    this.broadcastRules()
+    return removed
   }
 
   private requireScope(conn: DeviceConnection, scope: Scope): void {
@@ -1294,6 +1361,7 @@ export class Bridge implements ConnectionHost {
         addresses: candidateAddresses(this.settings.port, this.settings.extraAddresses, this.settings.bind),
         connections: [...this.connections].map((c) => ({ device: c.device?.name ?? null, address: c.remoteAddress })),
         roots: this.roots.listRoots(),
+        rules: this.store.listRules().map((r) => ({ ...r, label: describeRule(r) })),
         log: this.logLines.slice(-80),
       }
       if (this.healthAlerts) {
@@ -1398,6 +1466,17 @@ export class Bridge implements ConnectionHost {
           if (err instanceof HttpError) throw err
           return json(400, { ok: false, error: (err as Error).message })
         }
+      }
+      return json(405, { error: 'method not allowed' })
+    }
+
+    if (url.pathname === '/api/rules') {
+      if (method === 'GET') return json(200, { rules: this.store.listRules() })
+      if (method === 'POST') {
+        const { action, id } = await body()
+        if (action !== 'remove') throw new HttpError(400, 'unknown action')
+        const removed = this.removeRule(String(id ?? ''), null, 'local')
+        return json(200, { ok: removed !== null, rules: this.store.listRules() })
       }
       return json(405, { error: 'method not allowed' })
     }

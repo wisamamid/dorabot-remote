@@ -9,6 +9,7 @@ import { BRIDGE_VERSION, loadIdentity, loadSettings, resolvePaths, saveSettings 
 import { Bridge } from './bridge.js'
 import { Store } from './store.js'
 import { loginUrl } from './control-auth.js'
+import { describeRule } from './rules.js'
 import { createRootsStore, rootsFilePath } from './roots.js'
 import * as launchd from './launchd.js'
 import { SetupError, isFirstRun, runSetup, runUninstall } from './setup.js'
@@ -27,6 +28,7 @@ const USAGE = `dorabot-remote ${BRIDGE_VERSION}
   reject <deviceId>           Refuse and delete a newly paired phone
   audit                       Show recent security-relevant actions (--device <id>, --limit <n>)
   folders [add|remove <path>] List, add or remove shared folders
+  rules [remove <id>]         List or remove always-allow approval rules
   grant <deviceId> <scope>    Add a permission to a device
   revoke <deviceId>           Block a device without deleting it
   remove <deviceId>           Delete a device entirely
@@ -132,6 +134,9 @@ async function main(): Promise<void> {
       return
     case 'audit':
       cmdAudit(values.device, Number(values.limit ?? 50))
+      return
+    case 'rules':
+      cmdRules(positionals[1], positionals[2])
       return
     case 'folders':
       await cmdFolders(positionals[1], positionals[2])
@@ -448,6 +453,32 @@ async function main(): Promise<void> {
     }
     const roots = rootsStore.listRoots()
     process.stdout.write(roots.length ? `${roots.join('\n')}\n` : 'No folders shared.\n')
+  }
+
+  function cmdRules(sub: string | undefined, id: string | undefined): void {
+    if (sub !== undefined && sub !== 'remove') {
+      process.stderr.write('Usage: dorabot-remote rules [remove <id>]\n')
+      process.exitCode = 1
+      return
+    }
+    const store = new Store(paths.db)
+    try {
+      if (sub === 'remove') {
+        const removed = id ? store.removeRule(id) : null
+        if (!removed) {
+          process.stderr.write(id ? `No rule with id ${id}\n` : 'Usage: dorabot-remote rules remove <id>\n')
+          process.exitCode = 1
+          return
+        }
+        store.recordAudit({ action: 'rule_remove', summary: `rule=${removed.id} ${describeRule(removed)}`, transport: 'cli' })
+        process.stdout.write(`Removed rule ${removed.id}. A running bridge picks this up on the next approval.\n`)
+      }
+      const rules = store.listRules()
+      if (rules.length === 0) process.stdout.write('No always-allow rules.\n')
+      for (const r of rules) process.stdout.write(`${r.id}  ${describeRule(r)}  (${r.createdBy ?? 'unknown'}, ${new Date(r.createdAt).toLocaleDateString()})\n`)
+    } finally {
+      store.close()
+    }
   }
 
   function cmdInstall(): void {

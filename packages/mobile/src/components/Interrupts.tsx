@@ -8,9 +8,12 @@ import type {
 } from '@dorabot-remote/protocol'
 import { assessRisk } from '@dorabot-remote/protocol'
 import { useEffect, useState, type ReactNode } from 'react'
-import { requireApprovalAuth } from '../lib/approval-auth.js'
+import { requireApprovalAuth, requireFreshAuth } from '../lib/approval-auth.js'
+import { alwaysAllowOffer, ruleParams } from '../lib/always-allow.js'
+import { useConnection } from '../lib/connection.js'
 import { QUESTION_TIMEOUT_MS } from '../lib/inbox.js'
 import { haptic } from '../lib/platform.js'
+import { AlwaysAllowSheet } from './AlwaysAllowSheet.js'
 import { RiskBadge, ToolInputPreview } from './ApprovalPreview.js'
 import { Button, Card, cx } from './ui.js'
 
@@ -75,6 +78,34 @@ export function ApprovalCard({
   const [error, setError] = useState<string | null>(null)
   const assessment = assessApproval(approval)
   const risky = assessment.risky
+  const conn = useConnection()
+  // Never for risky inputs, never tool-wide for Bash (the offer is the exact command only).
+  const offer = conn.can('remote.rules.add') ? alwaysAllowOffer(approval.toolName, approval.input, approval.blockedPath ? { blockedPath: approval.blockedPath } : {}) : null
+  const [ruleSheet, setRuleSheet] = useState(false)
+  const [ruleBusy, setRuleBusy] = useState(false)
+  const [ruleError, setRuleError] = useState<string | null>(null)
+
+  /** Sheet confirmed: Face ID, save the rule on the Mac, then approve this request too. */
+  async function confirmAlways(): Promise<void> {
+    if (!offer) return
+    setRuleBusy(true)
+    setRuleError(null)
+    try {
+      const refused = await requireFreshAuth('Always allow this on your Mac')
+      if (refused) {
+        setRuleError(refused)
+        return
+      }
+      await conn.rpc('remote.rules.add', ruleParams(offer.spec))
+      await haptic('success')
+      setRuleSheet(false)
+      await onApprove()
+    } catch (err) {
+      setRuleError((err as Error).message)
+    } finally {
+      setRuleBusy(false)
+    }
+  }
 
   /** What will actually run: the edited input if the person changed it. */
   function modified(): Record<string, unknown> | undefined | null {
@@ -218,6 +249,18 @@ export function ApprovalCard({
               {busy === 'approve' ? 'Approving…' : editing ? 'Approve edited' : 'Approve'}
             </Button>
           </div>
+          {offer && !editing && (
+            <button
+              onClick={() => {
+                setRuleError(null)
+                setRuleSheet(true)
+              }}
+              disabled={busy !== null}
+              className="tap w-full text-center text-[14px] font-medium text-ink-300 active:text-ink-100 disabled:opacity-40"
+            >
+              {offer.label}
+            </button>
+          )}
           <div className="flex items-center justify-between">
             <button
               onClick={() => {
@@ -241,6 +284,17 @@ export function ApprovalCard({
       )}
 
       {!compact && <p className="text-center text-[13px] text-ink-500">The run is paused until you answer.</p>}
+
+      {ruleSheet && offer && (
+        <AlwaysAllowSheet
+          offer={offer}
+          command={offer.spec.kind === 'exact' ? offer.spec.command : undefined}
+          busy={ruleBusy}
+          error={ruleError}
+          onConfirm={() => void confirmAlways()}
+          onCancel={() => setRuleSheet(false)}
+        />
+      )}
     </Card>
   )
 }

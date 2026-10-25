@@ -73,6 +73,17 @@ To add folders:
    npx dorabot-remote folders add /path/to/folder
    ```
 
+### Something is being approved without asking me
+
+You (or someone holding your unlocked phone) chose "Always allow" on an approval. Those rules live on the Mac, never in dorabot's own settings, and each automatic approval is recorded in the audit log. Risky actions (deleting files, sudo, git push, writes into dotfiles or outside the project, uploads) are never covered by a rule.
+
+To see or remove rules: the **Always-allow rules** section of the Mac control page (`npx dorabot-remote open`), **Settings** in the phone app, or:
+
+```
+npx dorabot-remote rules
+npx dorabot-remote rules remove <id>
+```
+
 ### I can connect on WiFi but not on cellular
 
 By design, the app only works when both your phone and Mac are on the same network (your home WiFi or a Tailscale network). Cellular connections are not supported by direct connection.
