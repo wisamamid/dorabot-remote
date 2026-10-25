@@ -63,6 +63,8 @@ export interface ConnectionHost {
   protectedPaths?(): string[]
   /** Folders shared with phones. Absent or empty means no file access at all. */
   allowedRoots?(): string[]
+  /** Time-limited folders: path -> epoch ms it lapses. */
+  allowedRootsExpiry?(): Record<string, number>
   /** When an unapproved device's pairing lapses (epoch ms). Display hint for the phone. */
   pendingExpiresAt?(device: DeviceRecord): number | undefined
   auditRpc?(conn: DeviceConnection, method: string, requestId: string | number | undefined, params: Record<string, unknown>): void // SEC-S3
@@ -372,7 +374,7 @@ export class DeviceConnection {
       }
 
       if (env.method === 'remote.roots') {
-        reply({ roots: this.host.allowedRoots?.() ?? [] })
+        reply({ roots: this.host.allowedRoots?.() ?? [], expiry: this.host.allowedRootsExpiry?.() ?? {} })
         return
       }
 
@@ -552,10 +554,10 @@ export class DeviceConnection {
       this.close(fresh ? 'revoked' : 'removed')
       return
     }
-    const key = (d: DeviceRecord): string => [...d.scopes].sort().join(',')
+    const key = (d: DeviceRecord): string => `${[...d.scopes].sort().join(',')}|${JSON.stringify(d.scopeExpiry ?? {})}`
     if (key(fresh) !== key(this.device)) {
       this.device = fresh
-      this.forward('remote.scopes_changed', { scopes: fresh.scopes, granted: null }, undefined, null)
+      this.forward('remote.scopes_changed', { scopes: fresh.scopes, expiry: fresh.scopeExpiry ?? {}, granted: null }, undefined, null)
     }
   }
 

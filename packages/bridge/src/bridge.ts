@@ -65,6 +65,7 @@ import { GatewayClient } from './gateway-client.js'
 import { HealthAlerts } from './health-alerts.js'
 import { applyEventToSnapshots } from './snapshot-state.js'
 import { MAX_RULES, describeRule, findMatchingRule, parseNewRule } from './rules.js'
+import { MAX_GRANT_MS, MIN_GRANT_MS, formatRemaining } from './duration.js'
 import { Store, type AuditEntry, type DeviceRecord } from './store.js'
 import { isControlAuthorized, loadControlSecret, sessionSetCookie } from './control-auth.js'
 
@@ -83,6 +84,8 @@ export const PENDING_TTL_MS = 10 * 60 * 1000
 /** Devices unseen this long are revoked automatically. */
 export const DEVICE_EXPIRY_MS = 90 * 24 * 60 * 60 * 1000
 const PENDING_SWEEP_MS = 30_000
+/** Time-limited scopes and folders are enforced on every read; this sweep makes them official (audit + phone notice). */
+const GRANT_SWEEP_MS = 10_000
 const EXPIRY_SWEEP_MS = 24 * 60 * 60 * 1000
 
 /** Socket limits (M3). */
@@ -170,6 +173,7 @@ export class Bridge implements ConnectionHost {
   readonly logLines: string[] = []
   private controlSecret = ''
   private pendingTimer: NodeJS.Timeout | null = null
+  private grantTimer: NodeJS.Timeout | null = null
   private expiryTimer: NodeJS.Timeout | null = null
   private readonly notify: (title: string, body: string) => void
   private readonly transports = new WeakMap<DeviceConnection, 'relay' | 'direct'>()
@@ -295,6 +299,8 @@ export class Bridge implements ConnectionHost {
 
     this.sweepPending()
     this.sweepExpiredDevices()
+    this.sweepExpiredGrants()
+    this.grantTimer = setInterval(() => this.sweepExpiredGrants(), GRANT_SWEEP_MS)
     this.pendingTimer = setInterval(() => this.sweepPending(), PENDING_SWEEP_MS)
     this.expiryTimer = setInterval(() => this.sweepExpiredDevices(), EXPIRY_SWEEP_MS)
 
@@ -313,6 +319,7 @@ export class Bridge implements ConnectionHost {
     if (this.deviceTimer) clearInterval(this.deviceTimer)
     if (this.idleTimer) clearInterval(this.idleTimer)
     if (this.pendingTimer) clearInterval(this.pendingTimer)
+    if (this.grantTimer) clearInterval(this.grantTimer)
     if (this.expiryTimer) clearInterval(this.expiryTimer)
     for (const c of this.connections) c.close('bridge shutting down')
     this.healthAlerts?.stop()
@@ -357,6 +364,32 @@ export class Bridge implements ConnectionHost {
       for (const c of this.connections) if (c.device?.id === d.id) c.close('removed')
     }
     return gone.length
+  }
+
+  /**
+   * Time-limited grants: take back scopes and shared folders whose time is up, audit each, and tell live
+   * phones. (Enforcement does not wait for this: the store and the roots list already ignore lapsed grants.)
+   */
+  sweepExpiredGrants(now = Date.now()): number {
+    let n = 0
+    for (const { device, scopes } of this.store.expireScopes(now)) {
+      for (const scope of scopes) {
+        this.auditLog.record({ deviceId: device.id, deviceName: device.name, action: 'scope_expire', summary: `scope=${scope} time limit ended`, transport: 'mac' })
+        this.log(`"${scope}" for "${device.name}" expired`)
+        n++
+      }
+      for (const c of this.connections) {
+        if (c.device?.id !== device.id) continue
+        c.device = device
+        c.forward('remote.scopes_changed', { scopes: device.scopes, expiry: device.scopeExpiry ?? {}, granted: null }, undefined, null)
+      }
+    }
+    for (const path of this.roots.sweepExpired(now)) {
+      this.auditLog.record({ action: 'folder_expire', summary: path.slice(0, 150), transport: 'mac' })
+      this.log(`shared folder ${path} expired`)
+      n++
+    }
+    return n
   }
 
   /** Revoke devices unseen for 90 days. */
@@ -774,6 +807,10 @@ export class Bridge implements ConnectionHost {
     return this.roots.listRoots()
   }
 
+  allowedRootsExpiry(): Record<string, number> {
+    return this.roots.listExpiry()
+  }
+
   protectedPaths(): string[] {
     const p = this.paths
     return [p.root, p.db, p.identity, p.signingKey, p.settings, p.dorabotRoot, p.gatewayToken, p.gatewaySocket]
@@ -976,17 +1013,18 @@ export class Bridge implements ConnectionHost {
   }
 
   /** Called when the Mac approves a pending scope request. Pushes it live. */
-  applyScopeDecision(requestId: string, approve: boolean): boolean {
-    const resolved = this.store.resolveScopeRequest(requestId, approve)
+  applyScopeDecision(requestId: string, approve: boolean, forMs: number | null = null): boolean {
+    const expiresAt = approve && forMs ? Date.now() + forMs : null
+    const resolved = this.store.resolveScopeRequest(requestId, approve, expiresAt)
     if (!resolved) return false
     for (const c of this.connections) {
       if (c.device?.id === resolved.device.id) {
         c.device = resolved.device
-        c.forward('remote.scopes_changed', { scopes: resolved.device.scopes, granted: approve ? resolved.scope : null }, undefined, null)
+        c.forward('remote.scopes_changed', { scopes: resolved.device.scopes, expiry: resolved.device.scopeExpiry ?? {}, granted: approve ? resolved.scope : null }, undefined, null)
       }
     }
-    this.auditLog.record({ deviceId: resolved.device.id, deviceName: resolved.device.name, action: approve ? 'scope_grant' : 'scope_deny', summary: `scope=${resolved.scope}`, transport: 'mac' })
-    this.log(`${approve ? 'granted' : 'denied'} "${resolved.scope}" for ${resolved.device.name}`)
+    this.auditLog.record({ deviceId: resolved.device.id, deviceName: resolved.device.name, action: approve ? 'scope_grant' : 'scope_deny', summary: `scope=${resolved.scope}${expiresAt ? ` for ${formatRemaining(forMs!)} (until ${new Date(expiresAt).toISOString()})` : ''}`, transport: 'mac' })
+    this.log(`${approve ? 'granted' : 'denied'} "${resolved.scope}" for ${resolved.device.name}${expiresAt ? ` for ${formatRemaining(forMs!)}` : ''}`)
     return true
   }
 
@@ -1390,6 +1428,7 @@ export class Bridge implements ConnectionHost {
         addresses: candidateAddresses(this.settings.port, this.settings.extraAddresses, this.settings.bind),
         connections: [...this.connections].map((c) => ({ device: c.device?.name ?? null, address: c.remoteAddress })),
         roots: this.roots.listRoots(),
+        rootsExpiry: this.roots.listExpiry(),
         rules: this.store.listRules().map((r) => ({ ...r, label: describeRule(r) })),
         log: this.logLines.slice(-80),
       }
@@ -1420,14 +1459,14 @@ export class Bridge implements ConnectionHost {
     }
 
     if (url.pathname === '/api/scope' && method === 'POST') {
-      const { requestId, approve } = await body()
+      const { requestId, approve, forMs } = await body()
       if (typeof requestId !== 'string' || !requestId) throw new HttpError(400, 'requestId required')
-      json(200, { ok: this.applyScopeDecision(requestId, Boolean(approve)) })
+      json(200, { ok: this.applyScopeDecision(requestId, Boolean(approve), grantMs(forMs)) })
       return
     }
 
     if (url.pathname === '/api/device' && method === 'POST') {
-      const { deviceId, action, scopes } = await body()
+      const { deviceId, action, scopes, forMs, scope: oneScope } = await body()
       if (typeof deviceId !== 'string' || !deviceId) throw new HttpError(400, 'deviceId required')
       const known = this.store.getDevice(deviceId)
       const who = { deviceId, deviceName: known?.name ?? null, transport: 'local' }
@@ -1459,18 +1498,23 @@ export class Bridge implements ConnectionHost {
         }
         const next = [...new Set(scopes)]
         const before = known?.scopes ?? []
-        ok = this.store.setScopes(deviceId, next)
+        // A time limit applies to the scope being switched on (`scope`); everything else keeps what it had.
+        const limit = grantMs(forMs)
+        const patch: Record<string, number | null> = {}
+        if (limit && typeof oneScope === 'string' && next.includes(oneScope as Scope) && !before.includes(oneScope as Scope)) patch[oneScope] = Date.now() + limit
+        ok = this.store.setScopes(deviceId, next, patch)
         const updated = this.store.getDevice(deviceId)
         for (const c of this.connections) {
           if (c.device?.id === deviceId && updated) {
             c.device = updated
-            c.forward('remote.scopes_changed', { scopes: updated.scopes, granted: null }, undefined, null)
+            c.forward('remote.scopes_changed', { scopes: updated.scopes, expiry: updated.scopeExpiry ?? {}, granted: null }, undefined, null)
           }
         }
         if (ok) {
           const added = next.filter((x) => !before.includes(x))
           const removed = before.filter((x) => !next.includes(x))
-          this.auditLog.record({ ...who, action: 'scopes', summary: `+[${added.join(',')}] -[${removed.join(',')}]` })
+          const until = Object.entries(patch).map(([sc, at]) => `${sc} until ${new Date(at as number).toISOString()}`)
+          this.auditLog.record({ ...who, action: 'scopes', summary: `+[${added.join(',')}] -[${removed.join(',')}]${until.length ? ` (${until.join('; ')})` : ''}` })
         }
       } else {
         throw new HttpError(400, 'unknown action')
@@ -1490,16 +1534,17 @@ export class Bridge implements ConnectionHost {
     if (url.pathname === '/api/roots') {
       if (method === 'GET') return json(200, { roots: this.roots.listRoots() })
       if (method === 'POST') {
-        const { action, path } = await body()
+        const { action, path, forMs } = await body()
         if (typeof path !== 'string' || !path) throw new HttpError(400, 'path required')
         try {
           let roots: string[]
-          if (action === 'add') this.roots.addRoot(path)
+          const limit = grantMs(forMs)
+          if (action === 'add') this.roots.addRoot(path, { expiresAt: limit ? Date.now() + limit : null })
           else if (action === 'remove') this.roots.removeRoot(path)
           else throw new HttpError(400, 'unknown action')
           roots = this.roots.listRoots()
-          this.auditLog.record({ action: action === 'add' ? 'folder_add' : 'folder_remove', summary: path.slice(0, 150), transport: 'local' })
-          return json(200, { ok: true, roots })
+          this.auditLog.record({ action: action === 'add' ? 'folder_add' : 'folder_remove', summary: `${path.slice(0, 150)}${action === 'add' && limit ? ` for ${formatRemaining(limit)} (until ${new Date(Date.now() + limit).toISOString()})` : ''}`, transport: 'local' })
+          return json(200, { ok: true, roots, expiry: this.roots.listExpiry() })
         } catch (err) {
           if (err instanceof HttpError) throw err
           return json(400, { ok: false, error: (err as Error).message })
@@ -1521,6 +1566,15 @@ export class Bridge implements ConnectionHost {
 
     json(404, { error: 'not found' })
   }
+}
+
+/** A time limit from the control page (ms), or null for permanent. Out-of-range or junk is an error, not "forever". */
+function grantMs(v: unknown): number | null {
+  if (v === undefined || v === null || v === 0) return null
+  if (typeof v !== 'number') throw new HttpError(400, 'forMs must be a number of milliseconds')
+  const ms = Math.round(v)
+  if (!(ms >= MIN_GRANT_MS && ms <= MAX_GRANT_MS)) throw new HttpError(400, 'time limit must be between 1 minute and 30 days')
+  return ms
 }
 
 function LOGIN_HELP(msg: string): string {

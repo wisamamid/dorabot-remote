@@ -829,8 +829,10 @@ export class RemoteClient {
       case 'event': {
         if (typeof env.seq === 'number' && env.seq > this.lastSeq) this.lastSeq = env.seq
         if (env.event === 'remote.scopes_changed' && this.device) {
-          const scopes = (env.data as { scopes: Scope[] }).scopes
-          this.device = { ...this.device, scopes }
+          const { scopes, expiry } = env.data as { scopes: Scope[]; expiry?: Record<string, number> }
+          const { scopeExpiry: _old, ...rest } = this.device
+          void _old
+          this.device = { ...rest, scopes, ...(expiry && Object.keys(expiry).length ? { scopeExpiry: expiry } : {}) }
           this.allowed = methodsForScopes(scopes)
         }
         this.safe(() => this.opts.onEvent?.(env.event, env.data, env.seq, env.sessionKey), 'onEvent')

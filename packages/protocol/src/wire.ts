@@ -189,8 +189,10 @@ export interface DeviceSummary {
   fingerprint: string
   /** Paired but not yet approved on the Mac. Such a device can do nothing. */
   pending?: boolean
-  /** Why it was revoked automatically, e.g. 'expired' (unseen for 90 days). */
+  /** Why it was revoked automatically or by the user: 'expired' (unseen for 90 days), 'lost', 'lockdown'. */
   revokedReason?: string | null
+  /** Time-limited permissions still running: scope -> epoch ms (host clock) it lapses. */
+  scopeExpiry?: Record<string, number>
 }
 
 export interface HostSummary {

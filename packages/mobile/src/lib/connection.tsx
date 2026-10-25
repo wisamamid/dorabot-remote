@@ -65,6 +65,7 @@ import {
   type StoredPairing,
 } from './hosts.js'
 import { forgetSent } from './push-hosts.js'
+import { lapsedScopes } from './expiry.js'
 
 export type { HostPairing, StoredPairing }
 
@@ -97,6 +98,10 @@ interface ConnectionValue {
   device: DeviceSummary | null
   gatewayConnected: boolean
   scopes: Scope[]
+  /** Time-limited permissions still running: scope -> epoch ms (Mac clock) they lapse. */
+  scopeExpiry: Record<string, number>
+  /** Permissions whose time limit ended while this app was open (cleared when they are granted again). */
+  expiredScopes: Scope[]
   sessions: StoredSession[]
   sessionsLoading: boolean
   /** Pinned sessions, newest pin first. Synced across devices through the bridge. */
@@ -166,6 +171,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
   const lastOpened = useRef<{ key: string; id?: string } | null>(null)
   const [revision, setRevision] = useState(0)
   const [attention, setAttention] = useState<Attention[]>([])
+  const [expiredScopes, setExpiredScopes] = useState<Scope[]>([])
+  const deviceRef = useRef<DeviceSummary | null>(null)
+  deviceRef.current = device
   const [demo, setDemo] = useState(false)
   const demoRef = useRef(false)
   demoRef.current = demo
@@ -265,6 +273,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     setAttention([])
     setHost(null)
     setDevice(null)
+    setExpiredScopes([])
     setGatewayConnected(false)
     setTransport(null)
     setState('connecting')
@@ -388,6 +397,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       setAttention([])
       setHost(null)
       setDevice(null)
+      setExpiredScopes([])
       setState('idle')
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -499,8 +509,15 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
         return
       }
       if (event === 'remote.scopes_changed') {
-        const next = (data as { scopes: Scope[] }).scopes
-        setDevice((d) => (d ? { ...d, scopes: next } : d))
+        const { scopes: next, expiry } = data as { scopes: Scope[]; expiry?: Record<string, number> }
+        const lapsed = lapsedScopes(deviceRef.current?.scopeExpiry, next, Date.now())
+        setExpiredScopes((prev) => [...prev.filter((s) => !next.includes(s) && !lapsed.includes(s)), ...lapsed])
+        setDevice((d) => {
+          if (!d) return d
+          const { scopeExpiry: _old, ...rest } = d
+          void _old
+          return { ...rest, scopes: next, ...(expiry && Object.keys(expiry).length ? { scopeExpiry: expiry } : {}) }
+        })
         const cur = pairingRef.current
         if (cur) commit(updatePairing(fileRef.current, cur.hostId, (p) => ({ ...p, scopes: next })))
         void haptic('success')
@@ -737,6 +754,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       setAttention([])
       setHost(null)
       setDevice(null)
+      setExpiredScopes([])
       setState('idle')
     }
     if (next.pairings.length > 0) setState('connecting')
@@ -764,6 +782,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       device,
       gatewayConnected,
       scopes: device?.scopes ?? pairing?.scopes ?? [],
+      scopeExpiry: device?.scopeExpiry ?? {},
+      expiredScopes,
       sessions,
       sessionsLoading,
       pins,
@@ -806,6 +826,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
       approvalExpiresAt,
       host,
       device,
+      expiredScopes,
       gatewayConnected,
       sessions,
       sessionsLoading,

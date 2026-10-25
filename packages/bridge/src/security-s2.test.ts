@@ -246,7 +246,7 @@ describe('H4: folder allowlist', () => {
     const r = await h.rpc('search.files', { path: proj, query: 'x' })
     expect(r.error).toBeUndefined()
     expect((r.result as { results: unknown[] }).results).toHaveLength(1)
-    expect((await h.rpc('remote.roots')).result).toEqual({ roots: [proj] })
+    expect((await h.rpc('remote.roots')).result).toEqual({ roots: [proj], expiry: {} })
   })
 
   it('remote.roots needs files or git', async () => {
