@@ -57,6 +57,8 @@ import { RelayClient, type RelayState } from './relay-client.js'
 const RELAY_ACKED_KEY = 'relay.tokensAcked'
 const RELAY_ENFORCE_KEY = 'relay.enforce'
 const RELAY_SINCE_KEY = 'relay.accessSince'
+const RELAY_TOKSTATE_KEY = 'relay.tokState'
+const ROTATION_SWEEP_MS = 60 * 60 * 1000
 /** Enforcement turns on at the latest this long after the first start with tokens, even if an old phone never reconnected. */
 export const RELAY_ENFORCE_AFTER_MS = 14 * 24 * 60 * 60 * 1000
 import { CONTROL_PAGE } from './control-page.js'
@@ -67,6 +69,7 @@ import { applyEventToSnapshots } from './snapshot-state.js'
 import { MAX_RULES, describeRule, findMatchingRule, parseNewRule } from './rules.js'
 import { MAX_GRANT_MS, MIN_GRANT_MS, formatRemaining } from './duration.js'
 import { classifyNetwork } from './network-class.js'
+import { ackCurrent, dueForRotation, initialState, pruneExpired, rotate, tokenSubject, validGens, type TokState } from './relay-rotation.js'
 import { Store, type AuditEntry, type DeviceRecord } from './store.js'
 import { isControlAuthorized, loadControlSecret, sessionSetCookie } from './control-auth.js'
 import { createSecretIO, type SecretIO } from './keychain.js'
@@ -178,6 +181,7 @@ export class Bridge implements ConnectionHost {
   private controlSecret = ''
   private pendingTimer: NodeJS.Timeout | null = null
   private grantTimer: NodeJS.Timeout | null = null
+  private rotationTimer: NodeJS.Timeout | null = null
   private expiryTimer: NodeJS.Timeout | null = null
   private readonly notify: (title: string, body: string) => void
   private readonly secretIO: SecretIO | undefined
@@ -308,6 +312,10 @@ export class Bridge implements ConnectionHost {
     this.sweepExpiredDevices()
     this.sweepExpiredGrants()
     this.grantTimer = setInterval(() => this.sweepExpiredGrants(), GRANT_SWEEP_MS)
+    if (this.relaySecret) {
+      this.sweepRelayTokens()
+      this.rotationTimer = setInterval(() => this.sweepRelayTokens(), ROTATION_SWEEP_MS)
+    }
     this.pendingTimer = setInterval(() => this.sweepPending(), PENDING_SWEEP_MS)
     this.expiryTimer = setInterval(() => this.sweepExpiredDevices(), EXPIRY_SWEEP_MS)
 
@@ -327,6 +335,7 @@ export class Bridge implements ConnectionHost {
     if (this.idleTimer) clearInterval(this.idleTimer)
     if (this.pendingTimer) clearInterval(this.pendingTimer)
     if (this.grantTimer) clearInterval(this.grantTimer)
+    if (this.rotationTimer) clearInterval(this.rotationTimer)
     if (this.expiryTimer) clearInterval(this.expiryTimer)
     for (const c of this.connections) c.close('bridge shutting down')
     this.healthAlerts?.stop()
@@ -1060,8 +1069,67 @@ export class Bridge implements ConnectionHost {
   // [SEC-RELAY] Relay access control
   // -------------------------------------------------------------------------
 
+  /** The device's CURRENT relay token (what the phone is told and what it acks). */
   private relayTokenFor(deviceId: string): string {
-    return deriveRelayToken(this.relaySecret!, deviceId)
+    return this.relayTokenGen(deviceId, this.tokState(deviceId).gen)
+  }
+
+  private relayTokenGen(deviceId: string, gen: number): string {
+    return deriveRelayToken(this.relaySecret!, tokenSubject(deviceId, gen))
+  }
+
+  private tokStates(): Record<string, TokState> {
+    return this.store.getMeta<Record<string, TokState>>(RELAY_TOKSTATE_KEY, {})
+  }
+
+  private tokState(deviceId: string, states: Record<string, TokState> = this.tokStates()): TokState {
+    const stored = states[deviceId]
+    if (stored) return stored
+    const createdAt = this.store.getDevice(deviceId)?.createdAt ?? Date.now()
+    return initialState(createdAt, this.store.getMeta<string[]>(RELAY_ACKED_KEY, []).includes(deviceId))
+  }
+
+  private saveTokState(deviceId: string, s: TokState): void {
+    this.store.setMeta(RELAY_TOKSTATE_KEY, { ...this.tokStates(), [deviceId]: s })
+  }
+
+  /**
+   * Move one device to a new relay token. The phone gets it over the E2E channel (live now if connected,
+   * otherwise in `ready` at its next connect) and acks it; the old token works until that ack, or 7 days.
+   */
+  rotateRelayToken(deviceId: string, reason: string, transport = 'mac', now = Date.now()): boolean {
+    if (!this.relaySecret || !this.relayInfo) return false
+    const d = this.store.getDevice(deviceId)
+    if (!d || d.revoked || d.pending) return false
+    const next = rotate(pruneExpired(this.tokState(deviceId), now), now)
+    this.saveTokState(deviceId, next)
+    this.auditLog.record({ deviceId, deviceName: d.name, action: 'relay_token_rotate', summary: `${reason}; generation ${next.gen}, old token valid until acked or 7 days`, transport })
+    this.log(`relay: rotated the token of "${d.name}" (${reason})`)
+    const relay: RelayInfo = { ...this.relayInfo, tok: this.relayTokenGen(deviceId, next.gen) }
+    for (const c of this.connections) if (c.device?.id === deviceId) c.forward('remote.relay_token', { relay }, undefined, null)
+    this.syncRelayAccess()
+    return true
+  }
+
+  /** Scheduled rotation: every 30 days for devices that confirmed their token. Also forgets old state. */
+  sweepRelayTokens(now = Date.now()): number {
+    if (!this.relaySecret) return 0
+    const live = new Set(this.store.listDevices().map((d) => d.id))
+    const states = this.tokStates()
+    let changed = false
+    for (const id of Object.keys(states)) {
+      if (!live.has(id)) {
+        delete states[id]
+        changed = true
+      }
+    }
+    if (changed) this.store.setMeta(RELAY_TOKSTATE_KEY, states)
+    let n = 0
+    for (const d of this.store.listDevices()) {
+      if (d.revoked || d.pending) continue
+      if (dueForRotation(this.tokState(d.id), now) && this.rotateRelayToken(d.id, 'scheduled (30 days)', 'mac', now)) n++
+    }
+    return n
   }
 
   /**
@@ -1079,8 +1147,15 @@ export class Bridge implements ConnectionHost {
 
   relayTokAck(deviceId: string, tokHash: unknown): boolean {
     if (!this.relaySecret || typeof tokHash !== 'string') return false
+    // Only the CURRENT token counts: a phone still holding an older one has not received the new one.
     if (tokHash !== relayTokenHash(this.relayTokenFor(deviceId))) return false
+    const st = this.tokState(deviceId)
+    if (!st.acked || st.prev.length > 0) {
+      this.saveTokState(deviceId, ackCurrent(st))
+      if (st.gen > 0) this.log(`relay: device ${deviceId.slice(0, 8)} confirmed its rotated token; the old one is no longer valid`)
+    }
     this.markRelayTokenAcked(deviceId)
+    this.syncRelayAccess()
     return true
   }
 
@@ -1121,8 +1196,9 @@ export class Bridge implements ConnectionHost {
       this.store.setMeta(RELAY_ENFORCE_KEY, true)
       this.log('relay: access tokens are now enforced')
     }
+    const states = this.tokStates()
     this.relay.setAccess({
-      tokens: devices.map((d) => relayTokenHash(this.relayTokenFor(d.id))),
+      tokens: devices.flatMap((d) => validGens(this.tokState(d.id, states), now).map((g) => relayTokenHash(this.relayTokenGen(d.id, g)))),
       tickets: [...this.relayTickets.values()].map((t) => relayTokenHash(t.tok)),
       enforce,
     })
@@ -1514,6 +1590,8 @@ export class Bridge implements ConnectionHost {
           this.store.touchDevice(deviceId)
           this.auditLog.record({ ...who, action: 'restore' })
         }
+      } else if (action === 'rotate') {
+        ok = this.rotateRelayToken(deviceId, 'requested on the control page', 'local')
       } else if (action === 'lost') {
         ok = this.markLost(deviceId, 'local')
       } else if (action === 'delete') {
@@ -1549,6 +1627,13 @@ export class Bridge implements ConnectionHost {
       }
       this.syncRelayAccess() // [SEC-RELAY] revoke/restore/delete change who may use the relay
       json(200, { ok })
+      return
+    }
+
+    if (url.pathname === '/api/rotate-tokens' && method === 'POST') {
+      let n = 0
+      for (const d of this.store.listDevices()) if (this.rotateRelayToken(d.id, 'requested on the control page', 'local')) n++
+      json(200, { ok: true, rotated: n })
       return
     }
 

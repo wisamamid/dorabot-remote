@@ -25,6 +25,7 @@ import { FakeGateway } from '../test/fake-gateway.js'
 import { FakeRelay } from '../test/fake-relay.js'
 import { Bridge } from './bridge.js'
 import { loadSettings, resolvePaths } from './config.js'
+import { loadControlSecret } from './control-auth.js'
 import {
   BACKOFF_CAP_MS,
   MAX_PAYLOAD_BYTES,
@@ -701,6 +702,126 @@ describe('relay enforcement waits for confirmed tokens', () => {
     expect(warnings.length).toBeGreaterThanOrEqual(1)
     expect(warnings.some((l) => l.includes('Relay Phone'))).toBe(true)
     expect(relay.tokenSet.has(relayTokenHash(pair.relay!.tok!))).toBe(true)
+  })
+})
+
+describe('relay token rotation (T9d)', () => {
+  let relay: FakeRelay
+  let rig: Rig
+  type Internals = {
+    store: { setMeta(k: string, v: unknown): void; getMeta<T>(k: string, d: T): T; listAudit(o: object): Array<{ action: string; summary: string | null }> }
+    rotateRelayToken(id: string, reason: string): boolean
+    sweepRelayTokens(now?: number): number
+    syncRelayAccess(): void
+  }
+  const b = (): Internals => rig.bridge as unknown as Internals
+  const hash = (tok: string | undefined): string => relayTokenHash(tok!)
+
+  beforeAll(async () => {
+    relay = new FakeRelay()
+    await relay.start()
+    rig = await startRig(relay.url, 7875)
+    await until(() => relay.authedHost !== undefined, 8000, 'bridge online at relay')
+  }, 30_000)
+  afterAll(async () => {
+    await rig?.stop()
+    await relay?.stop()
+  })
+
+  it('rotates on demand: the phone gets the new token over the E2E channel and acks; the old one then stops working', async () => {
+    const pair = await rig.pair()
+    const oldTok = pair.relay!.tok!
+    const stored: Array<{ tok?: string }> = []
+    const client = await rig.connect(pair, { onRelay: (r) => void stored.push(r) })
+    // The first ready acks generation 0.
+    await until(() => relay.tokenSet.has(hash(oldTok)), 3000, 'gen 0 on relay')
+
+    expect(b().rotateRelayToken(pair.deviceId, 'test')).toBe(true)
+    // Between rotation and ack the relay accepts both.
+    await until(() => stored.length >= 1, 5000, 'phone received and persisted the new token')
+    const newTok = stored.at(-1)!.tok!
+    expect(newTok).not.toBe(oldTok)
+    expect(relay.tokenSet.has(hash(newTok))).toBe(true)
+    // The ack (after persisting) drops the old token.
+    await until(() => !relay.tokenSet.has(hash(oldTok)), 5000, 'old token dropped after ack')
+    expect(relay.tokenSet.has(hash(newTok))).toBe(true)
+    expect(b().store.listAudit({ limit: 20 }).some((e) => e.action === 'relay_token_rotate')).toBe(true)
+
+    // And the phone really connects with the new token: a fresh client built from what it stored.
+    client.disconnect()
+    const again = await rig.connect({ ...pair, relay: { ...pair.relay!, tok: newTok } })
+    expect(again.transport).toBe('relay')
+    again.disconnect()
+  })
+
+  it('an offline phone keeps working with the old token until it acks, for at most 7 days', async () => {
+    const pair = await rig.pair()
+    const oldTok = pair.relay!.tok!
+    const client = await rig.connect(pair) // acks gen 0
+    client.disconnect()
+    await sleep(200)
+    expect(b().rotateRelayToken(pair.deviceId, 'test')).toBe(true)
+    b().syncRelayAccess()
+    await sleep(200)
+    expect(relay.tokenSet.has(hash(oldTok))).toBe(true) // still valid: never acked the new one
+
+    // The phone reconnects with the OLD token over the relay and is handed the new one in `ready`.
+    const stored: Array<{ tok?: string }> = []
+    const back = await rig.connect(pair, { onRelay: (r) => void stored.push(r) })
+    await until(() => stored.length >= 1, 5000, 'new token delivered in ready')
+    await until(() => !relay.tokenSet.has(hash(oldTok)), 5000, 'old token dropped after ack')
+    back.disconnect()
+
+    // Without an ack, the old token dies after 7 days.
+    const p2 = await rig.pair()
+    const old2 = p2.relay!.tok!
+    ;(await rig.connect(p2)).disconnect()
+    b().rotateRelayToken(p2.deviceId, 'test')
+    const states = b().store.getMeta<Record<string, { prev: Array<{ gen: number; until: number }> }>>('relay.tokState', {})
+    states[p2.deviceId]!.prev = states[p2.deviceId]!.prev.map((p) => ({ ...p, until: Date.now() - 1 }))
+    b().store.setMeta('relay.tokState', states)
+    b().syncRelayAccess()
+    await until(() => !relay.tokenSet.has(hash(old2)), 3000, 'expired old token dropped')
+  })
+
+  it('rotates on schedule every 30 days, only devices that confirmed their token', async () => {
+    const acked = await rig.pair()
+    ;(await rig.connect(acked)).disconnect()
+    const never = await rig.pair() // never connects, so never acks
+    const states = b().store.getMeta<Record<string, unknown>>('relay.tokState', {})
+    const longAgo = Date.now() - 31 * 24 * 60 * 60 * 1000
+    states[acked.deviceId] = { gen: 0, issuedAt: longAgo, acked: true, prev: [] }
+    states[never.deviceId] = { gen: 0, issuedAt: longAgo, acked: false, prev: [] }
+    b().store.setMeta('relay.tokState', states)
+    const before = b().store.listAudit({ limit: 200 }).filter((e) => e.action === 'relay_token_rotate').length
+    b().sweepRelayTokens()
+    const after = b().store.listAudit({ limit: 200 }).filter((e) => e.action === 'relay_token_rotate')
+    expect(after.length - before).toBeGreaterThanOrEqual(1)
+    const st = b().store.getMeta<Record<string, { gen: number }>>('relay.tokState', {})
+    expect(st[acked.deviceId]!.gen).toBe(1)
+    expect(st[never.deviceId]!.gen).toBe(0)
+    // Nothing is due straight after.
+    expect(b().sweepRelayTokens()).toBe(0)
+  })
+
+  it('does not rotate revoked devices, and a wrong ack proof changes nothing', async () => {
+    const pair = await rig.pair()
+    ;(await rig.connect(pair)).disconnect()
+    ;(rig.bridge as unknown as { store: { setRevoked(id: string, r: boolean): boolean } }).store.setRevoked(pair.deviceId, true)
+    expect(b().rotateRelayToken(pair.deviceId, 'test')).toBe(false)
+    expect(b().rotateRelayToken('nope', 'test')).toBe(false)
+  })
+
+  it('the control API rotates one device or all', async () => {
+    const pair = await rig.pair()
+    ;(await rig.connect(pair)).disconnect()
+    const secret = loadControlSecret(rig.home, { store: null, warn: () => {}, shred: () => {} })
+    const post = (path: string, body: unknown) =>
+      fetch(`http://127.0.0.1:7875${path}`, { method: 'POST', headers: { authorization: `Bearer ${secret}` }, body: JSON.stringify(body) }).then((r) => r.json() as Promise<Record<string, unknown>>)
+    expect((await post('/api/device', { deviceId: pair.deviceId, action: 'rotate' })).ok).toBe(true)
+    const all = await post('/api/rotate-tokens', {})
+    expect(all.ok).toBe(true)
+    expect(all.rotated as number).toBeGreaterThanOrEqual(1)
   })
 })
 

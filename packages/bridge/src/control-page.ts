@@ -112,7 +112,10 @@ export const CONTROL_PAGE = `<!doctype html>
 
   <div class="row" style="margin:36px 0 12px">
     <h2 style="margin:0">Paired devices</h2>
-    <button class="small danger" onclick="lockdown()" title="Lost phone? Revoke every device at once">Lockdown: revoke all</button>
+    <span style="display:flex;gap:8px">
+      <button class="small" id="rotate-all" onclick="rotateAll()" style="display:none" title="Give every phone a new relay token (old ones work until the phone confirms, at most 7 days)">Rotate relay tokens</button>
+      <button class="small danger" onclick="lockdown()" title="Lost phone? Revoke every device at once">Lockdown: revoke all</button>
+    </span>
   </div>
   <div id="devices"></div>
 
@@ -200,6 +203,7 @@ function renderAll() {
   gw.textContent = state.gatewayConnected ? 'dorabot connected' : 'dorabot not reachable';
   gw.className = 'pill ' + (state.gatewayConnected ? 'on' : 'off');
 
+  document.getElementById('rotate-all').style.display = state.relay ? '' : 'none';
   const rl = document.getElementById('relay');
   if (state.relay) {
     rl.style.display = '';
@@ -272,7 +276,7 @@ function renderAll() {
           <div style="display:flex;gap:8px">
             \${d.revoked
               ? \`<button class="small" onclick="device('\${d.id}','restore')">Restore</button>\`
-              : \`<button class="small danger" onclick="device('\${d.id}','lost')">Lost</button><button class="small danger" onclick="device('\${d.id}','revoke')">Revoke</button>\`}
+              : \`\${state.relay && !d.pending ? \`<button class="small" onclick="device('\${d.id}','rotate')" title="New relay token, delivered over the encrypted channel">Rotate token</button>\` : ''}<button class="small danger" onclick="device('\${d.id}','lost')">Lost</button><button class="small danger" onclick="device('\${d.id}','revoke')">Revoke</button>\`}
             <button class="small danger" onclick="device('\${d.id}','delete')">Remove</button>
           </div>
         </div>
@@ -359,6 +363,12 @@ async function removeRoot(path) {
 
 async function removeRule(id) {
   await api('/api/rules', { action: 'remove', id });
+  load();
+}
+
+async function rotateAll() {
+  if (!confirm('Rotate the relay token of every device?\\n\\nPhones receive the new one over the encrypted channel and confirm it. The old token keeps working until they do, at most 7 days.')) return;
+  await api('/api/rotate-tokens', {});
   load();
 }
 
