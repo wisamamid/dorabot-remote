@@ -66,6 +66,7 @@ import { HealthAlerts } from './health-alerts.js'
 import { applyEventToSnapshots } from './snapshot-state.js'
 import { MAX_RULES, describeRule, findMatchingRule, parseNewRule } from './rules.js'
 import { MAX_GRANT_MS, MIN_GRANT_MS, formatRemaining } from './duration.js'
+import { classifyNetwork } from './network-class.js'
 import { Store, type AuditEntry, type DeviceRecord } from './store.js'
 import { isControlAuthorized, loadControlSecret, sessionSetCookie } from './control-auth.js'
 
@@ -777,6 +778,27 @@ export class Bridge implements ConnectionHost {
       summary: parts.join(' ') || null,
       transport: this.transports.get(conn) ?? 'direct',
     })
+  }
+
+  onDeviceAuthed(conn: DeviceConnection): void {
+    if (conn.device) this.noteNetwork(conn.device, this.transports.get(conn) ?? 'direct', conn.remoteAddress)
+  }
+
+  /**
+   * A device connected from a network it has not used before: audit it and show a macOS notification, so a
+   * stolen key being used from somewhere else is noticed. The first network a device is ever seen on is the
+   * baseline and does not alert (pairing was already approved on this Mac).
+   */
+  noteNetwork(device: { id: string; name: string }, transport: 'relay' | 'direct', remote: string): 'baseline' | 'new' | 'known' {
+    const net = classifyNetwork(transport, remote)
+    const result = this.store.recordNetwork(device.id, net.key)
+    if (result === 'new') {
+      const text = `${device.name} connected from a new network (${net.label})`
+      this.auditLog.record({ deviceId: device.id, deviceName: device.name, action: 'new_network', summary: text, transport })
+      this.log(text)
+      this.notify('dorabot remote', text)
+    }
+    return result
   }
 
   pendingExpiresAt(device: DeviceRecord): number | undefined {

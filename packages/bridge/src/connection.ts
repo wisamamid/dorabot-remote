@@ -67,6 +67,8 @@ export interface ConnectionHost {
   allowedRootsExpiry?(): Record<string, number>
   /** When an unapproved device's pairing lapses (epoch ms). Display hint for the phone. */
   pendingExpiresAt?(device: DeviceRecord): number | undefined
+  /** A device finished authenticating (used for new-network alerts). */
+  onDeviceAuthed?(conn: DeviceConnection): void
   auditRpc?(conn: DeviceConnection, method: string, requestId: string | number | undefined, params: Record<string, unknown>): void // SEC-S3
 }
 
@@ -280,6 +282,11 @@ export class DeviceConnection {
         this.handshakeTimer = null
         const device = this.device!
         this.host.touchDevice(device.id)
+        try {
+          this.host.onDeviceAuthed?.(this)
+        } catch (err) {
+          this.host.log(`new-network check failed: ${(err as Error).message}`)
+        }
         this.host.log(`device connected: ${device.name} (${this.remoteAddress})`)
 
         this.send({

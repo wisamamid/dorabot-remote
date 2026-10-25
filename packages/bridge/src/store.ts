@@ -180,6 +180,15 @@ export class Store {
         created_by TEXT
       );
 
+      -- Coarse network keys each device has connected from (see network-class.ts), for new-network alerts.
+      CREATE TABLE IF NOT EXISTS device_networks (
+        device_id  TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        net_key    TEXT NOT NULL,
+        first_seen INTEGER NOT NULL,
+        last_seen  INTEGER NOT NULL,
+        PRIMARY KEY (device_id, net_key)
+      );
+
       CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -479,6 +488,30 @@ export class Store {
     )
     for (const d of stale) this.setRevoked(d.id, true, 'expired')
     return stale
+  }
+
+  // -------------------------------------------------------------------------
+  // Networks a device has connected from
+  // -------------------------------------------------------------------------
+
+  /**
+   * Note that a device connected from a network. 'baseline' is the first network ever seen for the device
+   * (nothing to compare against, so no alert), 'new' is one it has not used before, 'known' is a repeat.
+   */
+  recordNetwork(deviceId: string, key: string, now = Date.now()): 'baseline' | 'new' | 'known' {
+    const had = this.db.prepare('SELECT COUNT(*) AS n FROM device_networks WHERE device_id = ?').get(deviceId) as { n: number }
+    const upd = this.db.prepare('UPDATE device_networks SET last_seen = ? WHERE device_id = ? AND net_key = ?').run(now, deviceId, key)
+    if (upd.changes > 0) return 'known'
+    this.db.prepare('INSERT INTO device_networks (device_id, net_key, first_seen, last_seen) VALUES (?,?,?,?)').run(deviceId, key, now, now)
+    // Bounded: forget the least recently used beyond 50.
+    this.db
+      .prepare('DELETE FROM device_networks WHERE device_id = ? AND net_key NOT IN (SELECT net_key FROM device_networks WHERE device_id = ? ORDER BY last_seen DESC LIMIT 50)')
+      .run(deviceId, deviceId)
+    return Number(had.n) === 0 ? 'baseline' : 'new'
+  }
+
+  listNetworks(deviceId: string): string[] {
+    return (this.db.prepare('SELECT net_key FROM device_networks WHERE device_id = ? ORDER BY first_seen').all(deviceId) as Array<{ net_key: string }>).map((r) => r.net_key)
   }
 
   // -------------------------------------------------------------------------
