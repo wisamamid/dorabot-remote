@@ -13,6 +13,7 @@ import { formatRemaining, parseDuration } from './duration.js'
 import { describeRule } from './rules.js'
 import { createRootsStore, rootsFilePath } from './roots.js'
 import * as launchd from './launchd.js'
+import { createKeychainStore, defaultSecurityRunner, keychainEnabled, keychainScope } from './keychain.js'
 import { SetupError, isFirstRun, runSetup, runUninstall } from './setup.js'
 
 const USAGE = `dorabot-remote ${BRIDGE_VERSION}
@@ -188,7 +189,7 @@ async function main(): Promise<void> {
     case 'setup':
     case 'update':
       if (values.uninstall) {
-        await runUninstall({ paths, launchd, log: say }, values.purge === true)
+        await runUninstall({ paths, launchd, log: say, keychain: keychainEnabled() ? createKeychainStore(defaultSecurityRunner, keychainScope(paths.root)) : null }, values.purge === true)
         return
       }
       await cmdSetup(command === 'update', values.yes === true)
@@ -197,7 +198,7 @@ async function main(): Promise<void> {
       cmdInstall()
       return
     case 'uninstall':
-      await runUninstall({ paths, launchd, log: say }, values.purge === true)
+      await runUninstall({ paths, launchd, log: say, keychain: keychainEnabled() ? createKeychainStore(defaultSecurityRunner, keychainScope(paths.root)) : null }, values.purge === true)
       return
     case 'status':
       cmdStatus()

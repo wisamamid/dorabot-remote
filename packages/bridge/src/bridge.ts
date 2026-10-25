@@ -69,6 +69,7 @@ import { MAX_GRANT_MS, MIN_GRANT_MS, formatRemaining } from './duration.js'
 import { classifyNetwork } from './network-class.js'
 import { Store, type AuditEntry, type DeviceRecord } from './store.js'
 import { isControlAuthorized, loadControlSecret, sessionSetCookie } from './control-auth.js'
+import { createSecretIO, type SecretIO } from './keychain.js'
 
 const SESSION_KEY_RE = /^[^:\s]+:[^:\s]+:\S+$/
 const MAX_PINS = 200
@@ -140,6 +141,8 @@ export interface BridgeOptions {
   log?: (msg: string) => void
   /** Desktop notification hook (pending pairing). Defaults to osascript on macOS. */
   notify?: (title: string, body: string) => void
+  /** Where the host identity, signing key and control secret live (login Keychain by default on macOS). */
+  secretIO?: SecretIO
 }
 
 export class Bridge implements ConnectionHost {
@@ -177,6 +180,7 @@ export class Bridge implements ConnectionHost {
   private grantTimer: NodeJS.Timeout | null = null
   private expiryTimer: NodeJS.Timeout | null = null
   private readonly notify: (title: string, body: string) => void
+  private readonly secretIO: SecretIO | undefined
   private readonly transports = new WeakMap<DeviceConnection, 'relay' | 'direct'>()
   private unauthTotal = 0
   private unauthByIp = new Map<string, number>()
@@ -194,6 +198,7 @@ export class Bridge implements ConnectionHost {
 
   constructor(opts: BridgeOptions) {
     this.notify = opts.notify ?? defaultNotify
+    this.secretIO = opts.secretIO
     this.paths = opts.paths
     this.settings = opts.settings
     this.store = new Store(opts.paths.db)
@@ -215,11 +220,12 @@ export class Bridge implements ConnectionHost {
   // -------------------------------------------------------------------------
 
   async start(): Promise<void> {
-    this.controlSecret = loadControlSecret(this.paths.root)
+    const secretIO = this.secretIO ?? createSecretIO(this.paths.root, (m) => this.log(m))
+    this.controlSecret = loadControlSecret(this.paths.root, secretIO)
     this.sodium = await sodiumReady()
-    this.hostIdentity = loadIdentity(this.sodium, this.paths)
+    this.hostIdentity = loadIdentity(this.sodium, this.paths, secretIO)
     if (this.settings.relay.enabled && isRelayUrlConfigured(this.settings.relay.url)) {
-      const key = loadSigningKey(this.paths)
+      const key = loadSigningKey(this.paths, secretIO)
       this.relayInfo = { u: this.settings.relay.url.replace(/\/+$/, ''), i: relayIdFromPublicKey(key.publicKey) }
       this.relaySecret = new Uint8Array(createHash('sha256').update('dorabot-relay-token-secret/v1').update(key.privateKey).digest())
       this.pusher = new PushNotifier({

@@ -1,7 +1,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { IncomingMessage } from 'node:http'
+import { createSecretIO, loadSecret, type SecretIO } from './keychain.js'
 
 /**
  * Local control page authentication.
@@ -19,21 +19,18 @@ export function controlSecretPath(root: string): string {
   return join(root, 'control-secret')
 }
 
-/** Read the install secret, creating it (mode 0600) on first use. Returns hex. */
-export function loadControlSecret(root: string): string {
-  const path = controlSecretPath(root)
-  if (existsSync(path)) {
-    const v = readFileSync(path, 'utf8').trim()
-    if (/^[0-9a-f]{64}$/.test(v)) {
-      chmodSync(path, 0o600)
-      return v
-    }
-  }
-  mkdirSync(root, { recursive: true, mode: 0o700 })
-  const secret = randomBytes(32).toString('hex')
-  writeFileSync(path, `${secret}\n`, { mode: 0o600 })
-  chmodSync(path, 0o600)
-  return secret
+/** Read the install secret (login Keychain, or the 0600 file as a fallback), creating it on first use. Returns hex. */
+export function loadControlSecret(root: string, io: SecretIO = createSecretIO(root, (m) => process.stderr.write(`${m}\n`))): string {
+  const text = loadSecret(
+    {
+      name: 'control-secret',
+      file: controlSecretPath(root),
+      create: () => `${randomBytes(32).toString('hex')}\n`,
+      valid: (t) => /^[0-9a-f]{64}$/.test(t.trim()),
+    },
+    io,
+  )
+  return text.trim()
 }
 
 /** The cookie value: an HMAC of the secret, so the secret itself never reaches the browser. */

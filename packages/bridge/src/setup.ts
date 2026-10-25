@@ -1,6 +1,7 @@
 import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { BridgePaths } from './config.js'
+import type { KeyStore } from './keychain.js'
 import type { LaunchdStatus } from './launchd.js'
 
 /** node:sqlite is unflagged from 22.13. */
@@ -122,7 +123,10 @@ export async function runSetup(d: SetupDeps): Promise<void> {
   else say(`Control page: ${url}`)
 }
 
-export async function runUninstall(d: Pick<SetupDeps, 'paths' | 'launchd' | 'log'>, purge: boolean): Promise<void> {
+/** The Keychain items the bridge creates (see keychain.ts). */
+export const KEYCHAIN_SECRETS = ['host-identity', 'signing-key', 'control-secret'] as const
+
+export async function runUninstall(d: Pick<SetupDeps, 'paths' | 'launchd' | 'log'> & { keychain?: KeyStore | null }, purge: boolean): Promise<void> {
   const had = d.launchd.uninstall()
   d.log(had ? 'Removed the launchd agent.' : 'The launchd agent was not installed.')
   rmSync(appDir(d.paths), { recursive: true, force: true })
@@ -130,6 +134,16 @@ export async function runUninstall(d: Pick<SetupDeps, 'paths' | 'launchd' | 'log
   if (purge) {
     rmSync(d.paths.root, { recursive: true, force: true })
     d.log(`Deleted ${d.paths.root} (keys, paired devices, logs).`)
+    if (d.keychain) {
+      for (const name of KEYCHAIN_SECRETS) {
+        try {
+          d.keychain.delete(name)
+        } catch (err) {
+          d.log(`Could not remove "${name}" from the login Keychain (${(err as Error).message}). Remove it in Keychain Access (service "dorabot-remote").`)
+        }
+      }
+      d.log('Removed the bridge keys from the login Keychain.')
+    }
   } else if (existsSync(d.paths.root)) {
     d.log(`Kept keys and paired devices in ${d.paths.root}. Add --purge to delete them too.`)
   }
