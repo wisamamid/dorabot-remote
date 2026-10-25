@@ -7,13 +7,15 @@ import {
   fitImagesToBudget,
   makeBrowserEncoder,
 } from '../lib/attachments.js'
-import { haptic, watchKeyboard } from '../lib/platform.js'
+import { haptic, watchKeyboard, isNative, platformName } from '../lib/platform.js'
+import { recordVoice, isVoiceSupported, type RecordingHandle } from '../lib/voice-transcription.js'
 import { PullToRefresh } from './PullToRefresh.js'
 import { ChatItemList, StatusLine } from './ChatItems.js'
 import { ApprovalCard, ElicitationCard, QuestionCard } from './Interrupts.js'
 import { ModelPicker } from './ModelPicker.js'
 import { usePinner } from './PinActions.js'
 import { useRename } from './RenameSheet.js'
+import { useSavedPromptsSheet } from './SavedPromptsSheet.js'
 import { Button, Dot, Screen, cx } from './ui.js'
 
 /**
@@ -36,6 +38,7 @@ export function SessionView({
   const conn = useConnection()
   const rename = useRename()
   const pinner = usePinner()
+  const savedPromptsSheet = useSavedPromptsSheet()
   const state = conn.getSession(sessionKey)
   const scrollRef = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
@@ -45,10 +48,14 @@ export function SessionView({
   const [error, setError] = useState<string | null>(null)
   const [photos, setPhotos] = useState<Array<{ id: number; file: File; url: string }>>([])
   const [loadingEarlier, setLoadingEarlier] = useState(false)
+  const [recording, setRecording] = useState(false)
+  const [voiceSupported, setVoiceSupported] = useState(false)
+  const [voiceText, setVoiceText] = useState('')
   const photoId = useRef(0)
   const photosRef = useRef(photos)
   photosRef.current = photos
   const fileInput = useRef<HTMLInputElement>(null)
+  const recordingRef = useRef<RecordingHandle | null>(null)
   const earlierLoadedRef = useRef(0)
 
   useEffect(() => {
@@ -56,6 +63,10 @@ export function SessionView({
     conn.clearAttention(sessionKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionKey, session?.id])
+
+  useEffect(() => {
+    void isVoiceSupported().then(setVoiceSupported)
+  }, [])
 
   useEffect(() => watchKeyboard(setKeyboard), [])
   // Release the preview blobs when leaving the conversation.
@@ -147,6 +158,62 @@ export function SessionView({
         setError((err as Error).message)
       }
     }
+  }
+
+  async function startVoiceRecording(): Promise<void> {
+    if (recording || !voiceSupported) return
+    try {
+      setRecording(true)
+      setVoiceText('')
+      recordingRef.current = await recordVoice({
+        language: 'en-US',
+        partialResults: true,
+        onResult: (result) => {
+          setVoiceText(result.text)
+        },
+        onError: (error) => {
+          setError(error)
+          setRecording(false)
+        },
+      })
+    } catch (err) {
+      setError((err as Error).message)
+      setRecording(false)
+    }
+  }
+
+  async function stopVoiceRecording(): Promise<void> {
+    if (!recording || !recordingRef.current) return
+    try {
+      const text = await recordingRef.current.stop()
+      if (text) {
+        setDraft((prev) => prev + (prev && !prev.endsWith(' ') ? ' ' : '') + text)
+      }
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setRecording(false)
+      setVoiceText('')
+      recordingRef.current = null
+    }
+  }
+
+  const handleVoiceMouseDown = () => {
+    void startVoiceRecording()
+  }
+
+  const handleVoiceMouseUp = () => {
+    void stopVoiceRecording()
+  }
+
+  const handleVoiceTouchStart = (e: React.TouchEvent) => {
+    e.preventDefault()
+    void startVoiceRecording()
+  }
+
+  const handleVoiceTouchEnd = (e: React.TouchEvent) => {
+    e.preventDefault()
+    void stopVoiceRecording()
   }
 
   async function loadEarlier(): Promise<void> {
@@ -342,6 +409,44 @@ export function SessionView({
                 <path d="M21 16l-5-5-8 8" />
               </svg>
             </button>
+            <button
+              onClick={() => savedPromptsSheet.open((text) => setDraft((prev) => prev + (prev && !prev.endsWith(' ') ? ' ' : '') + text))}
+              disabled={conn.state !== 'ready' || sending}
+              aria-label="Insert saved prompt"
+              className="flex size-11 shrink-0 items-center justify-center rounded-full bg-ink-800 text-ink-300 active:bg-ink-700 disabled:opacity-40"
+              title="Saved prompts"
+            >
+              <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="1" fill="currentColor" />
+                <circle cx="19" cy="12" r="1" fill="currentColor" />
+                <circle cx="5" cy="12" r="1" fill="currentColor" />
+              </svg>
+            </button>
+            {voiceSupported && (
+              <button
+                onMouseDown={handleVoiceMouseDown}
+                onMouseUp={handleVoiceMouseUp}
+                onTouchStart={handleVoiceTouchStart}
+                onTouchEnd={handleVoiceTouchEnd}
+                disabled={conn.state !== 'ready' || sending}
+                aria-label={recording ? 'Recording...' : 'Record voice'}
+                className={cx(
+                  'flex size-11 shrink-0 items-center justify-center rounded-full active:bg-ink-700 disabled:opacity-40 transition-colors',
+                  recording ? 'bg-rose-500 text-ink-950' : 'bg-ink-800 text-ink-300',
+                )}
+                title={recording ? 'Recording...' : 'Hold to record'}
+              >
+                <svg viewBox="0 0 24 24" className="size-5" fill={recording ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8" />
+                </svg>
+              </button>
+            )}
+            {voiceText && recording && (
+              <div className="flex-1 rounded-2xl border border-ink-600 bg-ink-850 px-4 py-2.5 text-[14px] text-ink-200 line-clamp-2">
+                {voiceText}
+              </div>
+            )}
             <textarea
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
