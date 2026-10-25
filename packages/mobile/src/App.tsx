@@ -16,7 +16,7 @@ import { useSplit } from './lib/layout.js'
 import { ConnectionProvider, useConnection } from './lib/connection.js'
 import { InboxProvider, useInbox } from './lib/inbox-context.js'
 import { bannerFor } from './lib/status-banner.js'
-import { haptic, onAppUrl, setStatusBarDark } from './lib/platform.js'
+import { haptic, isNative, onAppUrl, setStatusBarDark } from './lib/platform.js'
 import { AppLockProvider, useAppLock } from './lib/app-lock.js'
 import { clearDeliveredNotifications, onPushNavigate, pruneDeliveredNotifications } from './lib/push.js'
 import { hostIdForKid } from './lib/push-keys.js'
@@ -126,7 +126,7 @@ function Shell(): ReactNode {
     const verify = verifyOnce.current ?? lock.verify('Confirm')
     setDecision(null)
     verifyOnce.current = null
-    void runDecision(route, { verify: () => verify, rpc: (m, p) => connRef.current.rpc(m, p) }).then((out) => {
+    void runDecision(route, { verify: () => verify, verifyFresh: () => lock.verify('Approve a risky action', { fresh: true }), native: isNative, rpc: (m, p) => connRef.current.rpc(m, p) }).then((out) => {
       setToast({ text: out.message, ok: out.status === 'done' || out.status === 'already_resolved' })
       void haptic(out.status === 'done' ? 'success' : 'warning')
     })

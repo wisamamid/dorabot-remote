@@ -38,7 +38,7 @@ describe('runDecision', () => {
         verify: async () => verdict,
         rpc: async (m: string, p?: Record<string, unknown>) => {
           calls.push([m, p])
-          if (m === 'tool.pending') return pending.map((requestId) => ({ requestId }))
+          if (m === 'tool.pending') return pending.map((requestId) => ({ requestId, toolName: 'Bash', input: { command: requestId.startsWith('risky') ? 'git push --force' : 'ls' } }))
           if (fail) throw fail
           return {}
         },
@@ -65,6 +65,38 @@ describe('runDecision', () => {
   })
   it('allows a phone with no biometrics or passcode (the OS already required it unlocked)', async () => {
     expect((await runDecision(route, mk('unavailable', ['r1']).deps)).status).toBe('done')
+  })
+  describe('tiered approvals (risky approve needs its own fresh Face ID)', () => {
+    const risky = { type: 'decide', decision: 'approve', rid: 'risky1' } as const
+    const withFresh = (verdict: 'ok' | 'cancelled' | 'unavailable' | 'failed', fresh: 'ok' | 'cancelled' | 'unavailable' | 'failed' | null, native = true) => {
+      const t = mk(verdict, ['risky1', 'r1'])
+      const freshCalls: number[] = []
+      return { ...t, freshCalls, deps: { ...t.deps, native, ...(fresh ? { verifyFresh: async () => (freshCalls.push(1), fresh) } : {}) } }
+    }
+    it('prompts again even though the first verify succeeded, then approves', async () => {
+      const t = withFresh('ok', 'ok')
+      expect((await runDecision(risky, t.deps)).status).toBe('done')
+      expect(t.freshCalls).toHaveLength(1)
+      expect(t.calls.map((c) => c[0])).toEqual(['tool.pending', 'tool.approve'])
+    })
+    it('does not approve when the fresh prompt is cancelled, fails or is unavailable', async () => {
+      for (const f of ['cancelled', 'failed', 'unavailable'] as const) {
+        const t = withFresh('ok', f)
+        expect((await runDecision(risky, t.deps)).status).toBe('cancelled')
+        expect(t.calls.map((c) => c[0])).toEqual(['tool.pending'])
+      }
+    })
+    it('fails closed with no fresh verifier, and allows unavailable only without a native prompt', async () => {
+      expect((await runDecision(risky, withFresh('ok', null).deps)).status).toBe('cancelled')
+      expect((await runDecision(risky, withFresh('ok', 'unavailable', false).deps)).status).toBe('done')
+    })
+    it('a routine approve and any deny never ask for a fresh prompt', async () => {
+      const a = withFresh('ok', 'cancelled')
+      expect((await runDecision(route, a.deps)).status).toBe('done')
+      const d = withFresh('ok', 'cancelled')
+      expect((await runDecision({ ...risky, decision: 'deny' }, d.deps)).status).toBe('done')
+      expect(a.freshCalls.length + d.freshCalls.length).toBe(0)
+    })
   })
   it('reports an already resolved request without calling approve', async () => {
     const t = mk('ok', ['other'])

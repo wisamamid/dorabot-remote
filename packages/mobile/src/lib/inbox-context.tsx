@@ -17,6 +17,7 @@ import {
   useState,
   type ReactNode,
 } from 'react'
+import { requireApprovalAuth } from './approval-auth.js'
 import { useConnection } from './connection.js'
 import {
   actionable,
@@ -189,7 +190,13 @@ export function InboxProvider({ children }: { children: ReactNode }): ReactNode 
       for (const item of items) {
         if (item.kind !== 'approval') continue
         try {
-          await (action === 'approve' ? approve(item) : deny(item))
+          if (action === 'approve') {
+            // Same rule as a single approval: a risky one asks for Face ID on its own, every time.
+            const a = item.approval!
+            const refused = await requireApprovalAuth(a.toolName, a.input, a.blockedPath ? { blockedPath: a.blockedPath } : {})
+            if (refused) throw new Error(refused)
+            await approve(item)
+          } else await deny(item)
         } catch {
           failed += 1
         }

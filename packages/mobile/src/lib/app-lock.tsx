@@ -25,7 +25,7 @@ interface AppLockValue {
   locked: boolean
   setEnabled: (on: boolean) => Promise<boolean>
   /** Ask for Face ID / passcode; unlocks the app on success. */
-  verify: (reason: string) => Promise<AuthResult>
+  verify: (reason: string, opts?: { fresh?: boolean }) => Promise<AuthResult>
 }
 
 const Ctx = createContext<AppLockValue | null>(null)
@@ -77,8 +77,8 @@ export function AppLockProvider({ children }: { children: ReactNode }): ReactNod
     }
   }, [])
 
-  const verify = useCallback(async (reason: string): Promise<AuthResult> => {
-    const r = await authenticate(reason)
+  const verify = useCallback(async (reason: string, opts?: { fresh?: boolean }): Promise<AuthResult> => {
+    const r = await authenticate(reason, { fresh: opts?.fresh })
     // 'unavailable' means no biometrics and no passcode: nothing to check, so do not trap the user.
     if (r === 'ok' || r === 'unavailable') setLocked(false)
     return r

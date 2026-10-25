@@ -8,6 +8,7 @@ import type {
 } from '@dorabot-remote/protocol'
 import { assessRisk } from '@dorabot-remote/protocol'
 import { useEffect, useState, type ReactNode } from 'react'
+import { requireApprovalAuth } from '../lib/approval-auth.js'
 import { QUESTION_TIMEOUT_MS } from '../lib/inbox.js'
 import { haptic } from '../lib/platform.js'
 import { RiskBadge, ToolInputPreview } from './ApprovalPreview.js'
@@ -104,8 +105,15 @@ export function ApprovalCard({
       return
     }
     setBusy('approve')
-    await haptic('medium')
     try {
+      // Risky: Face ID / passcode right now, every time. Routine: straight through.
+      const refused = await requireApprovalAuth(approval.toolName, effective.input, approval.blockedPath ? { blockedPath: approval.blockedPath } : {})
+      if (refused) {
+        setError(refused)
+        setConfirming(false)
+        return
+      }
+      await haptic('medium')
       await onApprove(mod)
     } catch (err) {
       setError((err as Error).message)

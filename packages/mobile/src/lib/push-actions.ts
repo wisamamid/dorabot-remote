@@ -2,6 +2,7 @@
  * What to do with a notification tap or action button. Pure routing plus the
  * approve/deny flow, with every side effect injected so it can be tested.
  */
+import { authLevelFor, verdictAllows } from './approval-auth.js'
 import { decryptWithKeyInfo, pushKeyId, type StoredPushKey } from './push-keys.js'
 
 export interface PushNav {
@@ -73,6 +74,10 @@ const ALREADY_GONE = /no pending|already (answered|timeout|cancelled|resolved)|n
 export interface DecisionDeps {
   /** Face ID / passcode. 'unavailable' (no biometrics and no passcode) is allowed: the OS already required an unlocked phone. */
   verify: () => Promise<'ok' | 'cancelled' | 'unavailable' | 'failed'>
+  /** A fresh Face ID / passcode prompt for a risky approval (no reuse of the earlier one). Absent means risky approvals cannot proceed. */
+  verifyFresh?: () => Promise<'ok' | 'cancelled' | 'unavailable' | 'failed'>
+  /** Whether a real OS prompt exists (false in the browser demo). Defaults to true. */
+  native?: boolean
   rpc: (method: string, params?: Record<string, unknown>) => Promise<unknown>
 }
 
@@ -81,8 +86,14 @@ export async function runDecision(route: Extract<PushRoute, { type: 'decide' }>,
   if (verdict === 'cancelled' || verdict === 'failed') return { status: 'cancelled', message: 'Not confirmed. Nothing was changed.' }
   const gone: DecisionOutcome = { status: 'already_resolved', message: 'Already handled.' }
   try {
-    const pending = (await deps.rpc('tool.pending')) as Array<{ requestId?: string }> | null
-    if (!Array.isArray(pending) || !pending.some((p) => p.requestId === route.rid)) return gone
+    const pending = (await deps.rpc('tool.pending')) as Array<{ requestId?: string; toolName?: string; input?: Record<string, unknown> }> | null
+    const entry = Array.isArray(pending) ? pending.find((p) => p.requestId === route.rid) : undefined
+    if (!entry) return gone
+    // Tiered approvals: a risky approve needs its own Face ID, never the one a moment ago.
+    if (route.decision === 'approve' && authLevelFor(entry.toolName, entry.input) === 'fresh') {
+      const v = deps.verifyFresh ? await deps.verifyFresh() : 'failed'
+      if (!verdictAllows(v, deps.native ?? true)) return { status: 'cancelled', message: v === 'unavailable' ? 'Risky actions need Face ID or a passcode. Open the app to review it.' : 'Not confirmed. Nothing was approved.' }
+    }
     if (route.decision === 'approve') await deps.rpc('tool.approve', { requestId: route.rid })
     else await deps.rpc('tool.deny', { requestId: route.rid, reason: DENY_REASON })
   } catch (err) {
