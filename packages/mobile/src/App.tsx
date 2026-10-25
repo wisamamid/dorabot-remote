@@ -26,6 +26,8 @@ import { routePushAction, runDecision, type PushRoute } from './lib/push-actions
 import { createPortal } from 'react-dom'
 import { AskConfirmSheet } from './components/AskConfirmSheet.js'
 import { PushProvider } from './lib/push-context.js'
+import { SavedPromptsProvider } from './lib/saved-prompts-context.js'
+import { SavedPromptsSheetProvider } from './components/SavedPromptsSheet.js'
 
 type TabName = 'sessions' | 'inbox' | 'work' | 'code' | 'more'
 
@@ -42,12 +44,24 @@ export default function App(): ReactNode {
         <PushProvider>
           <InboxProvider>
             <RenameProvider>
-              <Shell />
+              <SavedPromptsSheetProvider>
+                <ShellWithSavedPrompts />
+              </SavedPromptsSheetProvider>
             </RenameProvider>
           </InboxProvider>
         </PushProvider>
       </ConnectionProvider>
     </AppLockProvider>
+  )
+}
+
+function ShellWithSavedPrompts(): ReactNode {
+  const conn = useConnection()
+  const hostId = conn.demo ? 'demo' : conn.activeHostId
+  return (
+    <SavedPromptsProvider hostId={hostId}>
+      <Shell />
+    </SavedPromptsProvider>
   )
 }
 

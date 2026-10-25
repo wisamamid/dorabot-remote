@@ -4,6 +4,7 @@ import { useConnection } from '../lib/connection.js'
 import { haptic, platformName } from '../lib/platform.js'
 import { useAppLock } from '../lib/app-lock.js'
 import { usePush } from '../lib/push-context.js'
+import { useSavedPrompts } from '../lib/saved-prompts-context.js'
 import { ConnectionLogScreen } from './ConnectionLogScreen.js'
 import { MacsSection } from './MacsSection.js'
 import { RulesSection } from './RulesSection.js'
@@ -19,10 +20,12 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
   const conn = useConnection()
   const push = usePush()
   const lock = useAppLock()
+  const savedPrompts = useSavedPrompts()
   const [confirmForget, setConfirmForget] = useState(false)
   const [requesting, setRequesting] = useState<Scope | null>(null)
   const [note, setNote] = useState<string | null>(null)
   const [showLog, setShowLog] = useState(false)
+  const [editingPrompts, setEditingPrompts] = useState(false)
 
   const scopes = conn.device?.scopes ?? conn.pairing?.scopes ?? []
 
@@ -41,6 +44,7 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
   }
 
   if (showLog) return <ConnectionLogScreen onBack={() => setShowLog(false)} />
+  if (editingPrompts) return <SavedPromptsEditScreen onBack={() => setEditingPrompts(false)} />
 
   return (
     <Screen title="Settings" onBack={onBack}>
@@ -168,6 +172,20 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
         )}
 
         <section className="space-y-2">
+          <h2 className="px-1 text-[13px] font-semibold uppercase tracking-wider text-ink-400">Composer</h2>
+          <button
+            onClick={() => setEditingPrompts(true)}
+            className="flex w-full items-center justify-between rounded-2xl border border-ink-700 bg-ink-800 px-4 py-3 text-left active:bg-ink-700"
+          >
+            <span>
+              <span className="block text-[15px] font-medium">Saved prompts</span>
+              <span className="block text-[13px] text-ink-400">{savedPrompts.prompts.length} prompts</span>
+            </span>
+            <span className="text-ink-400">›</span>
+          </button>
+        </section>
+
+        <section className="space-y-2">
           <h2 className="px-1 text-[13px] font-semibold uppercase tracking-wider text-ink-400">Permissions</h2>
           <div className="space-y-1.5">
             {SCOPES.map((scope) => {
@@ -244,4 +262,99 @@ function describeState(state: string, detail?: string): string {
   if (state === 'handshaking') return 'verifying…'
   if (state === 'pending') return 'waiting for approval on your Mac'
   return detail ? `offline (${detail})` : 'offline'
+}
+
+function SavedPromptsEditScreen({ onBack }: { onBack: () => void }): ReactNode {
+  const savedPrompts = useSavedPrompts()
+  const [editing, setEditing] = useState<string | null>(null)
+  const [newTitle, setNewTitle] = useState('')
+  const [newText, setNewText] = useState('')
+
+  const startEdit = (id: string) => {
+    const prompt = savedPrompts.prompts.find((p) => p.id === id)
+    if (prompt) {
+      setEditing(id)
+      setNewTitle(prompt.title)
+      setNewText(prompt.text)
+    }
+  }
+
+  const saveEdit = async () => {
+    if (editing && newTitle.trim()) {
+      await savedPrompts.update(editing, { title: newTitle.trim(), text: newText.trim() })
+      setEditing(null)
+    }
+  }
+
+  return (
+    <Screen title="Saved prompts" onBack={onBack}>
+      <div className="scroll h-full space-y-4 px-4 py-4">
+        {editing ? (
+          <Card className="space-y-3">
+            <h3 className="text-[15px] font-semibold">Edit prompt</h3>
+            <div className="space-y-2">
+              <label className="block text-[13px] font-medium">Title</label>
+              <input
+                value={newTitle}
+                onChange={(e) => setNewTitle(e.target.value)}
+                placeholder="Prompt title"
+                className="w-full rounded-lg border border-ink-600 bg-ink-900 px-3 py-2.5 text-[14px]"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="block text-[13px] font-medium">Text</label>
+              <textarea
+                value={newText}
+                onChange={(e) => setNewText(e.target.value)}
+                placeholder="Prompt text"
+                rows={3}
+                className="w-full rounded-lg border border-ink-600 bg-ink-900 px-3 py-2.5 text-[14px]"
+              />
+            </div>
+            <div className="flex gap-2 border-t border-ink-700 pt-3">
+              <Button variant="ghost" onClick={() => setEditing(null)} className="flex-1">
+                Cancel
+              </Button>
+              <Button variant="primary" onClick={() => void saveEdit()} className="flex-1">
+                Save
+              </Button>
+            </div>
+          </Card>
+        ) : (
+          <>
+            {savedPrompts.prompts.length === 0 ? (
+              <div className="py-8 text-center text-[14px] text-ink-400">No saved prompts</div>
+            ) : (
+              <div className="space-y-2">
+                {savedPrompts.prompts.map((prompt) => (
+                  <Card key={prompt.id} className="space-y-2">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[15px] font-medium text-ink-100">{prompt.title}</div>
+                        {prompt.title !== prompt.text && (
+                          <div className="text-[13px] text-ink-400 line-clamp-2">{prompt.text}</div>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => startEdit(prompt.id)}
+                        className="text-[13px] font-medium text-mint-500 active:opacity-70"
+                      >
+                        Edit
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => void savedPrompts.remove(prompt.id)}
+                      className="text-[13px] font-medium text-rose-glow active:opacity-70"
+                    >
+                      Delete
+                    </button>
+                  </Card>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </Screen>
+  )
 }
