@@ -8,6 +8,9 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { createPortal } from 'react-dom'
 import { authenticate, type AuthResult } from './biometric.js'
 import { isNative, onAppBackground, onAppResume, storage } from './platform.js'
+import { clearAllPushKeys } from './push-key.js'
+import { clearDeliveredNotifications } from './push.js'
+import { LOCK_FAILS_KEY, MAX_LOCK_FAILS, afterAttempt, attemptsLeft, parseFails, selfWipe } from './wipe.js'
 
 /** Matches SECRET_KEY, so the on/off flag lives in the Keychain (old Preferences copies are migrated on first read). */
 export const APPLOCK_KEY = 'dorabot-remote.applock.v1'
@@ -26,6 +29,8 @@ interface AppLockValue {
   setEnabled: (on: boolean) => Promise<boolean>
   /** Ask for Face ID / passcode; unlocks the app on success. */
   verify: (reason: string, opts?: { fresh?: boolean }) => Promise<AuthResult>
+  /** Failed unlock attempts left before the app erases itself; null until one has failed. */
+  attemptsLeft: number | null
 }
 
 const Ctx = createContext<AppLockValue | null>(null)
@@ -41,6 +46,9 @@ export function AppLockProvider({ children }: { children: ReactNode }): ReactNod
   const [loaded, setLoaded] = useState(!isNative)
   const [enabled, setEnabledState] = useState(false)
   const [locked, setLocked] = useState(isNative)
+  const [fails, setFails] = useState(0)
+  const [wiping, setWiping] = useState(false)
+  const failsRef = useRef<number | null>(null)
   const hiddenAt = useRef<number | null>(null)
   const enabledRef = useRef(false)
   enabledRef.current = enabled
@@ -79,6 +87,27 @@ export function AppLockProvider({ children }: { children: ReactNode }): ReactNod
 
   const verify = useCallback(async (reason: string, opts?: { fresh?: boolean }): Promise<AuthResult> => {
     const r = await authenticate(reason, { fresh: opts?.fresh })
+    // Consecutive failures at the lock erase the app (lost phone). Only counted while the lock is on.
+    if (enabledRef.current) {
+      failsRef.current ??= parseFails(await storage.get(LOCK_FAILS_KEY).catch(() => null))
+      const next = afterAttempt(failsRef.current, r)
+      if (next.fails !== failsRef.current) {
+        failsRef.current = next.fails
+        setFails(next.fails)
+        void storage.set(LOCK_FAILS_KEY, String(next.fails)).catch(() => {})
+      }
+      if (next.wipe) {
+        setWiping(true)
+        await selfWipe({
+          io: storage,
+          clearAllPushKeys,
+          clearNotifications: clearDeliveredNotifications,
+        })
+        // Everything in memory goes too: reload onto the Pair screen.
+        window.location.reload()
+        return r
+      }
+    }
     // 'unavailable' means no biometrics and no passcode: nothing to check, so do not trap the user.
     if (r === 'ok' || r === 'unavailable') setLocked(false)
     return r
@@ -99,19 +128,36 @@ export function AppLockProvider({ children }: { children: ReactNode }): ReactNod
   )
 
   const value = useMemo<AppLockValue>(
-    () => ({ supported: isNative, enabled, locked: locked && (enabled || !loaded), setEnabled, verify }),
-    [enabled, locked, loaded, setEnabled, verify],
+    () => ({
+      supported: isNative,
+      enabled,
+      locked: locked && (enabled || !loaded),
+      setEnabled,
+      verify,
+      attemptsLeft: fails > 0 ? attemptsLeft(fails) : null,
+    }),
+    [enabled, locked, loaded, setEnabled, verify, fails],
   )
 
   return (
     <Ctx.Provider value={value}>
       {children}
-      {value.locked && <LockScreen ready={loaded} onUnlock={() => verify('Unlock DoraBot Remote')} />}
+      {(value.locked || wiping) && <LockScreen ready={loaded && !wiping} wiping={wiping} attemptsLeft={value.attemptsLeft} onUnlock={() => verify('Unlock DoraBot Remote')} />}
     </Ctx.Provider>
   )
 }
 
-function LockScreen({ ready, onUnlock }: { ready: boolean; onUnlock: () => Promise<AuthResult> }): ReactNode {
+function LockScreen({
+  ready,
+  wiping,
+  attemptsLeft: left,
+  onUnlock,
+}: {
+  ready: boolean
+  wiping: boolean
+  attemptsLeft: number | null
+  onUnlock: () => Promise<AuthResult>
+}): ReactNode {
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState<string | null>(null)
   const tried = useRef(false)
@@ -144,8 +190,19 @@ function LockScreen({ ready, onUnlock }: { ready: boolean; onUnlock: () => Promi
         <rect x="4" y="11" width="16" height="10" rx="2" />
         <path d="M8 11V7a4 4 0 0 1 8 0v4" />
       </svg>
-      <p className="text-[19px] font-semibold">DoraBot Remote is locked</p>
-      {note && <p className="text-[14px] text-ink-400">{note}</p>}
+      <p className="text-[19px] font-semibold">{wiping ? 'Erasing this app…' : 'DoraBot Remote is locked'}</p>
+      {wiping ? (
+        <p className="text-[14px] text-ink-400">Too many failed attempts. Removing pairings and keys from this phone.</p>
+      ) : (
+        <>
+          {note && <p className="text-[14px] text-ink-400">{note}</p>}
+          {left !== null && left > 0 && (
+            <p className="text-[14px] text-amber-glow" role="status">
+              {left} {left === 1 ? 'attempt' : 'attempts'} left. After {MAX_LOCK_FAILS} failed attempts this app erases its pairings and keys.
+            </p>
+          )}
+        </>
+      )}
       <button
         onClick={() => void unlock()}
         disabled={busy || !ready}

@@ -109,7 +109,10 @@ export const CONTROL_PAGE = `<!doctype html>
   <h2>Permission requests</h2>
   <div id="requests"></div>
 
-  <h2>Paired devices</h2>
+  <div class="row" style="margin:36px 0 12px">
+    <h2 style="margin:0">Paired devices</h2>
+    <button class="small danger" onclick="lockdown()" title="Lost phone? Revoke every device at once">Lockdown: revoke all</button>
+  </div>
   <div id="devices"></div>
 
   <h2>Shared folders</h2>
@@ -251,14 +254,14 @@ function render() {
         <div class="row">
           <div>
             <div><strong>\${esc(d.name)}</strong>
-              <span class="pill \${d.revoked ? 'off' : (online ? 'on' : '')}">\${d.pending ? 'waiting for approval' : d.revoked ? (d.revokedReason === 'expired' ? 'revoked: unseen for 90 days' : 'revoked') : (online ? 'connected' : 'offline')}</span>
+              <span class="pill \${d.revoked ? 'off' : (online ? 'on' : '')}">\${d.pending ? 'waiting for approval' : d.revoked ? (d.revokedReason === 'expired' ? 'revoked: unseen for 90 days' : d.revokedReason === 'lost' ? 'revoked: marked lost' : d.revokedReason === 'lockdown' ? 'revoked: lockdown' : 'revoked') : (online ? 'connected' : 'offline')}</span>
             </div>
             <div class="small muted mono">\${esc(d.platform)} · \${esc(d.fingerprint)} · \${d.lastSeenAt ? 'last seen ' + new Date(d.lastSeenAt).toLocaleString() : 'never connected'}</div>
           </div>
           <div style="display:flex;gap:8px">
             \${d.revoked
               ? \`<button class="small" onclick="device('\${d.id}','restore')">Restore</button>\`
-              : \`<button class="small danger" onclick="device('\${d.id}','revoke')">Revoke</button>\`}
+              : \`<button class="small danger" onclick="device('\${d.id}','lost')">Lost</button><button class="small danger" onclick="device('\${d.id}','revoke')">Revoke</button>\`}
             <button class="small danger" onclick="device('\${d.id}','delete')">Remove</button>
           </div>
         </div>
@@ -318,7 +321,15 @@ async function removeRule(id) {
   load();
 }
 
+async function lockdown() {
+  const n = state.devices.filter(d => !d.revoked).length;
+  if (!confirm('Revoke ALL ' + n + ' device(s) now?\\n\\nEvery phone is cut off at once (direct and relay) and its push notifications stop. Phones must be paired again afterwards.')) return;
+  await api('/api/lockdown', { confirm: true });
+  load();
+}
+
 async function device(deviceId, action) {
+  if (action === 'lost' && !confirm('Mark this device as lost?\\n\\nIt is revoked at once and stops receiving notifications.')) return;
   if (action === 'delete' && !confirm('Remove this device? It will need to pair again.')) return;
   await api('/api/device', { deviceId, action });
   load();

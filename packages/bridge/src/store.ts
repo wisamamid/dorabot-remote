@@ -442,6 +442,25 @@ export class Store {
     return stale
   }
 
+  /**
+   * Lost phone: revoke EVERY device at once (push token and key dropped by setRevoked), delete the ones still
+   * waiting for approval, and deny open permission requests. Returns what changed so callers can audit it.
+   */
+  lockdown(reason = 'lockdown'): { revoked: DeviceRecord[]; rejected: DeviceRecord[] } {
+    const revoked: DeviceRecord[] = []
+    const rejected: DeviceRecord[] = []
+    for (const d of this.listDevices()) {
+      if (d.pending) {
+        if (this.rejectDevice(d.id)) rejected.push(d)
+      } else if (!d.revoked) {
+        this.setRevoked(d.id, true, reason)
+        revoked.push(d)
+      }
+    }
+    this.db.prepare("UPDATE scope_requests SET status = 'denied' WHERE status = 'pending'").run()
+    return { revoked, rejected }
+  }
+
   /** Revoke active devices unseen for maxAgeMs (never-connected devices count from creation). */
   expireStaleDevices(maxAgeMs: number, now = Date.now()): DeviceRecord[] {
     const stale = this.listDevices().filter(

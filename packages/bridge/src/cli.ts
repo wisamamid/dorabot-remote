@@ -31,6 +31,8 @@ const USAGE = `dorabot-remote ${BRIDGE_VERSION}
   rules [remove <id>]         List or remove always-allow approval rules
   grant <deviceId> <scope>    Add a permission to a device
   revoke <deviceId>           Block a device without deleting it
+  lost <deviceId>             Phone lost: revoke it at once (push and relay access dropped)
+  lockdown                    Lost phone: revoke ALL devices at once (asks to confirm; --yes skips)
   remove <deviceId>           Delete a device entirely
   addresses                   Show the addresses a phone can reach this Mac on
   config                      Show or change settings
@@ -146,6 +148,12 @@ async function main(): Promise<void> {
       return
     case 'revoke':
       cmdSetRevoked(positionals[1], true)
+      return
+    case 'lost':
+      cmdLost(positionals[1])
+      return
+    case 'lockdown':
+      await cmdLockdown(values.yes === true)
       return
     case 'unrevoke':
       cmdSetRevoked(positionals[1], false)
@@ -373,6 +381,54 @@ async function main(): Promise<void> {
     }
     process.stdout.write(ok ? `${revoked ? 'Revoked' : 'Restored'} ${deviceId}.\n` : `No device with id ${deviceId}\n`)
     store.close()
+  }
+
+  function cmdLost(deviceId: string | undefined): void {
+    if (!deviceId) {
+      process.stderr.write('Usage: dorabot-remote lost <deviceId>\n')
+      process.exitCode = 1
+      return
+    }
+    const store = new Store(paths.db)
+    const dev = store.getDevice(deviceId)
+    const ok = dev && !dev.pending ? store.setRevoked(deviceId, true, 'lost') : false
+    if (ok) store.recordAudit({ deviceId, deviceName: dev?.name, action: 'lost', summary: 'marked lost: revoked', transport: 'cli' })
+    process.stdout.write(ok ? `Marked ${dev?.name} as lost and revoked it. A running bridge cuts it off within seconds.\n` : `No active device with id ${deviceId}\n`)
+    if (!ok) process.exitCode = 1
+    store.close()
+  }
+
+  async function cmdLockdown(yes: boolean): Promise<void> {
+    const store = new Store(paths.db)
+    try {
+      const active = store.listDevices().filter((d) => !d.revoked)
+      if (active.length === 0) {
+        process.stdout.write('No active devices. Nothing to revoke.\n')
+        return
+      }
+      if (!yes) {
+        if (!process.stdin.isTTY || !process.stdout.isTTY) {
+          process.stderr.write('Lockdown revokes every device. Run it in a terminal to confirm, or pass --yes.\n')
+          process.exitCode = 1
+          return
+        }
+        const { createInterface } = await import('node:readline/promises')
+        const rl = createInterface({ input: process.stdin, output: process.stdout })
+        const a = (await rl.question(`Revoke ALL ${active.length} device(s) now (${active.map((d) => d.name).join(', ')})? [y/N] `)).trim().toLowerCase()
+        rl.close()
+        if (a !== 'y' && a !== 'yes') {
+          process.stdout.write('Cancelled.\n')
+          return
+        }
+      }
+      const { revoked, rejected } = store.lockdown('lockdown')
+      for (const d of revoked) store.recordAudit({ deviceId: d.id, deviceName: d.name, action: 'revoke', summary: 'lockdown: all devices revoked', transport: 'cli' })
+      for (const d of rejected) store.recordAudit({ deviceId: d.id, deviceName: d.name, action: 'reject', summary: 'lockdown', transport: 'cli' })
+      store.recordAudit({ action: 'lockdown', summary: `revoked ${revoked.length} device(s), removed ${rejected.length} pending`, transport: 'cli' })
+      process.stdout.write(`Lockdown: revoked ${revoked.length} device(s), removed ${rejected.length} pending. Push keys are dropped; a running bridge cuts live connections and relay access within seconds.\n`)
+    } finally {
+      store.close()
+    }
   }
 
   function cmdRemove(deviceId: string | undefined): void {

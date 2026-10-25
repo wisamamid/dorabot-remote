@@ -17,6 +17,20 @@ test.describe('DoraBot Remote iOS - Demo Mode', () => {
     await expect(demoLink).toBeVisible()
   })
 
+  test('After a self-wipe the Pair screen explains why, once', async ({ page }) => {
+    await page.addInitScript(() => {
+      if (!sessionStorage.getItem('seeded')) {
+        sessionStorage.setItem('seeded', '1')
+        localStorage.setItem('dorabot-remote.wipenotice.v1', '1')
+      }
+    })
+    await page.goto('/')
+    await expect(page.getByRole('alert')).toContainText('erased all pairings and keys after 5 failed unlock attempts')
+    await page.reload()
+    await expect(page.locator('h1', { hasText: /Pair with your Mac/ })).toBeVisible()
+    await expect(page.getByRole('alert')).toHaveCount(0)
+  })
+
   test('Enter demo mode shows sample sessions and demo banner', async ({ page }) => {
     await page.goto('/')
     await page.waitForLoadState('networkidle')

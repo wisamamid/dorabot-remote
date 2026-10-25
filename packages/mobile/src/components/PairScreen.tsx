@@ -1,7 +1,8 @@
 import { decodePairingPayload, pairWithHost, type PairingPayload } from '@dorabot-remote/protocol'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
-import { haptic, isNative, onPairingUrl, scanQr, suggestDeviceName } from '../lib/platform.js'
+import { haptic, isNative, onPairingUrl, scanQr, storage, suggestDeviceName } from '../lib/platform.js'
+import { WIPE_MESSAGE, WIPE_NOTICE_KEY } from '../lib/wipe.js'
 import { Button, Card } from './ui.js'
 
 const createSocket = (url: string) => new WebSocket(url) as never
@@ -22,6 +23,18 @@ export function PairScreen({ onCancel }: { onCancel?: () => void } = {}): ReactN
   const [deviceName, setDeviceName] = useState(suggestDeviceName())
   const nameRef = useRef(deviceName)
   nameRef.current = deviceName
+  // Set when the app erased itself after too many failed unlock attempts; shown once.
+  const [wiped, setWiped] = useState(false)
+  useEffect(() => {
+    void storage
+      .get(WIPE_NOTICE_KEY)
+      .then((v) => {
+        if (v !== '1') return
+        setWiped(true)
+        void storage.remove(WIPE_NOTICE_KEY).catch(() => {})
+      })
+      .catch(() => {})
+  }, [])
 
   // Opened from the Camera app, or from a link anywhere else on the phone.
   useEffect(() => {
@@ -111,6 +124,14 @@ export function PairScreen({ onCancel }: { onCancel?: () => void } = {}): ReactN
           placeholder="iPhone"
         />
       </Card>
+
+      {wiped && (
+        <Card tone="danger">
+          <div role="alert" className="text-[14px] leading-relaxed text-rose-glow">
+            {WIPE_MESSAGE}
+          </div>
+        </Card>
+      )}
 
       {error && (
         <Card tone="danger">

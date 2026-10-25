@@ -136,6 +136,17 @@ export const storage = {
       await (await prefs()).plugin.remove({ key })
     })
   },
+  /** Delete everything this app stored (Keychain items under our prefix, Preferences, localStorage). Self-wipe only. */
+  clearAll(): Promise<void> {
+    if (!isNative) {
+      localStorage.clear()
+      return Promise.resolve()
+    }
+    return withTimeout('clear all', async () => {
+      await (await secureStorage()).plugin.clear()
+      await (await prefs()).plugin.clear()
+    })
+  },
 }
 
 // ---------------------------------------------------------------------------

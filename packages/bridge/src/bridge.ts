@@ -370,6 +370,35 @@ export class Bridge implements ConnectionHost {
     return gone.length
   }
 
+  /**
+   * Lost phone, all devices: revoke everything now (push keys dropped, relay token hashes dropped via the relay
+   * sync, live sockets closed), delete unapproved pairings. Every device is audit-logged, plus one summary entry.
+   */
+  lockdown(transport = 'local'): { revoked: number; rejected: number } {
+    const { revoked, rejected } = this.store.lockdown('lockdown')
+    for (const d of revoked) this.auditLog.record({ deviceId: d.id, deviceName: d.name, action: 'revoke', summary: 'lockdown: all devices revoked', transport })
+    for (const d of rejected) this.auditLog.record({ deviceId: d.id, deviceName: d.name, action: 'reject', summary: 'lockdown', transport })
+    this.auditLog.record({ action: 'lockdown', summary: `revoked ${revoked.length} device(s), removed ${rejected.length} pending`, transport })
+    this.log(`LOCKDOWN: revoked ${revoked.length} device(s), removed ${rejected.length} pending pairing(s)`)
+    for (const c of [...this.connections]) if (c.device) c.close('revoked')
+    this.syncRelayAccess()
+    return { revoked: revoked.length, rejected: rejected.length }
+  }
+
+  /** One phone is lost: revoke it (push key and relay token dropped) and say why. */
+  markLost(deviceId: string, transport = 'local'): boolean {
+    const d = this.store.getDevice(deviceId)
+    if (!d || d.pending) return false
+    const ok = this.store.setRevoked(deviceId, true, 'lost')
+    if (ok) {
+      this.auditLog.record({ deviceId, deviceName: d.name, action: 'lost', summary: 'marked lost: revoked', transport })
+      this.log(`"${d.name}" marked lost and revoked`)
+    }
+    for (const c of this.connections) if (c.device?.id === deviceId) c.close('revoked')
+    this.syncRelayAccess()
+    return ok
+  }
+
   private acquireUnauthSlot(ip: string): { release: () => void; readonly done: boolean } | null {
     if (this.unauthTotal >= MAX_UNAUTH_TOTAL || (this.unauthByIp.get(ip) ?? 0) >= MAX_UNAUTH_PER_IP) return null
     this.unauthTotal++
@@ -1418,6 +1447,8 @@ export class Bridge implements ConnectionHost {
           this.store.touchDevice(deviceId)
           this.auditLog.record({ ...who, action: 'restore' })
         }
+      } else if (action === 'lost') {
+        ok = this.markLost(deviceId, 'local')
       } else if (action === 'delete') {
         ok = this.store.deleteDevice(deviceId)
         for (const c of this.connections) if (c.device?.id === deviceId) c.close('removed')
@@ -1446,6 +1477,13 @@ export class Bridge implements ConnectionHost {
       }
       this.syncRelayAccess() // [SEC-RELAY] revoke/restore/delete change who may use the relay
       json(200, { ok })
+      return
+    }
+
+    if (url.pathname === '/api/lockdown' && method === 'POST') {
+      const { confirm } = await body()
+      if (confirm !== true) throw new HttpError(400, 'lockdown needs confirm: true')
+      json(200, { ok: true, ...this.lockdown('local') })
       return
     }
 
