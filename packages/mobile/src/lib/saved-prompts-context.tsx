@@ -28,6 +28,7 @@ export function SavedPromptsProvider({ hostId, children }: { hostId: string; chi
 
   useEffect(() => {
     let alive = true
+    setLoading(true)
     void loadPrompts(hostId).then((loaded) => {
       if (alive) {
         setPrompts(loaded)

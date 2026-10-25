@@ -5,14 +5,6 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: { host: true, port: 5180 },
-  resolve: {
-    alias: {
-      // Stub module for @capacitor-community/speech-recognition which is only
-      // available at native runtime via Capacitor. The import is guarded by isNative
-      // checks so this stub is never used in web builds.
-      '@capacitor-community/speech-recognition': new URL('./src/stubs/speech-recognition.ts', import.meta.url).pathname,
-    },
-  },
   build: {
     // The app ships inside a WebView on a phone that may be on cellular. The
     // entry chunk is held to a gzip budget by `npm run size`; the heavy things

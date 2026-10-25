@@ -114,7 +114,15 @@ function questionContent(d: Record<string, unknown>): { title: string; body: str
 }
 
 /** Build the readable content for a gateway event, or null if it is not one we describe. */
-export function buildPushContent(name: string, data: unknown, rid: string, host?: { id: string; name: string }): PushContent | null {
+export interface RunStats {
+  /** ms epoch of the first event seen for this run */
+  startTime?: number
+  toolCalls: number
+  /** edit/write tool calls (not distinct files: the gateway does not send paths) */
+  fileCount: number
+}
+
+export function buildPushContent(name: string, data: unknown, rid: string, host?: { id: string; name: string }, stats?: RunStats): PushContent | null {
   const d = (data ?? {}) as Record<string, unknown>
   const sessionKey = typeof d.sessionKey === 'string' && d.sessionKey ? d.sessionKey : undefined
   const base = {
@@ -138,35 +146,25 @@ export function buildPushContent(name: string, data: unknown, rid: string, host?
     }
     case 'agent.result':
     case 'agent.error': {
-      const result = d.result ?? {}
-      const resultData = typeof result === 'object' ? (result as Record<string, unknown>) : {}
-      const startTime = typeof d.startTime === 'number' ? d.startTime : 0
-      const endTime = typeof d.timestamp === 'number' ? d.timestamp : Date.now()
-      const duration = Math.round((endTime - startTime) / 1000)
-      const cost = typeof resultData.total_cost_usd === 'number' ? resultData.total_cost_usd : undefined
-      const toolCalls = Array.isArray(d.toolCalls) ? d.toolCalls.length : 0
-      const fileCount = typeof d.fileCount === 'number' ? d.fileCount : 0
-
-      // Extract first message/preview from final assistant message
-      let preview = ''
-      if (typeof resultData.message === 'string') {
-        preview = resultData.message
-      } else if (Array.isArray(resultData.content)) {
-        const text = (resultData.content as Array<Record<string, unknown>>)
-          .filter((b) => typeof b.text === 'string')
-          .map((b) => b.text)
-          .join(' ')
-        preview = text
-      }
-
+      // Real gateway shapes: agent.result {result: string, usage: {totalCostUsd}, timestamp},
+      // agent.error {error: string, timestamp}. The gateway sends no start time or tool list,
+      // so the notifier tracks those per session and passes them in as `stats`.
       const isError = name === 'agent.error'
+      const usage = (d.usage ?? {}) as Record<string, unknown>
+      const cost = typeof usage.totalCostUsd === 'number' && usage.totalCostUsd > 0 ? usage.totalCostUsd : undefined
+      const endTime = typeof d.timestamp === 'number' ? d.timestamp : Date.now()
+      const duration = stats?.startTime !== undefined ? Math.max(0, Math.round((endTime - stats.startTime) / 1000)) : 0
+      const toolCalls = stats?.toolCalls ?? 0
+      const fileCount = stats?.fileCount ?? 0
+      const preview = oneLine(isError ? d.error : d.result)
+
       return {
         kind: isError ? 'error' : 'result',
         ...base,
         title: isError ? 'Run failed' : 'Run finished',
         body: buildResultBody(duration, cost, toolCalls, fileCount),
         ...(preview ? { preview: truncate(preview, 120) } : {}),
-        ...(duration !== 0 ? { duration } : {}),
+        ...(duration > 0 ? { duration } : {}),
         ...(cost !== undefined ? { cost } : {}),
         ...(toolCalls > 0 ? { toolCalls } : {}),
         ...(fileCount > 0 ? { fileCount } : {}),
@@ -201,8 +199,12 @@ export function encryptPushContent(content: PushContent, key: Uint8Array, nonce:
   let c = content
   let plain = new TextEncoder().encode(JSON.stringify(c))
   // Multi-byte text can exceed the byte budget even within the character caps.
-  while (plain.length > MAX_PLAINTEXT_BYTES && c.body.length > 1) {
-    c = { ...c, body: truncate(c.body, Math.floor(Array.from(c.body).length * 0.8)) }
+  while (plain.length > MAX_PLAINTEXT_BYTES && (c.body.length > 1 || (c.preview?.length ?? 0) > 1)) {
+    c = {
+      ...c,
+      body: truncate(c.body, Math.floor(Array.from(c.body).length * 0.8)),
+      ...(c.preview ? { preview: truncate(c.preview, Math.floor(Array.from(c.preview).length * 0.8)) } : {}),
+    }
     plain = new TextEncoder().encode(JSON.stringify(c))
   }
   const ct = chacha20poly1305(key, nonce).encrypt(plain)

@@ -1,31 +1,26 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import * as prompts from './saved-prompts.js'
 
-// Mock storage
+const mockStorage = vi.hoisted(() => ({ data: {} as Record<string, string> }))
+
 vi.mock('./platform.js', () => ({
   storage: {
-    get: vi.fn(),
-    set: vi.fn(),
-    remove: vi.fn(),
+    get: vi.fn((key: string) => Promise.resolve(mockStorage.data[key] ?? null)),
+    set: vi.fn((key: string, value: string) => {
+      mockStorage.data[key] = value
+      return Promise.resolve()
+    }),
+    remove: vi.fn((key: string) => {
+      delete mockStorage.data[key]
+      return Promise.resolve()
+    }),
   },
   isNative: false,
 }))
 
 describe('saved-prompts', () => {
-  let mockStorage: Record<string, string>
-
   beforeEach(() => {
-    mockStorage = {}
-    const { storage } = require('./platform.js')
-    storage.get = vi.fn((key: string) => Promise.resolve(mockStorage[key] ?? null))
-    storage.set = vi.fn((key: string, value: string) => {
-      mockStorage[key] = value
-      return Promise.resolve()
-    })
-    storage.remove = vi.fn((key: string) => {
-      delete mockStorage[key]
-      return Promise.resolve()
-    })
+    mockStorage.data = {}
   })
 
   it('should return default prompts when storage is empty', async () => {
@@ -70,6 +65,12 @@ describe('saved-prompts', () => {
 
     expect(loaded[0].id).toBe(p2.id)
     expect(loaded[1].id).toBe(p1.id)
+  })
+
+  it('prompts are kept per host', async () => {
+    await prompts.addPrompt('mac-a', { title: 'Only A', text: 'a' })
+    expect((await prompts.loadPrompts('mac-b')).find((p) => p.title === 'Only A')).toBeUndefined()
+    expect(await prompts.loadPrompts('mac-b')).toHaveLength(3)
   })
 
   it('storageKey includes hostId', () => {

@@ -28,11 +28,11 @@ export async function loadPrompts(hostId: string): Promise<SavedPrompt[]> {
   try {
     const key = storageKey(hostId)
     const stored = await storage.get(key)
-    if (!stored) return DEFAULT_PROMPTS
+    if (!stored) return DEFAULT_PROMPTS.map((p) => ({ ...p }))
     const data = JSON.parse(stored) as SavedPromptsStore
-    return data.prompts || DEFAULT_PROMPTS
+    return data.prompts || DEFAULT_PROMPTS.map((p) => ({ ...p }))
   } catch {
-    return DEFAULT_PROMPTS
+    return DEFAULT_PROMPTS.map((p) => ({ ...p }))
   }
 }
 

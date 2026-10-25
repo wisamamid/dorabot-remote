@@ -44,9 +44,7 @@ export default function App(): ReactNode {
         <PushProvider>
           <InboxProvider>
             <RenameProvider>
-              <SavedPromptsSheetProvider>
-                <ShellWithSavedPrompts />
-              </SavedPromptsSheetProvider>
+              <ShellWithSavedPrompts />
             </RenameProvider>
           </InboxProvider>
         </PushProvider>
@@ -58,12 +56,13 @@ export default function App(): ReactNode {
 function ShellWithSavedPrompts(): ReactNode {
   const conn = useConnection()
   const hostId = conn.demo ? 'demo' : (conn.activeHostId || '')
-  return hostId ? (
+  // Always mounted (the sheet and Settings read it); an unpaired phone has no hostId and no prompts UI.
+  return (
     <SavedPromptsProvider hostId={hostId}>
-      <Shell />
+      <SavedPromptsSheetProvider>
+        <Shell />
+      </SavedPromptsSheetProvider>
     </SavedPromptsProvider>
-  ) : (
-    <Shell />
   )
 }
 
