@@ -7,7 +7,7 @@ import {
   fitImagesToBudget,
   makeBrowserEncoder,
 } from '../lib/attachments.js'
-import { haptic, watchKeyboard, isNative, platformName } from '../lib/platform.js'
+import { haptic, watchKeyboard } from '../lib/platform.js'
 import { recordVoice, isVoiceSupported, type RecordingHandle } from '../lib/voice-transcription.js'
 import { PullToRefresh } from './PullToRefresh.js'
 import { ChatItemList, StatusLine } from './ChatItems.js'

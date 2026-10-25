@@ -326,6 +326,48 @@ test.describe('DoraBot Remote iOS - Demo Mode', () => {
     }
   })
 
+  test('Saved prompts sheet opens and inserts text in composer', async ({ page }) => {
+    await page.goto('/')
+    await page.waitForLoadState('networkidle')
+
+    // Enter demo
+    await page.locator('button, a', { hasText: /Try a demo/ }).click()
+    await page.waitForLoadState('networkidle')
+
+    // Open a session
+    await page.locator('text=Fix failing checkout tests').first().click()
+    await page.waitForTimeout(500)
+
+    // Find the saved prompts button (+ / dots icon in composer)
+    const composerButtons = page.locator('button[title="Saved prompts"], button[aria-label*="prompt"]')
+    const promptBtn = composerButtons.first()
+    await expect(promptBtn).toBeVisible()
+    await promptBtn.click()
+    await page.waitForTimeout(500)
+
+    // Verify sheet opened with default prompts
+    const sheet = page.getByRole('dialog', { name: /Saved prompts/ })
+    await expect(sheet).toBeVisible()
+
+    // Verify default prompts are listed
+    await expect(sheet.locator('text=Run the tests')).toBeVisible()
+    await expect(sheet.locator('text=Summarise what changed today')).toBeVisible()
+    await expect(sheet.locator('text=What are you working on?')).toBeVisible()
+
+    // Click first prompt
+    await sheet.locator('button', { hasText: 'Run the tests' }).first().click()
+    await page.waitForTimeout(300)
+
+    // Verify sheet closed and text was inserted
+    await expect(sheet).not.toBeVisible()
+
+    // Verify text appears in composer
+    const composer = page.locator('textarea').first()
+    await expect(composer).toBeVisible()
+    const value = await composer.inputValue()
+    expect(value).toContain('Run the tests')
+  })
+
   test('Exit demo returns to Pair screen', async ({ page }) => {
     await page.goto('/')
     await page.waitForLoadState('networkidle')

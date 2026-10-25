@@ -5,7 +5,7 @@
 import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { useSavedPrompts } from '../lib/saved-prompts-context.js'
-import { Button, cx } from './ui.js'
+import { Button } from './ui.js'
 
 interface SavedPromptsSheetCtx {
   open: (onSelect: (text: string) => void) => void

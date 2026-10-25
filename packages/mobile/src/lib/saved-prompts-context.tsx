@@ -3,7 +3,7 @@
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { SavedPrompt } from './saved-prompts.js'
-import { loadPrompts, savePrompts, addPrompt, updatePrompt, removePrompt, reorderPrompts } from './saved-prompts.js'
+import { loadPrompts, addPrompt, updatePrompt, removePrompt, reorderPrompts } from './saved-prompts.js'
 
 interface SavedPromptsContextValue {
   prompts: SavedPrompt[]

@@ -57,11 +57,13 @@ export default function App(): ReactNode {
 
 function ShellWithSavedPrompts(): ReactNode {
   const conn = useConnection()
-  const hostId = conn.demo ? 'demo' : conn.activeHostId
-  return (
+  const hostId = conn.demo ? 'demo' : (conn.activeHostId || '')
+  return hostId ? (
     <SavedPromptsProvider hostId={hostId}>
       <Shell />
     </SavedPromptsProvider>
+  ) : (
+    <Shell />
   )
 }
 

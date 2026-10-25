@@ -1,6 +1,9 @@
 /**
  * On-device voice transcription using @capacitor-community/speech-recognition.
  * Records audio while user holds the microphone button, transcribes on-device.
+ *
+ * Type declarations for the plugin are minimal since the package is optional
+ * and loaded dynamically. TypeScript assumes any for dynamic imports.
  */
 import { isNative, platformName } from './platform.js'
 
@@ -19,6 +22,9 @@ export interface VoiceRecognitionOptions {
 
 let supported: boolean | null = null
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type SpeechRecognitionType = any
+
 export async function isVoiceSupported(): Promise<boolean> {
   if (supported !== null) return supported
 
@@ -33,9 +39,15 @@ export async function isVoiceSupported(): Promise<boolean> {
   }
 
   try {
-    const { SpeechRecognition } = await import('@capacitor-community/speech-recognition')
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const plugin: any = await import('@capacitor-community/speech-recognition')
+    const SpeechRecognition: SpeechRecognitionType = plugin.SpeechRecognition
+    if (!SpeechRecognition) {
+      supported = false
+      return false
+    }
     const result = await SpeechRecognition.available()
-    supported = result.available === true
+    supported = result?.available === true
     return supported
   } catch {
     supported = false
@@ -53,31 +65,35 @@ export async function recordVoice(options: VoiceRecognitionOptions = {}): Promis
     throw new Error('Voice recording is only available on iOS.')
   }
 
-  const { SpeechRecognition } = await import('@capacitor-community/speech-recognition')
+  // Import plugin dynamically to avoid type errors when not available
+  let SpeechRecognition: SpeechRecognitionType
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const plugin: any = await import('@capacitor-community/speech-recognition')
+    SpeechRecognition = plugin.SpeechRecognition
+  } catch {
+    throw new Error('Speech Recognition plugin not available')
+  }
 
   let finished = false
-
-  // Set up the recognizer with options
-  await SpeechRecognition.start({
-    language: options.language || 'en-US',
-    maxResults: options.maxResults || 5,
-    partialResults: options.partialResults !== false,
-  })
-
-  // Listen for results
-  let lastPartial = ''
   let finalText = ''
 
-  // In a real app, Capacitor Speech Recognition would emit events or return results
-  // from the start() call. However, the current plugin pattern is to poll or use
-  // a callback. We'll wrap this in a way that works with the current API.
+  // Set up the recognizer with options
+  try {
+    await SpeechRecognition.start({
+      language: options.language || 'en-US',
+      maxResults: options.maxResults || 5,
+      partialResults: options.partialResults !== false,
+    })
+  } catch (err) {
+    options.onError?.((err as Error).message || 'Failed to start recording')
+    throw err
+  }
 
   const stop = async (): Promise<string> => {
     if (finished) return finalText
 
     try {
-      // Note: The @capacitor-community/speech-recognition plugin may have different
-      // APIs depending on version. This follows the documented pattern.
       finished = true
 
       // Get the result (the plugin returns the result when stop is called)
