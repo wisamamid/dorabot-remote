@@ -12,6 +12,8 @@ export default defineConfig({
     // chunks, named here so the budget script and bundle reports read clearly.
     chunkSizeWarningLimit: 600,
     rollupOptions: {
+      // Native-only modules that should not be bundled in the web app
+      external: ['@capacitor-community/speech-recognition'],
       output: {
         manualChunks(id) {
           if (id.includes('/@xterm/')) return 'xterm'
