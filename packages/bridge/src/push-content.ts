@@ -7,12 +7,12 @@
  *
  * Format: base64( nonce[12] || ciphertext || tag[16] ) using ChaCha20-Poly1305
  * (IETF, RFC 8439), a 32-byte key and a fresh random nonce per push. The
- * plaintext is UTF-8 JSON: {kind, rid, sessionKey?, title, body, hostId?, hostName?}.
+ * plaintext is UTF-8 JSON: {kind, rid, sessionKey?, title, body, hostId?, hostName?, duration?, cost?, toolCalls?, fileCount?, preview?}.
  */
 import { chacha20poly1305 } from '@noble/ciphers/chacha.js'
 import { createHash, randomBytes } from 'node:crypto'
 
-export type ContentKind = 'question' | 'approval'
+export type ContentKind = 'question' | 'approval' | 'result' | 'error'
 
 export interface PushContent {
   kind: ContentKind
@@ -23,6 +23,16 @@ export interface PushContent {
   /** Which Mac this is from, so a phone paired with several can switch to the right one on tap. */
   hostId?: string
   hostName?: string
+  /** For result/error: duration in seconds */
+  duration?: number
+  /** For result: cost in dollars */
+  cost?: number
+  /** For result/error: number of tool calls */
+  toolCalls?: number
+  /** For result: number of files touched (edited/written) */
+  fileCount?: number
+  /** For result/error: preview of final assistant message (first 120 chars) */
+  preview?: string
 }
 
 export const PUSH_KEY_BYTES = 32
@@ -126,9 +136,64 @@ export function buildPushContent(name: string, data: unknown, rid: string, host?
         body: truncate(summarizeToolInput(toolName, d.input as Record<string, unknown> | undefined), MAX_BODY),
       }
     }
+    case 'agent.result':
+    case 'agent.error': {
+      const result = d.result ?? {}
+      const resultData = typeof result === 'object' ? (result as Record<string, unknown>) : {}
+      const startTime = typeof d.startTime === 'number' ? d.startTime : 0
+      const endTime = typeof d.timestamp === 'number' ? d.timestamp : Date.now()
+      const duration = Math.round((endTime - startTime) / 1000)
+      const cost = typeof resultData.total_cost_usd === 'number' ? resultData.total_cost_usd : undefined
+      const toolCalls = Array.isArray(d.toolCalls) ? d.toolCalls.length : 0
+      const fileCount = typeof d.fileCount === 'number' ? d.fileCount : 0
+
+      // Extract first message/preview from final assistant message
+      let preview = ''
+      if (typeof resultData.message === 'string') {
+        preview = resultData.message
+      } else if (Array.isArray(resultData.content)) {
+        const text = (resultData.content as Array<Record<string, unknown>>)
+          .filter((b) => typeof b.text === 'string')
+          .map((b) => b.text)
+          .join(' ')
+        preview = text
+      }
+
+      const isError = name === 'agent.error'
+      return {
+        kind: isError ? 'error' : 'result',
+        ...base,
+        title: isError ? 'Run failed' : 'Run finished',
+        body: buildResultBody(duration, cost, toolCalls, fileCount),
+        ...(preview ? { preview: truncate(preview, 120) } : {}),
+        ...(duration !== 0 ? { duration } : {}),
+        ...(cost !== undefined ? { cost } : {}),
+        ...(toolCalls > 0 ? { toolCalls } : {}),
+        ...(fileCount > 0 ? { fileCount } : {}),
+      }
+    }
     default:
       return null
   }
+}
+
+function buildResultBody(duration: number, cost: number | undefined, toolCalls: number, fileCount: number): string {
+  const parts: string[] = []
+  if (duration > 0) {
+    const mins = Math.floor(duration / 60)
+    const secs = duration % 60
+    parts.push(mins > 0 ? `${mins}m ${secs}s` : `${secs}s`)
+  }
+  if (cost !== undefined && cost > 0) {
+    parts.push(`$${cost.toFixed(4)}`)
+  }
+  if (toolCalls > 0) {
+    parts.push(`${toolCalls} tool${toolCalls > 1 ? 's' : ''}`)
+  }
+  if (fileCount > 0) {
+    parts.push(`${fileCount} file${fileCount > 1 ? 's' : ''}`)
+  }
+  return truncate(parts.join(' · ') || 'Run completed', MAX_BODY)
 }
 
 /** base64(nonce || ciphertext || tag). `nonce` is injectable for tests only. */
