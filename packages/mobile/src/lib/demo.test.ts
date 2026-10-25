@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { SessionAggregator, sessionMessagesToChatItems, type StoredSession } from '@dorabot-remote/protocol'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DEMO_KEYS, createDemoClient, type ClientLike } from './demo.js'
+import { assessRisk } from '@dorabot-remote/protocol'
 import { actionable, emptyInbox, inboxReducer, type InboxState } from './inbox.js'
 
 let inbox: InboxState
@@ -61,17 +62,18 @@ describe('demo host', () => {
     expect(tools.every((t) => t.type === 'tool_use' && t.output)).toBe(true)
   })
 
-  it('puts one approval and one question in the inbox', async () => {
+  it('puts two approvals (one risky) and one question in the inbox', async () => {
     const live = actionable(inbox)
-    expect(live.map((i) => i.kind).sort()).toEqual(['approval', 'question'])
-    expect(live.find((i) => i.kind === 'approval')?.approval).toMatchObject({ toolName: 'Bash', input: { command: 'npm test' } })
-    expect(await client.rpc('tool.pending')).toHaveLength(1)
+    expect(live.map((i) => i.kind).sort()).toEqual(['approval', 'approval', 'question'])
+    expect(live.find((i) => i.id === 'approval:demo-approval-1')?.approval).toMatchObject({ toolName: 'Bash', input: { command: 'npm test' } })
+    expect(assessRisk('Bash', live.find((i) => i.id === 'approval:demo-approval-2')!.approval!.input).risky).toBe(true)
+    expect(await client.rpc('tool.pending')).toHaveLength(2)
   })
 
   it('approving resolves the item and streams a canned reply', async () => {
     await client.rpc('tool.approve', { requestId: 'demo-approval-1' })
     vi.advanceTimersByTime(10_000)
-    expect(inbox.items.some((i) => i.kind === 'approval')).toBe(false)
+    expect(inbox.items.some((i) => i.id === 'approval:demo-approval-1')).toBe(false)
     const s = agg.get(DEMO_KEYS.checkout)
     expect(s.status).toBe('idle')
     const text = s.chatItems.filter((i) => i.type === 'text').map((i) => (i.type === 'text' ? i.content : '')).join('')
@@ -79,13 +81,13 @@ describe('demo host', () => {
     const bash = s.chatItems.find((i) => i.type === 'tool_use' && i.name === 'Bash')
     expect(bash).toMatchObject({ output: expect.stringContaining('passed') })
     expect(s.chatItems.at(-1)?.type).toBe('result')
-    expect(await client.rpc('tool.pending')).toEqual([])
+    expect(await client.rpc('tool.pending')).toEqual([expect.objectContaining({ requestId: 'demo-approval-2' })])
   })
 
   it('denying also resolves and replies', async () => {
     await client.rpc('tool.deny', { requestId: 'demo-approval-1' })
     vi.advanceTimersByTime(10_000)
-    expect(inbox.items.some((i) => i.kind === 'approval')).toBe(false)
+    expect(inbox.items.some((i) => i.id === 'approval:demo-approval-1')).toBe(false)
     expect(agg.get(DEMO_KEYS.checkout).chatItems.some((i) => i.type === 'text')).toBe(true)
   })
 

@@ -81,13 +81,28 @@ test.describe('DoraBot Remote iOS - Demo Mode', () => {
     await expect(approvalItem.first()).toBeVisible()
 
     // Find and click approve button
-    const approveBtn = page.locator('button:has-text("Approve"), button:has-text("Allow")').first()
+    const approveBtn = page.locator('button:text-is("Approve")').first()
     await approveBtn.click()
     await page.waitForTimeout(1500)
 
     // Verify reply text appears
     const replyText = page.locator('text=/All.*tests pass|demo/i')
     await expect(replyText.first()).toBeVisible({ timeout: 5000 })
+  })
+
+  test('Inbox: a risky approval shows the Risky badge, reasons and the full command', async ({ page }) => {
+    await page.goto('/')
+    await page.waitForLoadState('networkidle')
+    await page.locator('button, a', { hasText: /Try a demo/ }).click()
+    await page.waitForLoadState('networkidle')
+    await page.locator('button, [role="tab"]', { hasText: /Inbox/ }).click()
+    await page.waitForTimeout(500)
+
+    const badge = page.getByTestId('risk-badge')
+    await expect(badge).toHaveCount(1)
+    await expect(badge.first()).toContainText('Risky')
+    await expect(badge.first()).toContainText(/force/i)
+    await expect(page.getByTestId('full-command').filter({ hasText: 'git push --force origin release/2.4' })).toBeVisible()
   })
 
   test('Inbox: answer question by choosing an option', async ({ page }) => {
