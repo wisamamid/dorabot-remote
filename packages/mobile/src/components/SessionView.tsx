@@ -8,6 +8,7 @@ import {
   makeBrowserEncoder,
 } from '../lib/attachments.js'
 import { haptic, watchKeyboard } from '../lib/platform.js'
+import { getDraftsForSession, markDraftSent, removeDraft, saveDraft, type OfflineDraft } from '../lib/offline-drafts.js'
 import { endRunActivity, startRunActivity, updateRunActivity } from '../lib/appgroup.js'
 import { recordVoice, isVoiceSupported, type RecordingHandle } from '../lib/voice-transcription.js'
 import { PullToRefresh } from './PullToRefresh.js'
@@ -53,6 +54,7 @@ export function SessionView({
   const [voiceSupported, setVoiceSupported] = useState(false)
   const [voiceText, setVoiceText] = useState('')
   const [runSummary, setRunSummary] = useState<{ duration: number; cost?: number; toolCount: number } | null>(null)
+  const [pendingDrafts, setPendingDrafts] = useState<OfflineDraft[]>([])
   const photoId = useRef(0)
   const photosRef = useRef(photos)
   photosRef.current = photos
@@ -65,6 +67,7 @@ export function SessionView({
   useEffect(() => {
     void conn.openSession(sessionKey, session?.id)
     conn.clearAttention(sessionKey)
+    void getDraftsForSession(sessionKey).then(setPendingDrafts)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionKey, session?.id])
 
@@ -99,6 +102,28 @@ export function SessionView({
 
     previousStatusRef.current = state.status
   }, [state.status, state.chatItems])
+
+  // Auto-send pending drafts when connection becomes ready
+  useEffect(() => {
+    if (conn.state !== 'ready' || pendingDrafts.length === 0 || sending) return
+    const sendNextDraft = async () => {
+      const draft = pendingDrafts[0]
+      if (!draft) return
+      setSending(true)
+      try {
+        const params = { prompt: draft.content, ...(draft.images?.length ? { images: draft.images } : {}) }
+        await conn.rpc('chat.send', params)
+        await markDraftSent(draft.id)
+        setPendingDrafts((prev) => prev.filter((d) => d.id !== draft.id))
+        await haptic('light')
+      } catch {
+        // Retry on next connection
+      } finally {
+        setSending(false)
+      }
+    }
+    void sendNextDraft()
+  }, [conn.state, pendingDrafts.length, sending, conn])
 
   function addPhotos(e: ChangeEvent<HTMLInputElement>): void {
     const picked = Array.from(e.target.files ?? []).filter((f) => f.type.startsWith('image/') || f.type === '')
@@ -194,11 +219,28 @@ export function SessionView({
       setPhotos([])
       await haptic('light')
     } catch (err) {
-      setError((err as Error).message)
+      const errMsg = (err as Error).message
+      // Queue draft if offline
+      if (conn.state !== 'ready') {
+        const result = await saveDraft(sessionKey, prompt, photos.map((p) => ({ data: '', mediaType: p.file.type })))
+        setPendingDrafts((prev) => [...prev, result])
+        setDraft('')
+        photos.forEach((p) => URL.revokeObjectURL(p.url))
+        setPhotos([])
+        setError('Message queued - will send when connected')
+        await haptic('light')
+      } else {
+        setError(errMsg)
+      }
     } finally {
       encoder.dispose()
       setSending(false)
     }
+  }
+
+  async function removePendingDraft(draftId: string): Promise<void> {
+    await removeDraft(draftId)
+    setPendingDrafts((prev) => prev.filter((d) => d.id !== draftId))
   }
 
   async function interrupt(): Promise<void> {
@@ -456,6 +498,30 @@ export function SessionView({
         {error && (
           <div className="shrink-0 bg-rose-dim px-4 py-2 text-[13px] text-rose-glow" onClick={() => setError(null)}>
             {error}
+          </div>
+        )}
+
+        {pendingDrafts.length > 0 && (
+          <div className="shrink-0 border-t border-ink-700 bg-ink-850 px-3 py-2.5">
+            {pendingDrafts.map((draft) => (
+              <div key={draft.id} className="mb-1.5 flex items-center justify-between rounded-lg border border-ink-600 bg-ink-900 px-3 py-2 opacity-50 last:mb-0">
+                <span className="min-w-0 flex-1 truncate text-[13px] text-ink-300">
+                  {draft.content}
+                </span>
+                <div className="ml-2 flex shrink-0 items-center gap-2">
+                  <span className="text-[11px] text-ink-500">Will send when connected</span>
+                  <button
+                    onClick={() => void removePendingDraft(draft.id)}
+                    aria-label="Remove draft"
+                    className="flex size-5 items-center justify-center text-ink-400 hover:text-ink-200"
+                  >
+                    <svg viewBox="0 0 24 24" className="size-4" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                      <path d="M6 6l12 12M18 6L6 18" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         )}
 
