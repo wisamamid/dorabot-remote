@@ -182,6 +182,7 @@ export function SessionView({
   const activityOn = useRef(false)
   const activityName = session?.name || session?.senderName || prettyKey(sessionKey)
   useEffect(() => {
+    if (conn.demo) return // the demo's made-up runs never reach the lock screen
     if (busy && !activityOn.current) {
       activityOn.current = true
       void startRunActivity(activityName, runLabel, Date.now())
