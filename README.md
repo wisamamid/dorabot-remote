@@ -32,6 +32,8 @@ then fails the whole turn.
 This project adds a small daemon beside dorabot that lets a phone you have
 explicitly paired answer those prompts without changing a line of dorabot itself.
 
+See the [Changelog](CHANGELOG.md) for what's new in each build.
+
 ## How it fits together
 
 ```

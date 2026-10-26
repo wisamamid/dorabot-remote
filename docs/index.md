@@ -68,6 +68,7 @@ npx dorabot-remote uninstall --purge
 ## Links
 
 - [GitHub repository](https://github.com/wisamamid/dorabot-remote)
+- [Changelog](https://github.com/wisamamid/dorabot-remote/blob/main/CHANGELOG.md)
 - [Privacy policy](privacy/)
 - [Support and FAQ](support/)
 
