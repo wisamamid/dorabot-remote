@@ -758,7 +758,9 @@ export class Bridge implements ConnectionHost {
   }
 
   private broadcastRules(): void {
-    this.broadcastBridgeEvent('remote.rules_changed', { rules: this.store.listRules() })
+    // Rules hold the exact commands the Mac auto-approves: only devices that may list them hear about changes.
+    const rules = this.store.listRules()
+    for (const c of this.connections) if (c.device?.scopes.includes('approvals')) c.forward('remote.rules_changed', { rules }, undefined, null)
   }
 
   /**

@@ -137,10 +137,13 @@ describe('remote.rules.* and auto-approve', () => {
   it('adds, lists, broadcasts and removes; audits both', async () => {
     const a = await connect()
     const b = await connect()
+    const readOnly = await connect(['sessions'])
     const res = await addRule<{ rule: { id: string }; rules: unknown[] }>(a.c, { kind: 'exact', toolName: 'Bash', command: 'npm test' })
     expect(res.rules).toHaveLength(1)
     await wait(150)
     expect(b.ev.find((e) => e.event === 'remote.rules_changed')?.data.rules).toHaveLength(1)
+    // A device without the approvals scope never hears about the rules (they contain exact commands).
+    expect(readOnly.ev.some((e) => e.event === 'remote.rules_changed')).toBe(false)
     await expect(addRule(a.c, { kind: 'exact', toolName: 'Bash', command: 'rm -rf /' })).rejects.toThrow(/risky/)
     const removed = await b.c.rpc<{ removed: boolean; rules: unknown[] }>('remote.rules.remove', { id: res.rule.id })
     expect(removed).toMatchObject({ removed: true, rules: [] })
