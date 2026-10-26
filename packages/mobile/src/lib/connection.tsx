@@ -65,6 +65,7 @@ import {
   type StoredPairing,
 } from './hosts.js'
 import { forgetSent } from './push-hosts.js'
+import { clearDraftsForHost } from './offline-drafts.js'
 import { lapsedScopes } from './expiry.js'
 
 export type { HostPairing, StoredPairing }
@@ -735,6 +736,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }): React
     }
     const next = removePairing(fileRef.current, p.hostId)
     await forgetSent(p.hostId)
+    await clearDraftsForHost(p.hostId).catch(() => {})
     await clearPushKey(p.hostId)
     if (next.pairings.length === 0) void clearAllPushKeys()
     caches.current.drop(p.hostId)

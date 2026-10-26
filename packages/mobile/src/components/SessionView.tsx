@@ -1,5 +1,5 @@
 import type { StoredSession } from '@dorabot-remote/protocol'
-import { useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
 import {
   MAX_IMAGES,
@@ -8,7 +8,7 @@ import {
   makeBrowserEncoder,
 } from '../lib/attachments.js'
 import { haptic, watchKeyboard } from '../lib/platform.js'
-import { getDraftsForSession, markDraftSent, removeDraft, saveDraft, type OfflineDraft } from '../lib/offline-drafts.js'
+import { canAutoSend, getDraftsForSession, removeDraft, saveDraft, type OfflineDraft } from '../lib/offline-drafts.js'
 import { endRunActivity, startRunActivity, updateRunActivity } from '../lib/appgroup.js'
 import { recordVoice, isVoiceSupported, type RecordingHandle } from '../lib/voice-transcription.js'
 import { PullToRefresh } from './PullToRefresh.js'
@@ -67,7 +67,8 @@ export function SessionView({
   useEffect(() => {
     void conn.openSession(sessionKey, session?.id)
     conn.clearAttention(sessionKey)
-    void getDraftsForSession(sessionKey).then(setPendingDrafts)
+    setPendingDrafts([])
+    if (conn.activeHostId) void getDraftsForSession(conn.activeHostId, sessionKey).then(setPendingDrafts)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionKey, session?.id])
 
@@ -103,27 +104,30 @@ export function SessionView({
     previousStatusRef.current = state.status
   }, [state.status, state.chatItems])
 
-  // Auto-send pending drafts when connection becomes ready
-  useEffect(() => {
-    if (conn.state !== 'ready' || pendingDrafts.length === 0 || sending) return
-    const sendNextDraft = async () => {
-      const draft = pendingDrafts[0]
-      if (!draft) return
+  // Auto-send recent drafts for this Mac when the connection becomes ready. Older ones wait for a tap.
+  const sendDraft = useCallback(
+    async (draft: OfflineDraft): Promise<void> => {
+      if (draft.hostId !== conn.activeHostId) return
       setSending(true)
       try {
-        const params = { prompt: draft.content, ...(draft.images?.length ? { images: draft.images } : {}) }
-        await conn.rpc('chat.send', params)
-        await markDraftSent(draft.id)
+        await conn.rpc('chat.send', buildChatSendParams({ prompt: draft.content, images: [], sessionKey: draft.sessionKey, chatId: session?.chatId }))
+        await removeDraft(draft.id)
         setPendingDrafts((prev) => prev.filter((d) => d.id !== draft.id))
         await haptic('light')
       } catch {
-        // Retry on next connection
+        // Stays queued; retried on the next connection.
       } finally {
         setSending(false)
       }
-    }
-    void sendNextDraft()
-  }, [conn.state, pendingDrafts.length, sending, conn])
+    },
+    [conn, session?.chatId],
+  )
+
+  useEffect(() => {
+    if (conn.state !== 'ready' || sending) return
+    const next = pendingDrafts.find((d) => canAutoSend(d))
+    if (next) void sendDraft(next)
+  }, [conn.state, pendingDrafts, sending, sendDraft])
 
   function addPhotos(e: ChangeEvent<HTMLInputElement>): void {
     const picked = Array.from(e.target.files ?? []).filter((f) => f.type.startsWith('image/') || f.type === '')
@@ -222,12 +226,14 @@ export function SessionView({
       const errMsg = (err as Error).message
       // Queue draft if offline
       if (conn.state !== 'ready') {
-        const result = await saveDraft(sessionKey, prompt, photos.map((p) => ({ data: '', mediaType: p.file.type })))
-        setPendingDrafts((prev) => [...prev, result])
-        setDraft('')
-        photos.forEach((p) => URL.revokeObjectURL(p.url))
-        setPhotos([])
-        setError('Message queued - will send when connected')
+        const result = conn.activeHostId && prompt ? await saveDraft(conn.activeHostId, sessionKey, prompt) : null
+        if (result) {
+          setPendingDrafts((prev) => [...prev, result])
+          setDraft('')
+          photos.forEach((p) => URL.revokeObjectURL(p.url))
+          setPhotos([])
+          setError(photos.length ? 'Message queued (photos are not queued) - will send when connected' : 'Message queued - will send when connected')
+        } else setError(errMsg)
         await haptic('light')
       } else {
         setError(errMsg)
@@ -509,7 +515,13 @@ export function SessionView({
                   {draft.content}
                 </span>
                 <div className="ml-2 flex shrink-0 items-center gap-2">
-                  <span className="text-[11px] text-ink-500">Will send when connected</span>
+                  {canAutoSend(draft) ? (
+                    <span className="text-[11px] text-ink-500">Will send when connected</span>
+                  ) : (
+                    <button onClick={() => void sendDraft(draft)} disabled={conn.state !== 'ready' || sending} className="text-[11px] text-ink-300 underline disabled:opacity-40">
+                      Old: send now
+                    </button>
+                  )}
                   <button
                     onClick={() => void removePendingDraft(draft.id)}
                     aria-label="Remove draft"
