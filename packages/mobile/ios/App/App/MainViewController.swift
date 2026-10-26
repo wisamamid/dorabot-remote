@@ -7,5 +7,6 @@ class MainViewController: CAPBridgeViewController {
         bridge?.registerPluginInstance(PushKeyStorePlugin())
         bridge?.registerPluginInstance(SpeechRecognitionPlugin())
         bridge?.registerPluginInstance(AppGroupPlugin())
+        bridge?.registerPluginInstance(WatchBridgePlugin())
     }
 }

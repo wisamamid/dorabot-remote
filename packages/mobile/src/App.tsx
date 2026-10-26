@@ -16,6 +16,7 @@ import { Button, Spinner, cx } from './components/ui.js'
 import { useSplit } from './lib/layout.js'
 import { ConnectionProvider, useConnection } from './lib/connection.js'
 import { InboxProvider, useInbox } from './lib/inbox-context.js'
+import type { InboxItem } from './lib/inbox.js'
 import { bannerFor } from './lib/status-banner.js'
 import { haptic, isNative, onAppUrl, setStatusBarDark } from './lib/platform.js'
 import { AppLockProvider, useAppLock } from './lib/app-lock.js'
@@ -26,6 +27,8 @@ import { displayName } from './lib/hosts.js'
 import { routePushAction, runDecision, type PushRoute } from './lib/push-actions.js'
 import { createPortal } from 'react-dom'
 import { takeShare, publishWidgetSnapshot } from './lib/appgroup.js'
+import { onWatchRequest, publishWatchSnapshot } from './lib/watch.js'
+import { buildWatchSnapshot, handleWatchRequest } from './lib/watch-logic.js'
 import { DEFAULT_IMAGE_PROMPT, requestBytes, REQUEST_BUDGET_BYTES } from './lib/attachments.js'
 import { AskConfirmSheet } from './components/AskConfirmSheet.js'
 import { PushProvider } from './lib/push-context.js'
@@ -36,6 +39,11 @@ type TabName = 'sessions' | 'inbox' | 'work' | 'code' | 'more'
 
 /** `hostId` is the Mac the session lives on: after a switch, a session of another Mac is simply not shown. */
 type Open = { session: StoredSession | null; sessionKey: string; hostId: string | null } | null
+
+/** Nothing is offered on the wrist while the phone has no live link to the Mac: it could not be acted on. */
+function widgetItemsFor(items: InboxItem[], state: string): InboxItem[] {
+  return state === 'ready' ? items : []
+}
 
 export default function App(): ReactNode {
   useEffect(() => {
@@ -218,6 +226,28 @@ function Shell(): ReactNode {
     if (!paired) return
     void publishWidgetSnapshot(widgetHost, widgetPending)
   }, [paired, widgetHost, widgetPending])
+
+  // Apple Watch: the same list, shaped for the wrist, and the watch's approve / deny requests. A
+  // request is checked against the live inbox and connection at the moment it arrives.
+  const watchRef = useRef({ conn, inbox })
+  watchRef.current = { conn, inbox }
+  useEffect(() => {
+    if (!paired) return
+    void publishWatchSnapshot(buildWatchSnapshot(widgetItemsFor(inbox.items, conn.state), widgetHost, conn.sessions, Date.now()))
+  }, [paired, inbox.items, conn.state, conn.sessions, widgetHost])
+  useEffect(
+    () =>
+      onWatchRequest((req) => {
+        const { conn: c, inbox: ib } = watchRef.current
+        return handleWatchRequest(req, {
+          connected: c.state === 'ready' && c.gatewayConnected && !c.demo,
+          items: ib.items,
+          approve: (i) => ib.approve(i),
+          deny: (i) => ib.deny(i),
+        })
+      }),
+    [],
+  )
 
   useEffect(() => {
     const q = askQueue.current
