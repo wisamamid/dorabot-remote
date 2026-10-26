@@ -1,6 +1,7 @@
 import { NOT_RECOGNISED_TEXT, type StoredSession } from '@dorabot-remote/protocol'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { keyOf } from './lib/connection.js'
+import { initializeTheme } from './lib/theme.js'
 import { formatCountdown } from './lib/countdown.js'
 import { CodeScreen } from './components/CodeScreen.js'
 import { InboxScreen } from './components/InboxScreen.js'
@@ -39,6 +40,7 @@ type Open = { session: StoredSession | null; sessionKey: string; hostId: string 
 export default function App(): ReactNode {
   useEffect(() => {
     void setStatusBarDark()
+    initializeTheme()
   }, [])
   return (
     <AppLockProvider>

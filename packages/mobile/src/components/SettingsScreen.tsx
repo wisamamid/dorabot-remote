@@ -1,10 +1,11 @@
 import { SCOPE_DESCRIPTIONS, SCOPE_LABELS, SCOPES, type Scope } from '@dorabot-remote/protocol'
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
 import { haptic, platformName } from '../lib/platform.js'
 import { useAppLock } from '../lib/app-lock.js'
 import { usePush } from '../lib/push-context.js'
 import { useSavedPrompts } from '../lib/saved-prompts-context.js'
+import { getThemePreference, setThemePreference, getTextSizePreference, setTextSizePreference, applyTheme, applyTextSize, type Theme, type TextSize } from '../lib/theme.js'
 import { ConnectionLogScreen } from './ConnectionLogScreen.js'
 import { MacsSection } from './MacsSection.js'
 import { RulesSection } from './RulesSection.js'
@@ -26,6 +27,23 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
   const [note, setNote] = useState<string | null>(null)
   const [showLog, setShowLog] = useState(false)
   const [editingPrompts, setEditingPrompts] = useState(false)
+  const [theme, setTheme] = useState<Theme>('system')
+  const [textSize, setTextSize] = useState<TextSize>('default')
+
+  useEffect(() => {
+    void getThemePreference().then(setTheme)
+    void getTextSizePreference().then(setTextSize)
+  }, [])
+
+  const handleThemeChange = (newTheme: Theme): void => {
+    setTheme(newTheme)
+    void setThemePreference(newTheme).then(() => applyTheme())
+  }
+
+  const handleTextSizeChange = (newSize: TextSize): void => {
+    setTextSize(newSize)
+    void setTextSizePreference(newSize).then(() => applyTextSize())
+  }
 
   const scopes = conn.device?.scopes ?? conn.pairing?.scopes ?? []
 
@@ -183,6 +201,46 @@ export function SettingsScreen({ onBack }: { onBack: () => void }): ReactNode {
             </span>
             <span className="text-ink-400">›</span>
           </button>
+        </section>
+
+        <section className="space-y-2">
+          <h2 className="px-1 text-[13px] font-semibold uppercase tracking-wider text-ink-400">Appearance</h2>
+          <Card className="space-y-3 text-[13.5px]">
+            <div>
+              <p className="mb-2 text-[14px] font-medium">Theme</p>
+              <div className="flex gap-2">
+                {(['dark', 'light', 'system'] as const).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => handleThemeChange(t)}
+                    className={cx(
+                      'flex-1 rounded px-3 py-2 text-[13px] font-medium transition-colors',
+                      theme === t ? 'bg-mint-500 text-ink-950' : 'bg-ink-700 text-ink-300 active:bg-ink-600',
+                    )}
+                  >
+                    {t.charAt(0).toUpperCase() + t.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="border-t border-ink-700 pt-3">
+              <p className="mb-2 text-[14px] font-medium">Text size</p>
+              <div className="flex gap-2">
+                {(['small', 'default', 'large', 'xl'] as const).map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => handleTextSizeChange(s)}
+                    className={cx(
+                      'flex-1 rounded px-2 py-2 text-[12px] font-medium transition-colors',
+                      textSize === s ? 'bg-mint-500 text-ink-950' : 'bg-ink-700 text-ink-300 active:bg-ink-600',
+                    )}
+                  >
+                    {s.slice(0, 1).toUpperCase()}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </Card>
         </section>
 
         <section className="space-y-2">
