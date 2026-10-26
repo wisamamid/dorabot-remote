@@ -48,6 +48,12 @@ describe('lockdown', () => {
     live.disconnect()
   })
 
+  it('cancels a pairing code that was shown before the lockdown', async () => {
+    const { uri } = h.bridge.newPairingPayload()
+    await h.post('/api/lockdown', { confirm: true })
+    await expect(pairWithHost({ payload: decodePairingPayload(uri), deviceName: 'Late', platform: 'ios', createSocket })).rejects.toThrow()
+  })
+
   it('a second lockdown is a no-op', async () => {
     const res = await h.post('/api/lockdown', { confirm: true })
     expect(res.body).toMatchObject({ revoked: 0, rejected: 0 })

@@ -430,6 +430,9 @@ export class Bridge implements ConnectionHost {
     const { revoked, rejected } = this.store.lockdown('lockdown')
     for (const d of revoked) this.auditLog.record({ deviceId: d.id, deviceName: d.name, action: 'revoke', summary: 'lockdown: all devices revoked', transport })
     for (const d of rejected) this.auditLog.record({ deviceId: d.id, deviceName: d.name, action: 'reject', summary: 'lockdown', transport })
+    // A QR / code shown earlier must not let a new phone in after a lockdown.
+    this.store.cancelOpenPairings()
+    this.relayTickets.clear()
     this.auditLog.record({ action: 'lockdown', summary: `revoked ${revoked.length} device(s), removed ${rejected.length} pending`, transport })
     this.log(`LOCKDOWN: revoked ${revoked.length} device(s), removed ${rejected.length} pending pairing(s)`)
     for (const c of [...this.connections]) if (c.device) c.close('revoked')

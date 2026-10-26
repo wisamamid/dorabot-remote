@@ -355,6 +355,11 @@ export class Store {
     return JSON.parse(row.scopes) as Scope[]
   }
 
+  /** Cancel every pairing code that has not been used yet (lockdown). Returns how many. */
+  cancelOpenPairings(): number {
+    return this.db.prepare('DELETE FROM pairings WHERE used_at IS NULL').run().changes as number
+  }
+
   purgeExpiredPairings(): void {
     this.db.prepare('DELETE FROM pairings WHERE expires_at < ?').run(Date.now() - 60 * 60 * 1000)
   }
