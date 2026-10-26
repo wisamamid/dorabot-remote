@@ -110,24 +110,38 @@ describe('remote.rules.* and auto-approve', () => {
     rmSync(home, { recursive: true, force: true })
   })
 
+  /** The two-step add: challenge, then echo the nonce. */
+  async function addRule<T = unknown>(c: RemoteClient, params: Record<string, unknown>): Promise<T> {
+    const { nonce } = await c.rpc<{ nonce: string }>('remote.rules.challenge')
+    return c.rpc<T>('remote.rules.add', { ...params, freshAuth: nonce })
+  }
+
   it('needs the approvals scope and a fresh Face ID flag to add', async () => {
     const a = await connect()
     await expect(a.c.rpc('remote.rules.add', { kind: 'tool', toolName: 'WebFetch' })).rejects.toThrow(/Face ID/)
     await expect(a.c.rpc('remote.rules.add', { kind: 'tool', toolName: 'WebFetch', freshAuth: 'true' })).rejects.toThrow(/Face ID/)
     const limited = await connect(['chat'])
     await expect(limited.c.rpc('remote.rules.list')).rejects.toThrow()
-    await expect(limited.c.rpc('remote.rules.add', { kind: 'tool', toolName: 'WebFetch', freshAuth: true })).rejects.toThrow()
+    await expect(limited.c.rpc('remote.rules.add', { kind: 'tool', toolName: 'WebFetch', freshAuth: 'x' })).rejects.toThrow()
     expect(await a.c.rpc('remote.rules.list')).toEqual([])
+    // Nonce rules: unknown, reused and other-connection nonces are refused.
+    const { nonce } = await a.c.rpc<{ nonce: string }>('remote.rules.challenge')
+    const other = await connect()
+    await expect(other.c.rpc('remote.rules.add', { kind: 'tool', toolName: 'WebFetch', freshAuth: nonce })).rejects.toThrow(/Face ID/)
+    await a.c.rpc('remote.rules.add', { kind: 'tool', toolName: 'WebFetch', freshAuth: nonce })
+    await expect(a.c.rpc('remote.rules.add', { kind: 'tool', toolName: 'Read', freshAuth: nonce })).rejects.toThrow(/Face ID/)
+    await a.c.rpc('remote.rules.remove', { id: (await a.c.rpc<Array<{ id: string }>>('remote.rules.list'))[0]!.id })
+    await expect(limited.c.rpc('remote.rules.challenge')).rejects.toThrow()
   })
 
   it('adds, lists, broadcasts and removes; audits both', async () => {
     const a = await connect()
     const b = await connect()
-    const res = await a.c.rpc<{ rule: { id: string }; rules: unknown[] }>('remote.rules.add', { kind: 'exact', toolName: 'Bash', command: 'npm test', freshAuth: true })
+    const res = await addRule<{ rule: { id: string }; rules: unknown[] }>(a.c, { kind: 'exact', toolName: 'Bash', command: 'npm test' })
     expect(res.rules).toHaveLength(1)
     await wait(150)
     expect(b.ev.find((e) => e.event === 'remote.rules_changed')?.data.rules).toHaveLength(1)
-    await expect(a.c.rpc('remote.rules.add', { kind: 'exact', toolName: 'Bash', command: 'rm -rf /', freshAuth: true })).rejects.toThrow(/risky/)
+    await expect(addRule(a.c, { kind: 'exact', toolName: 'Bash', command: 'rm -rf /' })).rejects.toThrow(/risky/)
     const removed = await b.c.rpc<{ removed: boolean; rules: unknown[] }>('remote.rules.remove', { id: res.rule.id })
     expect(removed).toMatchObject({ removed: true, rules: [] })
     expect((await b.c.rpc<{ removed: boolean }>('remote.rules.remove', { id: res.rule.id })).removed).toBe(false)
@@ -138,7 +152,7 @@ describe('remote.rules.* and auto-approve', () => {
 
   it('auto-approves a matching request with only {requestId}, audits it and keeps it off the phones', async () => {
     const a = await connect()
-    await a.c.rpc('remote.rules.add', { kind: 'exact', toolName: 'Bash', command: 'npm test', freshAuth: true })
+    await addRule(a.c, { kind: 'exact', toolName: 'Bash', command: 'npm test' })
     gateway.calls.length = 0
     a.ev.length = 0
     gateway.push('agent.tool_approval', { requestId: 'auto-1', toolName: 'Bash', input: { command: 'npm test' }, sessionKey: 'desktop:dm:abc', timestamp: 1 })

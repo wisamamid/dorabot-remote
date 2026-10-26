@@ -56,6 +56,7 @@ const ALLOWED = [
   'remote.pins.list',
   'remote.pins.set',
   'remote.rules.list',
+  'remote.rules.challenge',
   'remote.rules.add',
   'remote.rules.remove',
   'chat.send',
@@ -343,8 +344,10 @@ export function createDemoClient(handlers: DemoHandlers, now: () => number = Dat
       }
       case 'remote.rules.list':
         return rules
+      case 'remote.rules.challenge':
+        return { nonce: 'demo-nonce', ttlMs: 60_000 }
       case 'remote.rules.add': {
-        if (params.freshAuth !== true) throw new Error('adding an always-allow rule needs a fresh Face ID confirmation')
+        if (params.freshAuth !== 'demo-nonce') throw new Error('adding an always-allow rule needs a fresh Face ID confirmation')
         const kind = params.kind === 'exact' ? 'exact' : 'tool'
         const command = kind === 'exact' ? String(params.command ?? '') : null
         const toolName = String(params.toolName ?? '')

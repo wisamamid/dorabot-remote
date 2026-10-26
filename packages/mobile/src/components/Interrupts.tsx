@@ -91,12 +91,13 @@ export function ApprovalCard({
     setRuleBusy(true)
     setRuleError(null)
     try {
+      const { nonce } = await conn.rpc<{ nonce: string }>('remote.rules.challenge')
       const refused = await requireFreshAuth('Always allow this on your Mac')
       if (refused) {
         setRuleError(refused)
         return
       }
-      await conn.rpc('remote.rules.add', ruleParams(offer.spec))
+      await conn.rpc('remote.rules.add', ruleParams(offer.spec, nonce))
       await haptic('success')
       setRuleSheet(false)
       await onApprove()

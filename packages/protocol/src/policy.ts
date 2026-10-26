@@ -82,6 +82,7 @@ const RULES: Record<Scope, Rule[]> = {
     'remote.setPushPrefs',
     'remote.pushPrefs',
     // Bridge-managed "always allow" rules. Adding one also needs a fresh Face ID flag from the phone.
+    'remote.rules.challenge',
     'remote.rules.add',
     'remote.rules.list',
     'remote.rules.remove',
@@ -224,13 +225,14 @@ export const BRIDGE_METHODS = new Set([
   'remote.pins.list',
   'remote.pins.set',
   'remote.roots',
+  'remote.rules.challenge',
   'remote.rules.add',
   'remote.rules.list',
   'remote.rules.remove',
 ])
 
 /** Bridge methods that also require a scope (they are not open to every device). */
-const BRIDGE_SCOPE_GATED = new Set(['remote.events', 'remote.registerPush', 'remote.unregisterPush', 'remote.setPushPrefs', 'remote.pushPrefs', 'remote.pins.list', 'remote.pins.set', 'remote.roots', 'remote.rules.add', 'remote.rules.list', 'remote.rules.remove'])
+const BRIDGE_SCOPE_GATED = new Set(['remote.events', 'remote.registerPush', 'remote.unregisterPush', 'remote.setPushPrefs', 'remote.pushPrefs', 'remote.pins.list', 'remote.pins.set', 'remote.roots', 'remote.rules.challenge', 'remote.rules.add', 'remote.rules.list', 'remote.rules.remove'])
 
 /** True when `scope` is one of the known scope names (guards remote.requestScope). */
 export function isValidScope(scope: unknown): scope is Scope {

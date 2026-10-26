@@ -6,12 +6,12 @@ describe('alwaysAllowOffer', () => {
     const o = alwaysAllowOffer('Bash', { command: 'npm test' })!
     expect(o.label).toBe('Always allow this exact command')
     expect(o.spec).toEqual({ kind: 'exact', toolName: 'Bash', command: 'npm test' })
-    expect(ruleParams(o.spec)).toEqual({ kind: 'exact', toolName: 'Bash', command: 'npm test', freshAuth: true })
+    expect(ruleParams(o.spec, 'n1')).toEqual({ kind: 'exact', toolName: 'Bash', command: 'npm test', freshAuth: 'n1' })
   })
   it('offers the tool for ordinary tools', () => {
     const o = alwaysAllowOffer('WebFetch', { url: 'https://example.com' })!
     expect(o.label).toBe('Always allow WebFetch')
-    expect(ruleParams(o.spec)).toEqual({ kind: 'tool', toolName: 'WebFetch', freshAuth: true })
+    expect(ruleParams(o.spec, 'n1')).toEqual({ kind: 'tool', toolName: 'WebFetch', freshAuth: 'n1' })
   })
   it('offers nothing for risky inputs or free-form command tools', () => {
     expect(alwaysAllowOffer('Bash', { command: 'git push --force' })).toBeNull()

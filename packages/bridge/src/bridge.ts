@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http'
 import { execFile } from 'node:child_process'
 import type { Socket } from 'node:net'
@@ -147,6 +147,9 @@ export interface BridgeOptions {
   /** Where the host identity, signing key and control secret live (login Keychain by default on macOS). */
   secretIO?: SecretIO
 }
+
+/** How long a rule-add nonce stays valid after it is issued. */
+const RULE_CHALLENGE_MS = 60_000
 
 export class Bridge implements ConnectionHost {
   sodium!: Sodium
@@ -867,6 +870,7 @@ export class Bridge implements ConnectionHost {
 
   onClosed(conn: DeviceConnection): void {
     this.connections.delete(conn)
+    this.ruleChallenges.delete(conn)
     // Leaving a device's shells alive after it drops would let the next connection
     // inherit them. Kill them instead; the gateway's 60s orphan grace does not
     // apply to us because we never reclaim by id.
@@ -999,10 +1003,19 @@ export class Bridge implements ConnectionHost {
         return this.store.listRules()
       }
 
+      case 'remote.rules.challenge': {
+        this.requireScope(conn, 'approvals')
+        const nonce = randomBytes(16).toString('base64url')
+        this.ruleChallenges.set(conn, { nonce, at: Date.now() })
+        return { nonce, ttlMs: RULE_CHALLENGE_MS }
+      }
+
       case 'remote.rules.add': {
         this.requireScope(conn, 'approvals')
-        // The phone sets this only after a Face ID / passcode prompt for this very action.
-        if (params.freshAuth !== true) throw new Error('adding an always-allow rule needs a fresh Face ID confirmation')
+        // Two steps on the same connection: remote.rules.challenge hands out a one-time nonce, the phone shows
+        // Face ID, then echoes the nonce here within RULE_CHALLENGE_MS. The bridge cannot see the biometric
+        // itself; this stops a blind or replayed `freshAuth: true` and ties the add to a live, recent prompt.
+        this.consumeRuleChallenge(conn, params.freshAuth)
         const spec = parseNewRule(params)
         if (this.store.listRules().length >= MAX_RULES) throw new Error(`you can keep at most ${MAX_RULES} rules`)
         const rule = this.store.addRule({ ...spec, createdBy: conn.device?.name ?? null })
@@ -1032,6 +1045,18 @@ export class Bridge implements ConnectionHost {
       default:
         throw new Error(`unknown bridge method: ${method}`)
     }
+  }
+
+  private readonly ruleChallenges = new Map<DeviceConnection, { nonce: string; at: number }>()
+
+  private consumeRuleChallenge(conn: DeviceConnection, presented: unknown): void {
+    const ch = this.ruleChallenges.get(conn)
+    this.ruleChallenges.delete(conn) // single use, even when it fails
+    const need = 'adding an always-allow rule needs a fresh Face ID confirmation'
+    if (!ch || typeof presented !== 'string' || Date.now() - ch.at > RULE_CHALLENGE_MS) throw new Error(need)
+    const a = Buffer.from(ch.nonce)
+    const b = Buffer.from(presented)
+    if (a.length !== b.length || !timingSafeEqual(a, b)) throw new Error(need)
   }
 
   /** Shared by the phone, the control page and (via the DB) the CLI. */

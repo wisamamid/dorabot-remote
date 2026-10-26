@@ -34,12 +34,15 @@ export function alwaysAllowOffer(toolName: string, input: Record<string, unknown
   }
 }
 
-/** Params for remote.rules.add. `freshAuth` is set only after Face ID succeeded for this very action. */
-export function ruleParams(spec: AllowRuleSpec): Record<string, unknown> {
+/**
+ * Params for remote.rules.add. `nonce` comes from remote.rules.challenge on the same connection, fetched
+ * before the Face ID prompt; the bridge accepts it once, within a minute.
+ */
+export function ruleParams(spec: AllowRuleSpec, nonce: string): Record<string, unknown> {
   return {
     kind: spec.kind,
     toolName: spec.toolName,
     ...(spec.kind === 'exact' ? { command: spec.command } : {}),
-    freshAuth: true,
+    freshAuth: nonce,
   }
 }
