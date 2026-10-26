@@ -23,11 +23,28 @@ final class PushCrypto {
         String title;
         String body;
         String hostName;
+        String hostId;
         /** Key id of the key that opened it. */
         String kid;
     }
 
     private PushCrypto() {}
+
+    /**
+     * A key only vouches for its own Mac: the hostId inside must hash to the key id of the key that opened it
+     * (first 8 hex of sha256(hostId), as in the bridge). The pre-multi-Mac key (kid "") is tied to no Mac, so it never qualifies.
+     */
+    static boolean boundToKey(Content c) {
+        if (c == null || c.kid == null || c.kid.isEmpty() || c.hostId == null || c.hostId.isEmpty()) return false;
+        try {
+            byte[] d = java.security.MessageDigest.getInstance("SHA-256").digest(c.hostId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder();
+            for (int i = 0; i < 4; i++) hex.append(String.format("%02x", d[i] & 0xff));
+            return hex.toString().equals(c.kid);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            return false;
+        }
+    }
 
     static Content decrypt(String enc, List<PushKeyStore.Entry> keys) {
         if (enc == null || Build.VERSION.SDK_INT < 28) return null;
@@ -53,6 +70,7 @@ final class PushCrypto {
                 out.title = o.optString("title", "");
                 out.body = o.optString("body", "");
                 out.hostName = o.optString("hostName", "");
+                out.hostId = o.optString("hostId", "");
                 out.kid = e.kid;
                 return out;
             } catch (Exception ignored) {

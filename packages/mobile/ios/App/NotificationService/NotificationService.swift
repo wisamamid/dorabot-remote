@@ -22,8 +22,9 @@ class NotificationService: UNNotificationServiceExtension {
         if offeredCategory == "APPROVAL" { content.categoryIdentifier = "ACTIVITY" }
         if let enc = info["enc"] as? String {
             let keys = PushKeychain.candidates(kid: info["kid"] as? String)
-            if let text = Self.decrypt(enc, keys: keys) {
-                if offeredCategory == "APPROVAL", (text["kind"] as? String) == "approval" { content.categoryIdentifier = "APPROVAL" }
+            if let (text, openedBy) = Self.decrypt(enc, keys: keys) {
+                // Buttons only when the content is bound to the Mac its key belongs to (the app re-checks on tap).
+                if offeredCategory == "APPROVAL", (text["kind"] as? String) == "approval", Self.bound(text["hostId"] as? String, to: openedBy) { content.categoryIdentifier = "APPROVAL" }
                 if let title = text["title"] as? String, !title.isEmpty { content.title = title }
                 if let body = text["body"] as? String, !body.isEmpty { content.body = body }
                 // With more than one Mac paired, say which one this is from.
@@ -37,14 +38,22 @@ class NotificationService: UNNotificationServiceExtension {
         if let handler = contentHandler, let best = best { handler(best) }
     }
 
-    static func decrypt(_ enc: String, keys: [Data]) -> [String: Any]? {
+    /// The decrypted content and the kid of the key that opened it ("" for the pre-multi-Mac key).
+    static func decrypt(_ enc: String, keys: [PushKeychain.Entry]) -> ([String: Any], String)? {
         guard let combined = Data(base64Encoded: enc), let box = try? ChaChaPoly.SealedBox(combined: combined) else { return nil }
-        for keyData in keys where keyData.count == 32 {
-            if let plain = try? ChaChaPoly.open(box, using: SymmetricKey(data: keyData)),
+        for entry in keys where entry.key.count == 32 {
+            if let plain = try? ChaChaPoly.open(box, using: SymmetricKey(data: entry.key)),
                let obj = try? JSONSerialization.jsonObject(with: plain) as? [String: Any] {
-                return obj
+                return (obj, entry.kid)
             }
         }
         return nil
+    }
+
+    /// kid = first 8 hex of sha256(hostId). A key with no kid is tied to no Mac and never qualifies.
+    static func bound(_ hostId: String?, to kid: String) -> Bool {
+        guard let hostId = hostId, !hostId.isEmpty, !kid.isEmpty else { return false }
+        let hex = SHA256.hash(data: Data(hostId.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
+        return hex == kid
     }
 }

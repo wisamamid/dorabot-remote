@@ -96,7 +96,8 @@ public class DorabotMessagingService extends MessagingService {
             .setPriority(NotificationChannels.ACTIVITY.equals(channel) ? NotificationCompat.PRIORITY_DEFAULT : NotificationCompat.PRIORITY_HIGH)
             .setContentIntent(launch(c, id, "tap", content, enc, data.get("kid")));
         if (subText != null) b.setSubText(subText);
-        if (content != null && "approval".equals(content.kind)) {
+        // Buttons only for an approval whose content is bound to the Mac its key belongs to (JS re-checks on tap).
+        if (content != null && "approval".equals(content.kind) && PushCrypto.boundToKey(content)) {
             b.addAction(0, "Approve", launch(c, id, "APPROVE", content, enc, data.get("kid")));
             b.addAction(0, "Deny", launch(c, id, "DENY", content, enc, data.get("kid")));
         }
