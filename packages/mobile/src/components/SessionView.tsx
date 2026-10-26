@@ -52,12 +52,15 @@ export function SessionView({
   const [recording, setRecording] = useState(false)
   const [voiceSupported, setVoiceSupported] = useState(false)
   const [voiceText, setVoiceText] = useState('')
+  const [runSummary, setRunSummary] = useState<{ duration: number; cost?: number; toolCount: number } | null>(null)
   const photoId = useRef(0)
   const photosRef = useRef(photos)
   photosRef.current = photos
   const fileInput = useRef<HTMLInputElement>(null)
   const recordingRef = useRef<RecordingHandle | null>(null)
   const earlierLoadedRef = useRef(0)
+  const runStartTimeRef = useRef<number | null>(null)
+  const previousStatusRef = useRef<string>('idle')
 
   useEffect(() => {
     void conn.openSession(sessionKey, session?.id)
@@ -72,6 +75,30 @@ export function SessionView({
   useEffect(() => watchKeyboard(setKeyboard), [])
   // Release the preview blobs when leaving the conversation.
   useEffect(() => () => photosRef.current.forEach((p) => URL.revokeObjectURL(p.url)), [])
+
+  // Track run start/end for run summary card
+  useEffect(() => {
+    const isRunning = state.status !== 'idle' && state.status !== 'thinking'
+    const wasRunning = previousStatusRef.current !== 'idle' && previousStatusRef.current !== 'thinking'
+
+    if (isRunning && !wasRunning) {
+      // Run started
+      runStartTimeRef.current = Date.now()
+      setRunSummary(null)
+    } else if (!isRunning && wasRunning) {
+      // Run ended
+      if (runStartTimeRef.current) {
+        const duration = Date.now() - runStartTimeRef.current
+        const toolCount = state.chatItems.filter((item) => (item as Record<string, unknown>).type === 'tool_use').length
+        const resultItem = state.chatItems.find((item) => (item as Record<string, unknown>).type === 'result') as Record<string, unknown> | undefined
+        const cost = resultItem?.cost as number | undefined
+        setRunSummary({ duration, cost, toolCount })
+        runStartTimeRef.current = null
+      }
+    }
+
+    previousStatusRef.current = state.status
+  }, [state.status, state.chatItems])
 
   function addPhotos(e: ChangeEvent<HTMLInputElement>): void {
     const picked = Array.from(e.target.files ?? []).filter((f) => f.type.startsWith('image/') || f.type === '')
@@ -351,7 +378,38 @@ export function SessionView({
               Nothing here yet. Send a message to start.
             </div>
           ) : (
-            <ChatItemList items={state.chatItems} />
+            <>
+              <ChatItemList items={state.chatItems} />
+              {runSummary && (
+                <div className="mt-4 rounded-lg border border-mint-500/30 bg-mint-dim p-3">
+                  <div className="flex items-center justify-between">
+                    <div className="space-y-1.5">
+                      <p className="text-[13px] font-semibold text-mint-glow">Run complete</p>
+                      <div className="flex gap-4 text-[12px] text-ink-400">
+                        <span>
+                          Duration:{' '}
+                          {runSummary.duration < 1000
+                            ? `${runSummary.duration}ms`
+                            : `${(runSummary.duration / 1000).toFixed(1)}s`}
+                        </span>
+                        {runSummary.cost !== undefined && <span>Cost: ${runSummary.cost.toFixed(4)}</span>}
+                        <span>Tools: {runSummary.toolCount}</span>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => {
+                        setRunSummary(null)
+                        const textarea = scrollRef.current?.closest('[data-composer]')?.querySelector('textarea')
+                        if (textarea) textarea.focus()
+                      }}
+                      className="shrink-0 rounded-lg bg-mint-600 px-3 py-1.5 text-[12px] font-medium text-ink-950 active:opacity-80"
+                    >
+                      Continue
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
           )}
           <StatusLine status={state.status} detail={state.statusDetail} />
         </PullToRefresh>
