@@ -63,7 +63,11 @@ export function ridOf(item: InboxItem): string | null {
   return item.approval?.requestId ?? item.question?.requestId ?? item.elicitation?.elicitationId ?? null
 }
 
-export function buildWatchSnapshot(items: InboxItem[], hostName: string, sessions: StoredSession[], now: number): WatchSnapshot {
+/**
+ * `locked`: the iPhone app lock is on and currently locked. The wrist then shows tool names only, no command,
+ * path or question text, so nothing sensitive is readable on a watch while the phone itself is locked.
+ */
+export function buildWatchSnapshot(items: InboxItem[], hostName: string, sessions: StoredSession[], now: number, locked = false): WatchSnapshot {
   const out: WatchItem[] = []
   // Newest first, as the Inbox is; expired questions are history, not something to answer.
   for (const item of actionable({ items })) {
@@ -77,8 +81,8 @@ export function buildWatchSnapshot(items: InboxItem[], hostName: string, session
         kind: 'approval',
         hostName: clip(hostName, 40),
         sessionName,
-        title: clip(a.title || a.toolName, TITLE_MAX),
-        summary: clip(summarizeInput(a.input), SUMMARY_MAX),
+        title: clip(locked ? a.toolName : a.title || a.toolName, TITLE_MAX),
+        summary: locked ? '' : clip(summarizeInput(a.input), SUMMARY_MAX),
         risky: isRiskyApproval(item),
       })
     } else {
@@ -86,7 +90,7 @@ export function buildWatchSnapshot(items: InboxItem[], hostName: string, session
         item.question?.questions?.[0]?.question ??
         item.elicitation?.message ??
         'A question is waiting'
-      out.push({ rid, kind: 'question', hostName: clip(hostName, 40), sessionName, title: 'Question', summary: clip(text, SUMMARY_MAX), risky: false })
+      out.push({ rid, kind: 'question', hostName: clip(hostName, 40), sessionName, title: 'Question', summary: locked ? '' : clip(text, SUMMARY_MAX), risky: false })
     }
     if (out.length >= WATCH_MAX_ITEMS) break
   }
@@ -108,12 +112,15 @@ export interface WatchReply {
 export interface WatchDeps {
   /** Linked to the Mac and the gateway is up: only then can anything be done. */
   connected: boolean
+  /** The iPhone app lock is on and locked: the watch may not execute anything. */
+  locked?: boolean
   items: InboxItem[]
   approve: (item: InboxItem) => Promise<void>
   deny: (item: InboxItem) => Promise<void>
 }
 
 export const NOT_CONNECTED = 'Phone not connected'
+export const UNLOCK_PHONE = 'Unlock DoraBot on iPhone'
 export const OPEN_ON_PHONE = 'Open on iPhone to approve'
 export const DENY_REASON = 'Denied from Apple Watch'
 
@@ -122,6 +129,7 @@ export async function handleWatchRequest(req: WatchRequest, deps: WatchDeps): Pr
   if (!deps.connected) return { ok: false, message: NOT_CONNECTED }
   if (req.action === 'refresh') return { ok: true, message: 'Updated' }
   if (req.action !== 'approve' && req.action !== 'deny') return { ok: false, message: 'Unsupported' }
+  if (deps.locked) return { ok: false, message: UNLOCK_PHONE }
   if (typeof req.rid !== 'string' || !req.rid) return { ok: false, message: 'Unsupported' }
 
   const item = deps.items.find((i) => ridOf(i) === req.rid)

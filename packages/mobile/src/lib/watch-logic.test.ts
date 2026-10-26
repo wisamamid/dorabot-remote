@@ -5,6 +5,7 @@ import {
   handleWatchRequest,
   NOT_CONNECTED,
   OPEN_ON_PHONE,
+  UNLOCK_PHONE,
   WATCH_MAX_ITEMS,
   type WatchDeps,
 } from './watch-logic.js'
@@ -28,6 +29,24 @@ const question = (rid: string, timedOut = false): InboxItem => ({
 
 const routine = approval('r1', 'Read', { file_path: '/tmp/proj/a.txt' })
 const risky = approval('r2', 'Bash', { command: 'rm -rf /' })
+
+describe('app lock', () => {
+  it('omits command text from the snapshot while locked', () => {
+    const snap = buildWatchSnapshot([routine, risky, question('q1')], 'm', [], 0, true)
+    expect(snap.items.map((i) => [i.title, i.summary])).toEqual([['Read', ''], ['Bash', ''], ['Question', '']])
+    expect(JSON.stringify(snap)).not.toContain('rm -rf')
+    expect(JSON.stringify(snap)).not.toContain('a.txt')
+  })
+
+  it('refuses approve and deny while locked, but still answers a refresh', async () => {
+    const d = { connected: true, locked: true, items: [routine], approve: vi.fn(async () => {}), deny: vi.fn(async () => {}) }
+    expect(await handleWatchRequest({ action: 'approve', rid: 'r1' }, d)).toEqual({ ok: false, message: UNLOCK_PHONE })
+    expect(await handleWatchRequest({ action: 'deny', rid: 'r1' }, d)).toEqual({ ok: false, message: UNLOCK_PHONE })
+    expect(d.approve).not.toHaveBeenCalled()
+    expect(d.deny).not.toHaveBeenCalled()
+    expect((await handleWatchRequest({ action: 'refresh' }, d)).ok).toBe(true)
+  })
+})
 
 describe('buildWatchSnapshot', () => {
   it('shapes approvals and flags risky ones', () => {

@@ -234,20 +234,21 @@ function Shell(): ReactNode {
 
   // Apple Watch: the same list, shaped for the wrist, and the watch's approve / deny requests. A
   // request is checked against the live inbox and connection at the moment it arrives.
-  const watchRef = useRef({ conn, inbox })
-  watchRef.current = { conn, inbox }
+  const watchRef = useRef({ conn, inbox, locked: lock.locked })
+  watchRef.current = { conn, inbox, locked: lock.locked }
   useEffect(() => {
     if (!live) {
       void clearWatchSnapshot()
       return
     }
-    void publishWatchSnapshot(buildWatchSnapshot(widgetItemsFor(inbox.items, conn.state), widgetHost, conn.sessions, Date.now()))
-  }, [live, inbox.items, conn.state, conn.sessions, widgetHost])
+    void publishWatchSnapshot(buildWatchSnapshot(widgetItemsFor(inbox.items, conn.state), widgetHost, conn.sessions, Date.now(), lock.locked))
+  }, [live, inbox.items, conn.state, conn.sessions, widgetHost, lock.locked])
   useEffect(
     () =>
       onWatchRequest((req) => {
-        const { conn: c, inbox: ib } = watchRef.current
+        const { conn: c, inbox: ib, locked } = watchRef.current
         return handleWatchRequest(req, {
+          locked,
           connected: c.state === 'ready' && c.gatewayConnected && !c.demo,
           items: ib.items,
           approve: (i) => ib.approve(i),
