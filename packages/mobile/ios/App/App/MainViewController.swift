@@ -6,5 +6,6 @@ class MainViewController: CAPBridgeViewController {
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(PushKeyStorePlugin())
         bridge?.registerPluginInstance(SpeechRecognitionPlugin())
+        bridge?.registerPluginInstance(AppGroupPlugin())
     }
 }
