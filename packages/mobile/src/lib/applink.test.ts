@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ASK_TTL_MS, AppLinkQueue, MAX_PROMPT, nextAskStep, parseAppLink, resolveHost, type AskStepInput } from './applink.js'
+import { ASK_TTL_MS, AppLinkQueue, MAX_PROMPT, nextAskStep, parseAppLink, parseShareLink, resolveHost, type AskStepInput } from './applink.js'
 
 describe('parseAppLink', () => {
   it('parses an ask with prompt, host and nonce (percent-encoding, plus, ampersand)', () => {
@@ -143,5 +143,15 @@ describe('nextAskStep', () => {
   })
   it('falls back to the first Mac when none is active yet', () => {
     expect(step({ activeHostId: null, confirmed: true })).toEqual({ do: 'switch', hostId: 'a' })
+  })
+})
+
+describe('parseShareLink', () => {
+  it('accepts a share id and nothing else', () => {
+    expect(parseShareLink('dorabot-remote://share?id=3F2A-11')).toBe('3F2A-11')
+    expect(parseShareLink('dorabot-remote://share?id=../x')).toBeNull()
+    expect(parseShareLink('dorabot-remote://share')).toBeNull()
+    expect(parseShareLink('dorabot-remote://ask?id=abc')).toBeNull()
+    expect(parseAppLink('dorabot-remote://share?id=abc')).toBeNull()
   })
 })

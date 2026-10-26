@@ -8,6 +8,7 @@ import {
   makeBrowserEncoder,
 } from '../lib/attachments.js'
 import { haptic, watchKeyboard } from '../lib/platform.js'
+import { endRunActivity, startRunActivity, updateRunActivity } from '../lib/appgroup.js'
 import { recordVoice, isVoiceSupported, type RecordingHandle } from '../lib/voice-transcription.js'
 import { PullToRefresh } from './PullToRefresh.js'
 import { ChatItemList, StatusLine } from './ChatItems.js'
@@ -118,6 +119,33 @@ export function SessionView({
   }
 
   const busy = state.status !== 'idle'
+
+  // Live Activity while a run is active in the open session: started when it becomes busy,
+  // updated as the status changes, ended when it goes idle or the session is closed.
+  const runLabel = state.status === 'tool_use' ? (state.statusDetail ? `Running ${state.statusDetail}` : 'Running a tool') : state.status === 'responding' ? 'Writing' : 'Thinking'
+  const activityOn = useRef(false)
+  const activityName = session?.name || session?.senderName || prettyKey(sessionKey)
+  useEffect(() => {
+    if (busy && !activityOn.current) {
+      activityOn.current = true
+      void startRunActivity(activityName, runLabel, Date.now())
+    } else if (busy) {
+      void updateRunActivity(runLabel)
+    } else if (activityOn.current) {
+      activityOn.current = false
+      void endRunActivity()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, runLabel])
+  useEffect(
+    () => () => {
+      if (activityOn.current) {
+        activityOn.current = false
+        void endRunActivity()
+      }
+    },
+    [],
+  )
   const blocked = state.pendingApproval ?? state.pendingQuestion ?? state.pendingElicitation
 
   async function send(): Promise<void> {

@@ -20,10 +20,12 @@ import { haptic, isNative, onAppUrl, setStatusBarDark } from './lib/platform.js'
 import { AppLockProvider, useAppLock } from './lib/app-lock.js'
 import { clearDeliveredNotifications, onPushNavigate, pruneDeliveredNotifications } from './lib/push.js'
 import { hostIdForKid } from './lib/push-keys.js'
-import { AppLinkQueue, ASK_TTL_MS, nextAskStep, parseAppLink } from './lib/applink.js'
+import { AppLinkQueue, ASK_TTL_MS, nextAskStep, parseAppLink, parseShareLink } from './lib/applink.js'
 import { displayName } from './lib/hosts.js'
 import { routePushAction, runDecision, type PushRoute } from './lib/push-actions.js'
 import { createPortal } from 'react-dom'
+import { takeShare, publishWidgetSnapshot } from './lib/appgroup.js'
+import { DEFAULT_IMAGE_PROMPT, requestBytes, REQUEST_BUDGET_BYTES } from './lib/attachments.js'
 import { AskConfirmSheet } from './components/AskConfirmSheet.js'
 import { PushProvider } from './lib/push-context.js'
 import { SavedPromptsProvider } from './lib/saved-prompts-context.js'
@@ -158,7 +160,7 @@ function Shell(): ReactNode {
   const askQueue = useRef(new AppLinkQueue())
   const [askTick, setAskTick] = useState(0)
   const askConfirmed = useRef(false)
-  const [askConfirm, setAskConfirm] = useState<{ prompt: string; hostName: string } | null>(null)
+  const [askConfirm, setAskConfirm] = useState<{ prompt: string; hostName: string; images?: Array<{ data: string; mediaType: string }> } | null>(null)
   const askBusy = useRef(false)
   const lockRef = useRef(lock)
   lockRef.current = lock
@@ -166,11 +168,54 @@ function Shell(): ReactNode {
   useEffect(
     () =>
       onAppUrl((url) => {
+        const shareId = parseShareLink(url)
+        if (shareId) {
+          void pickUpShare(shareId)
+          return
+        }
         const link = parseAppLink(url)
         if (link && askQueue.current.push(link, Date.now())) setAskTick((t) => t + 1)
       }, 'ask'),
     [],
   )
+
+  // Something shared from another app (Share Extension): it waits in the App Group until the app
+  // opens, by URL or simply by coming to the foreground. It goes through the same confirmation
+  // sheet as a Siri ask; nothing is sent until Send is tapped.
+  function pickUpShare(id?: string): Promise<void> {
+    return takeShare(id).then((shared) => {
+      if (!shared) return
+      const link = { type: 'ask' as const, prompt: shared.text, nonce: shared.id, ...(shared.images.length ? { images: shared.images } : {}) }
+      if (askQueue.current.push(link, Date.now())) setAskTick((t) => t + 1)
+    })
+  }
+
+  useEffect(() => {
+    if (!isNative) return
+    void pickUpShare()
+    let remove: (() => void) | null = null
+    let gone = false
+    void import('@capacitor/app').then(async ({ App }) => {
+      const sub = await App.addListener('appStateChange', ({ isActive }) => {
+        if (isActive) void pickUpShare()
+      })
+      if (gone) void sub.remove()
+      else remove = () => void sub.remove()
+    })
+    return () => {
+      gone = true
+      remove?.()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Home-screen widget: how many approvals / questions wait, and on which Mac.
+  const widgetHost = conn.demo ? 'Demo Mac' : (conn.pairings.find((p) => p.hostId === conn.activeHostId)?.hostName ?? '')
+  const widgetPending = inbox.items.filter((i) => !i.timedOut).length
+  useEffect(() => {
+    if (!paired) return
+    void publishWidgetSnapshot(widgetHost, widgetPending)
+  }, [paired, widgetHost, widgetPending])
 
   useEffect(() => {
     const q = askQueue.current
@@ -220,14 +265,21 @@ function Shell(): ReactNode {
     }
     if (step.do === 'confirm') {
       // Show the full prompt; nothing happens until the user taps Send.
-      setAskConfirm((cur) => (cur && cur.prompt === link.prompt && cur.hostName === step.hostName ? cur : { prompt: link.prompt, hostName: step.hostName }))
+      setAskConfirm((cur) => (cur && cur.prompt === link.prompt && cur.hostName === step.hostName ? cur : { prompt: link.prompt, hostName: step.hostName, ...(link.images?.length ? { images: link.images } : {}) }))
       return
     }
     askBusy.current = true
     // send: start a NEW session on that Mac with the prompt, then show it.
     const c = connRef.current
     const name = hosts.find((h) => h.hostId === step.hostId)
-    void (c.demo ? c.rpc<{ sessionKey: string }>('chat.send', { prompt: link.prompt }) : c.rpcOn<{ sessionKey: string }>(step.hostId, 'chat.send', { prompt: link.prompt }))
+    const params: Record<string, unknown> = link.images?.length
+      ? { prompt: link.prompt.trim() || DEFAULT_IMAGE_PROMPT, images: link.images.map((i) => ({ data: i.data, mediaType: i.mediaType })), source: 'remote/mobile' }
+      : { prompt: link.prompt }
+    if (requestBytes(params) > REQUEST_BUDGET_BYTES) {
+      askBusy.current = false
+      return finish({ text: 'That share is too large to send. Try fewer or smaller photos.', ok: false })
+    }
+    void (c.demo ? c.rpc<{ sessionKey: string }>('chat.send', params) : c.rpcOn<{ sessionKey: string }>(step.hostId, 'chat.send', params))
       .then((res) => {
         askBusy.current = false
         c.cancelAddMac()
@@ -380,6 +432,7 @@ function Shell(): ReactNode {
         <AskConfirmSheet
           prompt={askConfirm.prompt}
           hostName={askConfirm.hostName}
+          images={askConfirm.images}
           onSend={() => {
             askConfirmed.current = true
             setAskConfirm(null)

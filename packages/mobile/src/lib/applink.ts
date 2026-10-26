@@ -4,6 +4,7 @@
  * Parsing, a small expiring queue, and the pure "what next" decision for a queued
  * ask. The React layer (App.tsx) executes the steps.
  */
+import type { ImageAttachment } from '@dorabot-remote/protocol'
 import { displayName, type HostPairing } from './hosts.js'
 
 export const MAX_PROMPT = 8000
@@ -12,11 +13,24 @@ export const MAX_HOST_NAME = 80
 export const ASK_TTL_MS = 2 * 60_000
 
 export type AppLink =
-  | { type: 'ask'; prompt: string; host?: string; nonce?: string }
+  /** `images` only ever comes from the Share Extension (never from a URL); `prompt` may then be empty. */
+  | { type: 'ask'; prompt: string; host?: string; nonce?: string; images?: ImageAttachment[] }
   | { type: 'inbox'; nonce?: string }
 
 // eslint-disable-next-line no-control-regex
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g
+
+/** `dorabot-remote://share?id=<uuid>` from the Share Extension: the id of the share waiting in the App Group, or null. */
+export function parseShareLink(url: string): string | null {
+  try {
+    const u = new URL(url)
+    if (u.protocol !== 'dorabot-remote:' || u.hostname.toLowerCase() !== 'share') return null
+    const id = u.searchParams.get('id') ?? ''
+    return /^[A-Za-z0-9-]{1,64}$/.test(id) ? id : null
+  } catch {
+    return null
+  }
+}
 
 /** Null for anything that is not a well-formed ask / inbox link (pair links and junk included). */
 export function parseAppLink(url: string): AppLink | null {
