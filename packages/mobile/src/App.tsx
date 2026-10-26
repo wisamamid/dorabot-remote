@@ -316,6 +316,76 @@ function Shell(): ReactNode {
     if (split && open) setTab('sessions')
   }, [split, open])
 
+  // Keyboard shortcuts for iPad
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent): void => {
+      const target = e.target as HTMLElement
+      const isTextInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA'
+
+      // Cmd+Enter: send (even in textarea)
+      if (e.metaKey && e.key === 'Enter' && isTextInput) {
+        e.preventDefault()
+        const composer = target.closest('[data-composer]')
+        if (composer) {
+          const sendBtn = composer.querySelector('button:last-child') as HTMLButtonElement
+          if (sendBtn && !sendBtn.disabled) sendBtn.click()
+        }
+        return
+      }
+
+      // Cmd+K: focus search field (even in input)
+      if (e.metaKey && e.key === 'k') {
+        e.preventDefault()
+        const searchField = document.querySelector('input[placeholder*="Search"]') as HTMLInputElement
+        if (searchField) searchField.focus()
+        return
+      }
+
+      // Don't process other shortcuts if typing
+      if (isTextInput) return
+
+      // Esc to go back or close
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        if (open) setOpen(null)
+        return
+      }
+
+      // Other Cmd shortcuts
+      if (!e.metaKey) return
+      e.preventDefault()
+
+      // Cmd+N: new session
+      if (e.key === 'n') {
+        if (tab === 'sessions') {
+          const btns = document.querySelectorAll('button')
+          for (const btn of btns) {
+            if (btn.textContent?.includes('New session') && !btn.disabled) {
+              btn.click()
+              return
+            }
+          }
+        }
+        return
+      }
+
+      // Cmd+1..5: switch tabs
+      const tabMap: Record<string, TabName> = {
+        '1': 'sessions',
+        '2': 'inbox',
+        '3': 'work',
+        '4': 'code',
+        '5': 'more',
+      }
+      if (tabMap[e.key]) {
+        setTab(tabMap[e.key])
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [tab, open])
+
   if (!conn.ready) {
     return (
       <div className="flex h-full items-center justify-center">

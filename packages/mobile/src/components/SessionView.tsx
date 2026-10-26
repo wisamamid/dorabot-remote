@@ -403,6 +403,7 @@ export function SessionView({
 
         <div
           className="safe-bottom shrink-0 border-t border-ink-700 bg-ink-900 px-3 pt-2.5"
+          data-composer
         >
           {photos.length > 0 && (
             <div className="no-scrollbar mb-2 flex gap-2 overflow-x-auto pt-2">

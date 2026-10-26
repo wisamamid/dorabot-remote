@@ -31,6 +31,7 @@ export function MoreScreen(): ReactNode {
             onClick={() => setSub('terminal')}
             trailing={!conn.hasScope('terminal') ? <LockIcon className="size-5 text-ink-400" /> : undefined}
           />
+          <Row title="Keyboard shortcuts" subtitle="Cmd+Enter send, Cmd+K search, Cmd+N new, Cmd+1–5 tabs, Esc back" />
           <Row title="Settings" subtitle="Permissions, this device, disconnect" onClick={() => setSub('settings')} />
         </div>
       </Screen>
