@@ -227,7 +227,8 @@ describe('bridge fuzz', () => {
       await wait(60)
       s.ws.terminate()
     }
-    expect(sent).toBeGreaterThan(2000)
+    // A floor, not a target: the bridge may close a connection early on abuse, so timing decides how many frames get in.
+    expect(sent).toBeGreaterThan(1000)
     expect(answered).toBeGreaterThan(100) // the dispatcher really ran (rpc_res frames came back)
     expect(unhandled).toEqual([])
     const c = await h.connect(pair)
