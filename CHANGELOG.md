@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Unreleased
 
-## Build 13 (TBD) - 2026-10-26
+## Build 13 (202610261054) - 2026-10-26
 
 Big security and convenience release: richer approvals, a lost-phone lockdown, Apple Watch, widgets, a share extension and an Android app.
 
