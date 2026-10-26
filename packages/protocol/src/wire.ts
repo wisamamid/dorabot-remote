@@ -235,18 +235,56 @@ export function encodePairingPayload(p: PairingPayload): string {
   return `${PAIRING_URL_SCHEME}#${b64}`
 }
 
+const MAX_PAIRING_INPUT = 16 * 1024
+
+const isStr = (v: unknown, max: number): v is string => typeof v === 'string' && v.length <= max
+
+/**
+ * Parse a pairing link, fragment or raw payload. Throws an Error (never anything else) for malformed input,
+ * and only returns a payload whose fields have the right types and sane sizes.
+ */
 export function decodePairingPayload(input: string): PairingPayload {
+  if (typeof input !== 'string' || input.length > MAX_PAIRING_INPUT) throw new Error('Pairing code is too long')
   let b64 = input.trim()
   const hash = b64.indexOf('#')
   if (hash >= 0) b64 = b64.slice(hash + 1)
-  const json = new TextDecoder().decode(base64UrlDecode(b64))
-  const parsed = JSON.parse(json) as PairingPayload
-  if (parsed.v !== 1) throw new Error(`Unsupported pairing code version ${parsed.v}`)
-  const hasRelay = typeof parsed.r?.u === 'string' && typeof parsed.r?.i === 'string'
-  if (!parsed.k || !parsed.c || !Array.isArray(parsed.a) || (parsed.a.length === 0 && !hasRelay)) {
+  let raw: unknown
+  try {
+    raw = JSON.parse(new TextDecoder().decode(base64UrlDecode(b64)))
+  } catch {
+    throw new Error('Pairing code is not valid')
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Pairing code is not valid')
+  const parsed = raw as Record<string, unknown>
+  if (parsed.v !== 1) throw new Error(`Unsupported pairing code version ${String(parsed.v)}`)
+  const r = parsed.r
+  const relayOk =
+    r !== undefined &&
+    r !== null &&
+    typeof r === 'object' &&
+    isStr((r as RelayInfo).u, 512) &&
+    isStr((r as RelayInfo).i, 128) &&
+    ((r as RelayInfo).tok === undefined || isStr((r as RelayInfo).tok, 512)) &&
+    ((r as RelayInfo).tk === undefined || isStr((r as RelayInfo).tk, 512))
+  if (r !== undefined && !relayOk) throw new Error('Pairing code is not valid')
+  const a = parsed.a
+  if (
+    !isStr(parsed.h, 128) ||
+    !isStr(parsed.n, 200) ||
+    !isStr(parsed.k, 128) ||
+    !isStr(parsed.c, 128) ||
+    !parsed.k ||
+    !parsed.c ||
+    !Array.isArray(a) ||
+    a.length > 16 ||
+    !a.every((x) => isStr(x, 255)) ||
+    typeof parsed.e !== 'number' ||
+    !Number.isFinite(parsed.e) ||
+    (a.length === 0 && !relayOk)
+  ) {
     throw new Error('Pairing code is missing required fields')
   }
-  return parsed
+  return parsed as unknown as PairingPayload
 }
 
 const B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
