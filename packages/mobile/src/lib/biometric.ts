@@ -36,8 +36,22 @@ async function run(reason: string): Promise<AuthResult> {
   }
 }
 
-/** One prompt at a time; concurrent callers share it. */
-export function authenticate(reason: string, now: () => number = Date.now): Promise<AuthResult> {
+/**
+ * One prompt at a time; concurrent callers share it. `fresh` is for approvals of risky actions:
+ * it never reuses a recent success and never joins a prompt that was already showing for something else.
+ */
+export function authenticate(reason: string, opts: { now?: () => number; fresh?: boolean } = {}): Promise<AuthResult> {
+  const now = opts.now ?? Date.now
+  if (opts.fresh) {
+    const after = inflight ?? Promise.resolve('ok' as AuthResult)
+    return after
+      .catch(() => 'failed' as AuthResult)
+      .then(() => run(reason))
+      .then((r) => {
+        if (r === 'ok') lastOkAt = now()
+        return r
+      })
+  }
   if (recentlyAuthed(now(), lastOkAt)) return Promise.resolve('ok')
   inflight ??= run(reason)
     .then((r) => {

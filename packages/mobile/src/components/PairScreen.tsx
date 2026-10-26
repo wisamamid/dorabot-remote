@@ -1,7 +1,8 @@
 import { decodePairingPayload, pairWithHost, type PairingPayload } from '@dorabot-remote/protocol'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
-import { haptic, isNative, onPairingUrl, scanQr, suggestDeviceName } from '../lib/platform.js'
+import { haptic, isNative, onPairingUrl, scanQr, storage, suggestDeviceName } from '../lib/platform.js'
+import { WIPE_MESSAGE, WIPE_NOTICE_KEY } from '../lib/wipe.js'
 import { Button, Card } from './ui.js'
 
 const createSocket = (url: string) => new WebSocket(url) as never
@@ -22,12 +23,27 @@ export function PairScreen({ onCancel }: { onCancel?: () => void } = {}): ReactN
   const [deviceName, setDeviceName] = useState(suggestDeviceName())
   const nameRef = useRef(deviceName)
   nameRef.current = deviceName
+  // Set when the app erased itself after too many failed unlock attempts; shown once.
+  const [wiped, setWiped] = useState(false)
+  useEffect(() => {
+    void storage
+      .get(WIPE_NOTICE_KEY)
+      .then((v) => {
+        if (v !== '1') return
+        setWiped(true)
+        void storage.remove(WIPE_NOTICE_KEY).catch(() => {})
+      })
+      .catch(() => {})
+  }, [])
+
+  const [linked, setLinked] = useState<PairingPayload | null>(null)
 
   // Opened from the Camera app, or from a link anywhere else on the phone.
   useEffect(() => {
     return onPairingUrl((url) => {
+      // A link can come from any web page or app, so it only fills in a confirmation: nothing is paired until Pair is tapped.
       try {
-        void connectWith(decodePairingPayload(url))
+        setLinked(decodePairingPayload(url))
       } catch (err) {
         setError((err as Error).message)
       }
@@ -111,6 +127,41 @@ export function PairScreen({ onCancel }: { onCancel?: () => void } = {}): ReactN
           placeholder="iPhone"
         />
       </Card>
+
+      {wiped && (
+        <Card tone="danger">
+          <div role="alert" className="text-[14px] leading-relaxed text-rose-glow">
+            {WIPE_MESSAGE}
+          </div>
+        </Card>
+      )}
+
+      {linked && (
+        <Card className="space-y-3">
+          <div className="text-[15px] font-medium">Pair with {linked.n.replace(/[\u0000-\u001f]/g, ' ') || 'this Mac'}?</div>
+          <p className="text-[13px] leading-relaxed text-ink-400">
+            A link asked to pair this phone. Only continue if you started pairing on your own Mac
+            {linked.a[0] ? ` (${linked.a[0].replace(/[\u0000-\u001f]/g, ' ')})` : ''}.
+          </p>
+          <div className="flex gap-2">
+            <Button
+              variant="primary"
+              disabled={busy}
+              onClick={() => {
+                const p = linked
+                setLinked(null)
+                void connectWith(p)
+              }}
+              className="flex-1"
+            >
+              Pair
+            </Button>
+            <Button variant="ghost" disabled={busy} onClick={() => setLinked(null)} className="flex-1">
+              Cancel
+            </Button>
+          </div>
+        </Card>
+      )}
 
       {error && (
         <Card tone="danger">

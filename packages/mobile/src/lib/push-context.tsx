@@ -5,7 +5,7 @@
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useConnection } from './connection.js'
-import { APNS_ENV, enablePush, listenPush, pushSupported, registerIfGranted, type PushPermission } from './push.js'
+import { APNS_ENV, PUSH_PLATFORM, enablePush, listenPush, pushSupported, registerIfGranted, type PushPermission } from './push.js'
 import { generatePushKey } from './push-crypto.js'
 import { setPushKey, storedKeyIds } from './push-key.js'
 import { markSent, planPushRegistrations, readSent, registerWithHost, withTempClient } from './push-hosts.js'
@@ -96,8 +96,8 @@ export function PushProvider({ children }: { children: ReactNode }): ReactNode {
         try {
           const mk = (rpc: (m: string, params: unknown) => Promise<unknown>) => ({ rpc, newKey: generatePushKey, storeKey: setPushKey })
           const stamp = isActive
-            ? await registerWithHost(mk((m, params) => connRef.current.rpcOn(hostId, m, params)), p, token, APNS_ENV)
-            : await withTempClient(p, (rpc) => registerWithHost(mk(rpc), p, token, APNS_ENV))
+            ? await registerWithHost(mk((m, params) => connRef.current.rpcOn(hostId, m, params)), p, token, APNS_ENV, PUSH_PLATFORM)
+            : await withTempClient(p, (rpc) => registerWithHost(mk(rpc), p, token, APNS_ENV, PUSH_PLATFORM))
           await markSent(hostId, stamp)
           if (isActive && alive) setRegistered(true)
         } catch {

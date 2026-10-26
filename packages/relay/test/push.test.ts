@@ -238,15 +238,26 @@ describe('buildFcmMessage', () => {
     expect(m.apns.payload.aps).toEqual({ 'content-available': 1 })
   })
 
-  it('android: high priority and the right channel per kind', () => {
+  it('android: data-only message, high priority for questions/approvals, channel + generic text in data', () => {
     const q = msg({ platform: 'android', kind: 'question' })
-    expect(q.apns).toBeUndefined()
-    expect(q.android).toMatchObject({ priority: 'HIGH', collapse_key: 'req-1', notification: { channel_id: 'questions' } })
-    expect(msg({ platform: 'android', kind: 'approval' }).android.notification.channel_id).toBe('approvals')
+    expect(q.notification).toBeUndefined()
+    expect(q.android.notification).toBeUndefined()
+    expect(q.android).toEqual({ priority: 'HIGH', collapse_key: 'req-1' })
+    expect(q.data).toEqual({ t: 'question', rid: 'req-1', h: relayId, title: 'dorabot has a question', body: 'Tap to answer', channel: 'questions' })
+    expect(msg({ platform: 'android', kind: 'approval' }).data.channel).toBe('approvals')
     const r = msg({ platform: 'android', kind: 'result' })
-    expect(r.android).toMatchObject({ priority: 'NORMAL', notification: { channel_id: 'activity' } })
+    expect(r.android).toEqual({ priority: 'NORMAL', collapse_key: 'req-1' })
+    expect(r.data.channel).toBe('activity')
     const w = msg({ platform: 'android', kind: 'withdraw' })
     expect(w.android).toEqual({ priority: 'NORMAL', collapse_key: 'req-1' })
+    expect(w.data).toEqual({ t: 'withdraw', rid: 'req-1', h: relayId })
+  })
+
+  it('android: enc and kid ride along in data (opaque), only when present', () => {
+    const m = msg({ platform: 'android', kind: 'approval', enc: 'QUJD', kid: 'ab12cd34' })
+    expect(m.data).toMatchObject({ enc: 'QUJD', kid: 'ab12cd34', t: 'approval' })
+    expect(Object.values(m.data).every((v) => typeof v === 'string')).toBe(true)
+    expect(msg({ platform: 'android', kind: 'approval' }).data).not.toHaveProperty('enc')
   })
 })
 

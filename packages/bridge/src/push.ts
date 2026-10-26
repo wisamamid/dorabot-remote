@@ -8,7 +8,7 @@
  */
 import { createHash } from 'node:crypto'
 import { signBytes, type SigningKeyPair } from '@dorabot-remote/protocol'
-import { buildPushContent, encryptPushContent, parsePushKey, pushKeyId, type PushContent } from './push-content.js'
+import { buildPushContent, encryptPushContent, parsePushKey, pushKeyId, type PushContent, type RunStats } from './push-content.js'
 import type { DeviceRecord, Store } from './store.js'
 
 export type PushKind = 'question' | 'approval' | 'result' | 'error' | 'alert'
@@ -39,6 +39,8 @@ export function relayHttpBase(url: string): string {
 export class PushNotifier {
   private readonly seen = new Map<string, number>()
   private readonly lastApproval = new Map<string, number>()
+  /** Per-session run tallies for the end-of-run summary: the gateway does not send them. */
+  private readonly runs = new Map<string, RunStats>()
   private readonly fetchFn: typeof fetch
   private readonly now: () => number
 
@@ -53,6 +55,9 @@ export class PushNotifier {
     const d = (data ?? {}) as Record<string, unknown>
     const ts = typeof d.timestamp === 'number' ? d.timestamp : null
     if (ts !== null && this.now() - ts > MAX_EVENT_AGE_MS) return []
+
+    const sessionKey = typeof d.sessionKey === 'string' ? d.sessionKey : ''
+    if (sessionKey && name.startsWith('agent.') && name !== 'agent.result' && name !== 'agent.error') this.trackRun(sessionKey, name, d, ts)
 
     let kind: PushKind
     let rid: string
@@ -84,7 +89,26 @@ export class PushNotifier {
         return []
     }
     const r = rid.slice(0, 128)
-    return this.notify(kind, r, buildPushContent(name, data, r, this.opts.host))
+    let stats: RunStats | undefined
+    if (kind === 'result' || kind === 'error') {
+      stats = this.runs.get(sessionKey)
+      this.runs.delete(sessionKey)
+    }
+    return this.notify(kind, r, buildPushContent(name, data, r, this.opts.host, stats))
+  }
+
+  private trackRun(sessionKey: string, name: string, d: Record<string, unknown>, ts: number | null): void {
+    let run = this.runs.get(sessionKey)
+    if (!run) {
+      if (this.runs.size >= 200) this.runs.delete(this.runs.keys().next().value!)
+      run = { startTime: ts ?? this.now(), toolCalls: 0, fileCount: 0 }
+      this.runs.set(sessionKey, run)
+    }
+    if (name === 'agent.tool_use') {
+      run.toolCalls += 1
+      const tool = typeof d.tool === 'string' ? d.tool : ''
+      if (/^(Edit|Write|MultiEdit|NotebookEdit)$/.test(tool)) run.fileCount += 1
+    }
   }
 
   private notify(kind: PushKind, rid: string, content: PushContent | null): Promise<void>[] {

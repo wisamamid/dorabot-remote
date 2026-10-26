@@ -7,12 +7,12 @@
  *
  * Format: base64( nonce[12] || ciphertext || tag[16] ) using ChaCha20-Poly1305
  * (IETF, RFC 8439), a 32-byte key and a fresh random nonce per push. The
- * plaintext is UTF-8 JSON: {kind, rid, sessionKey?, title, body, hostId?, hostName?}.
+ * plaintext is UTF-8 JSON: {kind, rid, sessionKey?, title, body, hostId?, hostName?, duration?, cost?, toolCalls?, fileCount?, preview?}.
  */
 import { chacha20poly1305 } from '@noble/ciphers/chacha.js'
 import { createHash, randomBytes } from 'node:crypto'
 
-export type ContentKind = 'question' | 'approval'
+export type ContentKind = 'question' | 'approval' | 'result' | 'error'
 
 export interface PushContent {
   kind: ContentKind
@@ -23,6 +23,16 @@ export interface PushContent {
   /** Which Mac this is from, so a phone paired with several can switch to the right one on tap. */
   hostId?: string
   hostName?: string
+  /** For result/error: duration in seconds */
+  duration?: number
+  /** For result: cost in dollars */
+  cost?: number
+  /** For result/error: number of tool calls */
+  toolCalls?: number
+  /** For result: number of files touched (edited/written) */
+  fileCount?: number
+  /** For result/error: preview of final assistant message (first 120 chars) */
+  preview?: string
 }
 
 export const PUSH_KEY_BYTES = 32
@@ -104,7 +114,15 @@ function questionContent(d: Record<string, unknown>): { title: string; body: str
 }
 
 /** Build the readable content for a gateway event, or null if it is not one we describe. */
-export function buildPushContent(name: string, data: unknown, rid: string, host?: { id: string; name: string }): PushContent | null {
+export interface RunStats {
+  /** ms epoch of the first event seen for this run */
+  startTime?: number
+  toolCalls: number
+  /** edit/write tool calls (not distinct files: the gateway does not send paths) */
+  fileCount: number
+}
+
+export function buildPushContent(name: string, data: unknown, rid: string, host?: { id: string; name: string }, stats?: RunStats): PushContent | null {
   const d = (data ?? {}) as Record<string, unknown>
   const sessionKey = typeof d.sessionKey === 'string' && d.sessionKey ? d.sessionKey : undefined
   const base = {
@@ -126,9 +144,54 @@ export function buildPushContent(name: string, data: unknown, rid: string, host?
         body: truncate(summarizeToolInput(toolName, d.input as Record<string, unknown> | undefined), MAX_BODY),
       }
     }
+    case 'agent.result':
+    case 'agent.error': {
+      // Real gateway shapes: agent.result {result: string, usage: {totalCostUsd}, timestamp},
+      // agent.error {error: string, timestamp}. The gateway sends no start time or tool list,
+      // so the notifier tracks those per session and passes them in as `stats`.
+      const isError = name === 'agent.error'
+      const usage = (d.usage ?? {}) as Record<string, unknown>
+      const cost = typeof usage.totalCostUsd === 'number' && usage.totalCostUsd > 0 ? usage.totalCostUsd : undefined
+      const endTime = typeof d.timestamp === 'number' ? d.timestamp : Date.now()
+      const duration = stats?.startTime !== undefined ? Math.max(0, Math.round((endTime - stats.startTime) / 1000)) : 0
+      const toolCalls = stats?.toolCalls ?? 0
+      const fileCount = stats?.fileCount ?? 0
+      const preview = oneLine(isError ? d.error : d.result)
+
+      return {
+        kind: isError ? 'error' : 'result',
+        ...base,
+        title: isError ? 'Run failed' : 'Run finished',
+        body: buildResultBody(duration, cost, toolCalls, fileCount),
+        ...(preview ? { preview: truncate(preview, 120) } : {}),
+        ...(duration > 0 ? { duration } : {}),
+        ...(cost !== undefined ? { cost } : {}),
+        ...(toolCalls > 0 ? { toolCalls } : {}),
+        ...(fileCount > 0 ? { fileCount } : {}),
+      }
+    }
     default:
       return null
   }
+}
+
+function buildResultBody(duration: number, cost: number | undefined, toolCalls: number, fileCount: number): string {
+  const parts: string[] = []
+  if (duration > 0) {
+    const mins = Math.floor(duration / 60)
+    const secs = duration % 60
+    parts.push(mins > 0 ? `${mins}m ${secs}s` : `${secs}s`)
+  }
+  if (cost !== undefined && cost > 0) {
+    parts.push(`$${cost.toFixed(4)}`)
+  }
+  if (toolCalls > 0) {
+    parts.push(`${toolCalls} tool${toolCalls > 1 ? 's' : ''}`)
+  }
+  if (fileCount > 0) {
+    parts.push(`${fileCount} file${fileCount > 1 ? 's' : ''}`)
+  }
+  return truncate(parts.join(' · ') || 'Run completed', MAX_BODY)
 }
 
 /** base64(nonce || ciphertext || tag). `nonce` is injectable for tests only. */
@@ -136,8 +199,12 @@ export function encryptPushContent(content: PushContent, key: Uint8Array, nonce:
   let c = content
   let plain = new TextEncoder().encode(JSON.stringify(c))
   // Multi-byte text can exceed the byte budget even within the character caps.
-  while (plain.length > MAX_PLAINTEXT_BYTES && c.body.length > 1) {
-    c = { ...c, body: truncate(c.body, Math.floor(Array.from(c.body).length * 0.8)) }
+  while (plain.length > MAX_PLAINTEXT_BYTES && (c.body.length > 1 || (c.preview?.length ?? 0) > 1)) {
+    c = {
+      ...c,
+      body: truncate(c.body, Math.floor(Array.from(c.body).length * 0.8)),
+      ...(c.preview ? { preview: truncate(c.preview, Math.floor(Array.from(c.preview).length * 0.8)) } : {}),
+    }
     plain = new TextEncoder().encode(JSON.stringify(c))
   }
   const ct = chacha20poly1305(key, nonce).encrypt(plain)

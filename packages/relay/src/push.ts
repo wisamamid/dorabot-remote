@@ -18,9 +18,9 @@ export interface PushBody {
   rid?: string
   /** iOS only: which APNs environment the token belongs to. Defaults to production. */
   env?: 'production' | 'sandbox'
-  /** iOS only: opaque E2E-encrypted content (base64) for the Notification Service Extension. Never decrypted here. */
+  /** Opaque E2E-encrypted content (base64) for the iOS Notification Service Extension / Android messaging service. Never decrypted here. */
   enc?: string
-  /** iOS only: short key id (which stored push key opens `enc`), so the NSE can pick the right Mac's key. Not secret. */
+  /** Short key id (which stored push key opens `enc`), so the device can pick the right Mac's key. Not secret. */
   kid?: string
   ts: number
 }
@@ -139,10 +139,17 @@ export function buildFcmMessage(body: PushBody, relayId: string): { message: Rec
       },
     }
   } else {
+    // DATA message, deliberately without a `notification` block: Android then always calls the app's
+    // FirebaseMessagingService (foreground or background), which decrypts `enc` and posts the real
+    // notification itself. title/body/channel here are the generic fallback if it cannot decrypt.
+    if (body.enc) data.enc = body.enc
+    if (body.kid) data.kid = body.kid
+    data.title = text.title
+    data.body = text.body
+    data.channel = CHANNEL[kind]
     message.android = {
       priority: kind === 'question' || kind === 'approval' ? 'HIGH' : 'NORMAL',
       ...(rid ? { collapse_key: collapseId(rid) } : {}),
-      notification: { title: text.title, body: text.body, channel_id: CHANNEL[kind] },
     }
   }
   return { message }

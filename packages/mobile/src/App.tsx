@@ -1,6 +1,7 @@
 import { NOT_RECOGNISED_TEXT, type StoredSession } from '@dorabot-remote/protocol'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { keyOf } from './lib/connection.js'
+import { initializeTheme } from './lib/theme.js'
 import { formatCountdown } from './lib/countdown.js'
 import { CodeScreen } from './components/CodeScreen.js'
 import { InboxScreen } from './components/InboxScreen.js'
@@ -15,26 +16,39 @@ import { Button, Spinner, cx } from './components/ui.js'
 import { useSplit } from './lib/layout.js'
 import { ConnectionProvider, useConnection } from './lib/connection.js'
 import { InboxProvider, useInbox } from './lib/inbox-context.js'
+import type { InboxItem } from './lib/inbox.js'
 import { bannerFor } from './lib/status-banner.js'
-import { haptic, onAppUrl, setStatusBarDark } from './lib/platform.js'
+import { haptic, isNative, onAppUrl, setStatusBarDark } from './lib/platform.js'
 import { AppLockProvider, useAppLock } from './lib/app-lock.js'
 import { clearDeliveredNotifications, onPushNavigate, pruneDeliveredNotifications } from './lib/push.js'
 import { hostIdForKid } from './lib/push-keys.js'
-import { AppLinkQueue, ASK_TTL_MS, nextAskStep, parseAppLink } from './lib/applink.js'
+import { AppLinkQueue, ASK_TTL_MS, nextAskStep, parseAppLink, parseShareLink } from './lib/applink.js'
 import { displayName } from './lib/hosts.js'
 import { routePushAction, runDecision, type PushRoute } from './lib/push-actions.js'
 import { createPortal } from 'react-dom'
+import { takeShare, publishWidgetSnapshot, wipeAppGroup } from './lib/appgroup.js'
+import { clearWatchSnapshot, onWatchRequest, publishWatchSnapshot } from './lib/watch.js'
+import { buildWatchSnapshot, handleWatchRequest } from './lib/watch-logic.js'
+import { DEFAULT_IMAGE_PROMPT, requestBytes, REQUEST_BUDGET_BYTES } from './lib/attachments.js'
 import { AskConfirmSheet } from './components/AskConfirmSheet.js'
 import { PushProvider } from './lib/push-context.js'
+import { SavedPromptsProvider } from './lib/saved-prompts-context.js'
+import { SavedPromptsSheetProvider } from './components/SavedPromptsSheet.js'
 
 type TabName = 'sessions' | 'inbox' | 'work' | 'code' | 'more'
 
 /** `hostId` is the Mac the session lives on: after a switch, a session of another Mac is simply not shown. */
 type Open = { session: StoredSession | null; sessionKey: string; hostId: string | null } | null
 
+/** Nothing is offered on the wrist while the phone has no live link to the Mac: it could not be acted on. */
+function widgetItemsFor(items: InboxItem[], state: string): InboxItem[] {
+  return state === 'ready' ? items : []
+}
+
 export default function App(): ReactNode {
   useEffect(() => {
     void setStatusBarDark()
+    initializeTheme()
   }, [])
   return (
     <AppLockProvider>
@@ -42,12 +56,25 @@ export default function App(): ReactNode {
         <PushProvider>
           <InboxProvider>
             <RenameProvider>
-              <Shell />
+              <ShellWithSavedPrompts />
             </RenameProvider>
           </InboxProvider>
         </PushProvider>
       </ConnectionProvider>
     </AppLockProvider>
+  )
+}
+
+function ShellWithSavedPrompts(): ReactNode {
+  const conn = useConnection()
+  const hostId = conn.demo ? 'demo' : (conn.activeHostId || '')
+  // Always mounted (the sheet and Settings read it); an unpaired phone has no hostId and no prompts UI.
+  return (
+    <SavedPromptsProvider hostId={hostId}>
+      <SavedPromptsSheetProvider>
+        <Shell />
+      </SavedPromptsSheetProvider>
+    </SavedPromptsProvider>
   )
 }
 
@@ -126,7 +153,7 @@ function Shell(): ReactNode {
     const verify = verifyOnce.current ?? lock.verify('Confirm')
     setDecision(null)
     verifyOnce.current = null
-    void runDecision(route, { verify: () => verify, rpc: (m, p) => connRef.current.rpc(m, p) }).then((out) => {
+    void runDecision(route, { verify: () => verify, verifyFresh: () => lock.verify('Approve a risky action', { fresh: true }), native: isNative, rpc: (m, p) => connRef.current.rpc(m, p) }).then((out) => {
       setToast({ text: out.message, ok: out.status === 'done' || out.status === 'already_resolved' })
       void haptic(out.status === 'done' ? 'success' : 'warning')
     })
@@ -143,7 +170,7 @@ function Shell(): ReactNode {
   const askQueue = useRef(new AppLinkQueue())
   const [askTick, setAskTick] = useState(0)
   const askConfirmed = useRef(false)
-  const [askConfirm, setAskConfirm] = useState<{ prompt: string; hostName: string } | null>(null)
+  const [askConfirm, setAskConfirm] = useState<{ prompt: string; hostName: string; images?: Array<{ data: string; mediaType: string }> } | null>(null)
   const askBusy = useRef(false)
   const lockRef = useRef(lock)
   lockRef.current = lock
@@ -151,9 +178,83 @@ function Shell(): ReactNode {
   useEffect(
     () =>
       onAppUrl((url) => {
+        const shareId = parseShareLink(url)
+        if (shareId) {
+          void pickUpShare(shareId)
+          return
+        }
         const link = parseAppLink(url)
         if (link && askQueue.current.push(link, Date.now())) setAskTick((t) => t + 1)
       }, 'ask'),
+    [],
+  )
+
+  // Something shared from another app (Share Extension): it waits in the App Group until the app
+  // opens, by URL or simply by coming to the foreground. It goes through the same confirmation
+  // sheet as a Siri ask; nothing is sent until Send is tapped.
+  function pickUpShare(id?: string): Promise<void> {
+    return takeShare(id).then((shared) => {
+      if (!shared) return
+      const link = { type: 'ask' as const, prompt: shared.text, nonce: shared.id, ...(shared.images.length ? { images: shared.images } : {}) }
+      if (askQueue.current.push(link, Date.now())) setAskTick((t) => t + 1)
+    })
+  }
+
+  useEffect(() => {
+    if (!isNative) return
+    void pickUpShare()
+    let remove: (() => void) | null = null
+    let gone = false
+    void import('@capacitor/app').then(async ({ App }) => {
+      const sub = await App.addListener('appStateChange', ({ isActive }) => {
+        if (isActive) void pickUpShare()
+      })
+      if (gone) void sub.remove()
+      else remove = () => void sub.remove()
+    })
+    return () => {
+      gone = true
+      remove?.()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Home-screen widget: how many approvals / questions wait, and on which Mac.
+  const widgetHost = conn.demo ? 'Demo Mac' : (conn.pairings.find((p) => p.hostId === conn.activeHostId)?.hostName ?? '')
+  const widgetPending = inbox.items.filter((i) => !i.timedOut).length
+  // Never from the demo (fake Mac), and emptied when nothing is paired, so no old Mac name or command text lingers.
+  const live = paired && !conn.demo
+  useEffect(() => {
+    if (!live) {
+      void wipeAppGroup()
+      return
+    }
+    void publishWidgetSnapshot(widgetHost, widgetPending)
+  }, [live, widgetHost, widgetPending])
+
+  // Apple Watch: the same list, shaped for the wrist, and the watch's approve / deny requests. A
+  // request is checked against the live inbox and connection at the moment it arrives.
+  const watchRef = useRef({ conn, inbox, locked: lock.locked })
+  watchRef.current = { conn, inbox, locked: lock.locked }
+  useEffect(() => {
+    if (!live) {
+      void clearWatchSnapshot()
+      return
+    }
+    void publishWatchSnapshot(buildWatchSnapshot(widgetItemsFor(inbox.items, conn.state), widgetHost, conn.sessions, Date.now(), lock.locked))
+  }, [live, inbox.items, conn.state, conn.sessions, widgetHost, lock.locked])
+  useEffect(
+    () =>
+      onWatchRequest((req) => {
+        const { conn: c, inbox: ib, locked } = watchRef.current
+        return handleWatchRequest(req, {
+          locked,
+          connected: c.state === 'ready' && c.gatewayConnected && !c.demo,
+          items: ib.items,
+          approve: (i) => ib.approve(i),
+          deny: (i) => ib.deny(i),
+        })
+      }),
     [],
   )
 
@@ -205,14 +306,21 @@ function Shell(): ReactNode {
     }
     if (step.do === 'confirm') {
       // Show the full prompt; nothing happens until the user taps Send.
-      setAskConfirm((cur) => (cur && cur.prompt === link.prompt && cur.hostName === step.hostName ? cur : { prompt: link.prompt, hostName: step.hostName }))
+      setAskConfirm((cur) => (cur && cur.prompt === link.prompt && cur.hostName === step.hostName ? cur : { prompt: link.prompt, hostName: step.hostName, ...(link.images?.length ? { images: link.images } : {}) }))
       return
     }
     askBusy.current = true
     // send: start a NEW session on that Mac with the prompt, then show it.
     const c = connRef.current
     const name = hosts.find((h) => h.hostId === step.hostId)
-    void (c.demo ? c.rpc<{ sessionKey: string }>('chat.send', { prompt: link.prompt }) : c.rpcOn<{ sessionKey: string }>(step.hostId, 'chat.send', { prompt: link.prompt }))
+    const params: Record<string, unknown> = link.images?.length
+      ? { prompt: link.prompt.trim() || DEFAULT_IMAGE_PROMPT, images: link.images.map((i) => ({ data: i.data, mediaType: i.mediaType })), source: 'remote/mobile' }
+      : { prompt: link.prompt }
+    if (requestBytes(params) > REQUEST_BUDGET_BYTES) {
+      askBusy.current = false
+      return finish({ text: 'That share is too large to send. Try fewer or smaller photos.', ok: false })
+    }
+    void (c.demo ? c.rpc<{ sessionKey: string }>('chat.send', params) : c.rpcOn<{ sessionKey: string }>(step.hostId, 'chat.send', params))
       .then((res) => {
         askBusy.current = false
         c.cancelAddMac()
@@ -248,6 +356,76 @@ function Shell(): ReactNode {
   useEffect(() => {
     if (split && open) setTab('sessions')
   }, [split, open])
+
+  // Keyboard shortcuts for iPad
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent): void => {
+      const target = e.target as HTMLElement
+      const isTextInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA'
+
+      // Cmd+Enter: send (even in textarea)
+      if (e.metaKey && e.key === 'Enter' && isTextInput) {
+        e.preventDefault()
+        const composer = target.closest('[data-composer]')
+        if (composer) {
+          const sendBtn = composer.querySelector('button:last-child') as HTMLButtonElement
+          if (sendBtn && !sendBtn.disabled) sendBtn.click()
+        }
+        return
+      }
+
+      // Cmd+K: focus search field (even in input)
+      if (e.metaKey && e.key === 'k') {
+        e.preventDefault()
+        const searchField = document.querySelector('input[placeholder*="Search"]') as HTMLInputElement
+        if (searchField) searchField.focus()
+        return
+      }
+
+      // Don't process other shortcuts if typing
+      if (isTextInput) return
+
+      // Esc to go back or close
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        if (open) setOpen(null)
+        return
+      }
+
+      // Other Cmd shortcuts
+      if (!e.metaKey) return
+      e.preventDefault()
+
+      // Cmd+N: new session
+      if (e.key === 'n') {
+        if (tab === 'sessions') {
+          const btns = document.querySelectorAll('button')
+          for (const btn of btns) {
+            if (btn.textContent?.includes('New session') && !btn.disabled) {
+              btn.click()
+              return
+            }
+          }
+        }
+        return
+      }
+
+      // Cmd+1..5: switch tabs
+      const tabMap: Record<string, TabName> = {
+        '1': 'sessions',
+        '2': 'inbox',
+        '3': 'work',
+        '4': 'code',
+        '5': 'more',
+      }
+      if (tabMap[e.key]) {
+        setTab(tabMap[e.key])
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [tab, open])
 
   if (!conn.ready) {
     return (
@@ -365,6 +543,7 @@ function Shell(): ReactNode {
         <AskConfirmSheet
           prompt={askConfirm.prompt}
           hostName={askConfirm.hostName}
+          images={askConfirm.images}
           onSend={() => {
             askConfirmed.current = true
             setAskConfirm(null)

@@ -71,6 +71,7 @@ export const CONTROL_PAGE = `<!doctype html>
   .request + .request { margin-top: 10px; }
   pre.log { background: #0e1013; border: 1px solid var(--line); border-radius: 10px; padding: 14px;
             max-height: 240px; overflow: auto; font-size: 12px; color: var(--muted); margin: 0; }
+  select.dur { padding: 5px 8px; font-size: 13px; }
   input[type=text], select { font: inherit; background: var(--panel-2); color: var(--text);
     border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
   table.audit { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -109,7 +110,13 @@ export const CONTROL_PAGE = `<!doctype html>
   <h2>Permission requests</h2>
   <div id="requests"></div>
 
-  <h2>Paired devices</h2>
+  <div class="row" style="margin:36px 0 12px">
+    <h2 style="margin:0">Paired devices</h2>
+    <span style="display:flex;gap:8px">
+      <button class="small" id="rotate-all" onclick="rotateAll()" style="display:none" title="Give every phone a new relay token (old ones work until the phone confirms, at most 7 days)">Rotate relay tokens</button>
+      <button class="small danger" onclick="lockdown()" title="Lost phone? Revoke every device at once">Lockdown: revoke all</button>
+    </span>
+  </div>
   <div id="devices"></div>
 
   <h2>Shared folders</h2>
@@ -118,9 +125,16 @@ export const CONTROL_PAGE = `<!doctype html>
     <div id="roots"></div>
     <div class="row" style="margin-top:12px;gap:8px">
       <input id="root-path" type="text" placeholder="/Users/you/Projects" style="flex:1" />
+      <span class="small muted">For:</span><span id="root-dur"></span>
       <button class="small primary" onclick="addRoot()">Add</button>
     </div>
     <div id="root-msg" class="small" style="margin-top:8px;color:var(--danger)"></div>
+  </div>
+
+  <h2>Always-allow rules</h2>
+  <div class="card">
+    <div class="small muted" style="margin-bottom:10px">Tool calls your phone chose to always approve. They are approved here, on the bridge, and recorded in the audit log. Risky actions are never covered. Rules can only be added from the phone (with Face ID).</div>
+    <div id="rules"></div>
   </div>
 
   <h2>Audit log</h2>
@@ -175,12 +189,21 @@ async function loadAudit() {
 }
 
 function render() {
+  // Re-rendering replaces the time-limit pickers; keep what the user chose.
+  const picked = {};
+  document.querySelectorAll('select.dur').forEach(el => { picked[el.id] = el.value; });
+  renderAll();
+  document.querySelectorAll('select.dur').forEach(el => { if (picked[el.id] !== undefined) el.value = picked[el.id]; });
+}
+
+function renderAll() {
   document.getElementById('host-name').textContent = state.host.name;
   document.getElementById('host-fp').textContent = state.host.fingerprint;
   const gw = document.getElementById('gw');
   gw.textContent = state.gatewayConnected ? 'dorabot connected' : 'dorabot not reachable';
   gw.className = 'pill ' + (state.gatewayConnected ? 'on' : 'off');
 
+  document.getElementById('rotate-all').style.display = state.relay ? '' : 'none';
   const rl = document.getElementById('relay');
   if (state.relay) {
     rl.style.display = '';
@@ -208,8 +231,13 @@ function render() {
 
   const roots = document.getElementById('roots');
   roots.innerHTML = state.roots && state.roots.length
-    ? state.roots.map(r => '<div class="row" style="padding:4px 0"><code>' + esc(r) + '</code><button class="small danger" data-root="' + esc(r) + '" onclick="removeRoot(this.dataset.root)">Remove</button></div>').join('')
+    ? state.roots.map(r => '<div class="row" style="padding:4px 0"><span><code>' + esc(r) + '</code>' + (state.rootsExpiry && state.rootsExpiry[r] ? ' <span class="muted small">· ' + left(state.rootsExpiry[r] - Date.now()) + ' left</span>' : '') + '</span><button class="small danger" data-root="' + esc(r) + '" onclick="removeRoot(this.dataset.root)">Remove</button></div>').join('')
     : '<div class="empty">No folders shared.</div>';
+
+  const rules = document.getElementById('rules');
+  rules.innerHTML = state.rules && state.rules.length
+    ? state.rules.map(r => '<div class="row" style="padding:4px 0"><span><code>' + esc(r.label) + '</code> <span class="muted small">' + esc(r.createdBy || '') + ' · ' + new Date(r.createdAt).toLocaleDateString() + '</span></span><button class="small danger" data-rule="' + esc(r.id) + '" onclick="removeRule(this.dataset.rule)">Remove</button></div>').join('')
+    : '<div class="empty">No rules. Every approval is asked.</div>';
 
   const reqs = document.getElementById('requests');
   if (!state.scopeRequests.length) {
@@ -224,6 +252,7 @@ function render() {
           </div>
           <div style="display:flex;gap:8px">
             <button class="small" onclick="scope('\${r.id}', false)">Deny</button>
+            \${durSelect('dur-req-' + r.id)}
             <button class="small primary" onclick="scope('\${r.id}', true)">Allow</button>
           </div>
         </div>
@@ -240,26 +269,49 @@ function render() {
         <div class="row">
           <div>
             <div><strong>\${esc(d.name)}</strong>
-              <span class="pill \${d.revoked ? 'off' : (online ? 'on' : '')}">\${d.pending ? 'waiting for approval' : d.revoked ? (d.revokedReason === 'expired' ? 'revoked: unseen for 90 days' : 'revoked') : (online ? 'connected' : 'offline')}</span>
+              <span class="pill \${d.revoked ? 'off' : (online ? 'on' : '')}">\${d.pending ? 'waiting for approval' : d.revoked ? (d.revokedReason === 'expired' ? 'revoked: unseen for 90 days' : d.revokedReason === 'lost' ? 'revoked: marked lost' : d.revokedReason === 'lockdown' ? 'revoked: lockdown' : 'revoked') : (online ? 'connected' : 'offline')}</span>
             </div>
             <div class="small muted mono">\${esc(d.platform)} · \${esc(d.fingerprint)} · \${d.lastSeenAt ? 'last seen ' + new Date(d.lastSeenAt).toLocaleString() : 'never connected'}</div>
           </div>
           <div style="display:flex;gap:8px">
             \${d.revoked
               ? \`<button class="small" onclick="device('\${d.id}','restore')">Restore</button>\`
-              : \`<button class="small danger" onclick="device('\${d.id}','revoke')">Revoke</button>\`}
+              : \`\${state.relay && !d.pending ? \`<button class="small" onclick="device('\${d.id}','rotate')" title="New relay token, delivered over the encrypted channel">Rotate token</button>\` : ''}<button class="small danger" onclick="device('\${d.id}','lost')">Lost</button><button class="small danger" onclick="device('\${d.id}','revoke')">Revoke</button>\`}
             <button class="small danger" onclick="device('\${d.id}','delete')">Remove</button>
           </div>
         </div>
         <div class="scopes">
           \${SCOPES.map(s => \`<span class="scope \${d.scopes.includes(s) ? 'active' : ''} \${RISKY.has(s) ? 'danger' : ''}"
-             onclick="toggleScope('\${d.id}','\${s}')">\${s}</span>\`).join('')}
+             onclick="toggleScope('\${d.id}','\${s}')">\${s}\${d.scopeExpiry && d.scopeExpiry[s] ? ' · ' + left(d.scopeExpiry[s] - Date.now()) + ' left' : ''}</span>\`).join('')}
+          <span class="small muted" style="margin-left:6px">Turn on for:</span>\${durSelect('dur-' + d.id)}
         </div>
       </div>\`;
     }).join('');
   }
 
   document.getElementById('log').textContent = state.log.join('\\n');
+}
+
+// Time limits for grants: '' = permanent. 'custom' asks for hours.
+function durSelect(id) {
+  return '<select id="' + id + '" class="dur" title="How long the permission lasts"><option value="">Permanent</option><option value="3600000">1 hour</option><option value="28800000">8 hours</option><option value="86400000">24 hours</option><option value="custom">Custom…</option></select>';
+}
+// Returns ms, null (permanent) or undefined (cancelled / invalid).
+function readDur(id) {
+  const el = document.getElementById(id);
+  const v = el ? el.value : '';
+  if (v === '') return null;
+  if (v !== 'custom') return Number(v);
+  const h = Number(prompt('For how many hours? (for example 2 or 0.5; 1 minute to 30 days)') || '');
+  if (!Number.isFinite(h) || h <= 0) return undefined;
+  return Math.round(h * 3600000);
+}
+function left(ms) {
+  const m = Math.max(1, Math.ceil(ms / 60000));
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  if (h < 48) return m % 60 ? h + 'h ' + (m % 60) + 'm' : h + 'h';
+  return Math.floor(h / 24) + 'd';
 }
 
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -284,13 +336,20 @@ async function newPairing() {
 }
 
 async function scope(requestId, approve) {
-  await api('/api/scope', { requestId, approve });
+  let forMs = null;
+  if (approve) {
+    forMs = readDur('dur-req-' + requestId);
+    if (forMs === undefined) return;
+  }
+  await api('/api/scope', { requestId, approve, forMs });
   load();
 }
 
 async function addRoot() {
   const input = document.getElementById('root-path');
-  const r = await api('/api/roots', { action: 'add', path: input.value.trim() });
+  const forMs = readDur('dur-root');
+  if (forMs === undefined) return;
+  const r = await api('/api/roots', { action: 'add', path: input.value.trim(), forMs });
   const j = await r.json();
   document.getElementById('root-msg').textContent = j.ok ? '' : (j.error || 'Could not add that folder');
   if (j.ok) input.value = '';
@@ -302,7 +361,26 @@ async function removeRoot(path) {
   load();
 }
 
+async function removeRule(id) {
+  await api('/api/rules', { action: 'remove', id });
+  load();
+}
+
+async function rotateAll() {
+  if (!confirm('Rotate the relay token of every device?\\n\\nPhones receive the new one over the encrypted channel and confirm it. The old token keeps working until they do, at most 7 days.')) return;
+  await api('/api/rotate-tokens', {});
+  load();
+}
+
+async function lockdown() {
+  const n = state.devices.filter(d => !d.revoked).length;
+  if (!confirm('Revoke ALL ' + n + ' device(s) now?\\n\\nEvery phone is cut off at once (direct and relay) and its push notifications stop. Phones must be paired again afterwards.')) return;
+  await api('/api/lockdown', { confirm: true });
+  load();
+}
+
 async function device(deviceId, action) {
+  if (action === 'lost' && !confirm('Mark this device as lost?\\n\\nIt is revoked at once and stops receiving notifications.')) return;
   if (action === 'delete' && !confirm('Remove this device? It will need to pair again.')) return;
   await api('/api/device', { deviceId, action });
   load();
@@ -315,10 +393,14 @@ async function toggleScope(deviceId, scope) {
   if (!d.scopes.includes(scope) && RISKY.has(scope)
       && !confirm('Grant "' + scope + '" to ' + d.name + '?\\n\\n' +
                   (scope === 'terminal' ? 'This gives the device a real shell on this Mac.' : 'This is a powerful permission.'))) return;
-  await api('/api/device', { deviceId, action: 'scopes', scopes: next });
+  const turningOn = !d.scopes.includes(scope);
+  const forMs = turningOn ? readDur('dur-' + deviceId) : null;
+  if (forMs === undefined) return;
+  await api('/api/device', { deviceId, action: 'scopes', scopes: next, scope: turningOn ? scope : undefined, forMs });
   load();
 }
 
+document.getElementById('root-dur').innerHTML = durSelect('dur-root');
 load();
 setInterval(load, 4000);
 </script>

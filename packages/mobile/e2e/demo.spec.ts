@@ -17,6 +17,20 @@ test.describe('DoraBot Remote iOS - Demo Mode', () => {
     await expect(demoLink).toBeVisible()
   })
 
+  test('After a self-wipe the Pair screen explains why, once', async ({ page }) => {
+    await page.addInitScript(() => {
+      if (!sessionStorage.getItem('seeded')) {
+        sessionStorage.setItem('seeded', '1')
+        localStorage.setItem('dorabot-remote.wipenotice.v1', '1')
+      }
+    })
+    await page.goto('/')
+    await expect(page.getByRole('alert')).toContainText('erased all pairings and keys after 5 failed unlock attempts')
+    await page.reload()
+    await expect(page.locator('h1', { hasText: /Pair with your Mac/ })).toBeVisible()
+    await expect(page.getByRole('alert')).toHaveCount(0)
+  })
+
   test('Enter demo mode shows sample sessions and demo banner', async ({ page }) => {
     await page.goto('/')
     await page.waitForLoadState('networkidle')
@@ -81,13 +95,55 @@ test.describe('DoraBot Remote iOS - Demo Mode', () => {
     await expect(approvalItem.first()).toBeVisible()
 
     // Find and click approve button
-    const approveBtn = page.locator('button:has-text("Approve"), button:has-text("Allow")').first()
+    const approveBtn = page.locator('button:text-is("Approve")').first()
     await approveBtn.click()
     await page.waitForTimeout(1500)
 
     // Verify reply text appears
     const replyText = page.locator('text=/All.*tests pass|demo/i')
     await expect(replyText.first()).toBeVisible({ timeout: 5000 })
+  })
+
+  test('Inbox: a risky approval shows the Risky badge, reasons and the full command', async ({ page }) => {
+    await page.goto('/')
+    await page.waitForLoadState('networkidle')
+    await page.locator('button, a', { hasText: /Try a demo/ }).click()
+    await page.waitForLoadState('networkidle')
+    await page.locator('button, [role="tab"]', { hasText: /Inbox/ }).click()
+    await page.waitForTimeout(500)
+
+    const badge = page.getByTestId('risk-badge')
+    await expect(badge).toHaveCount(1)
+    await expect(badge.first()).toContainText('Risky')
+    await expect(badge.first()).toContainText(/force/i)
+    await expect(page.getByTestId('full-command').filter({ hasText: 'git push --force origin release/2.4' })).toBeVisible()
+  })
+
+  test('Inbox: Always allow offers a confirmation sheet for a routine approval, never a risky one', async ({ page }) => {
+    await page.goto('/')
+    await page.waitForLoadState('networkidle')
+    await page.locator('button, a', { hasText: /Try a demo/ }).click()
+    await page.waitForLoadState('networkidle')
+    await page.locator('button, [role="tab"]', { hasText: /Inbox/ }).click()
+    await page.waitForTimeout(500)
+
+    // Only the routine approval (npm test) gets the option.
+    const always = page.getByRole('button', { name: /Always allow/ })
+    await expect(always).toHaveCount(1)
+    await expect(always).toContainText('this exact command')
+    await always.click()
+
+    const sheet = page.getByRole('dialog', { name: /Always allow/ })
+    await expect(sheet).toBeVisible()
+    await expect(sheet).toContainText('npm test')
+    await expect(sheet).toContainText(/Face ID/)
+    await sheet.getByRole('button', { name: 'Cancel' }).click()
+    await expect(sheet).toHaveCount(0)
+
+    // Confirm: the rule is saved (demo has no OS prompt), this request is approved, and Settings lists it.
+    await always.click()
+    await page.getByRole('dialog', { name: /Always allow/ }).getByRole('button', { name: 'Continue' }).click()
+    await expect(page.locator('text=/All.*tests pass|demo/i').first()).toBeVisible({ timeout: 5000 })
   })
 
   test('Inbox: answer question by choosing an option', async ({ page }) => {
@@ -268,6 +324,48 @@ test.describe('DoraBot Remote iOS - Demo Mode', () => {
       await pinBtn.click()
       await page.waitForTimeout(1000)
     }
+  })
+
+  test('Saved prompts sheet opens and inserts text in composer', async ({ page }) => {
+    await page.goto('/')
+    await page.waitForLoadState('networkidle')
+
+    // Enter demo
+    await page.locator('button, a', { hasText: /Try a demo/ }).click()
+    await page.waitForLoadState('networkidle')
+
+    // Open a session
+    await page.locator('text=Fix failing checkout tests').first().click()
+    await page.waitForTimeout(500)
+
+    // Find the saved prompts button (+ / dots icon in composer)
+    const composerButtons = page.locator('button[title="Saved prompts"], button[aria-label*="prompt"]')
+    const promptBtn = composerButtons.first()
+    await expect(promptBtn).toBeVisible()
+    await promptBtn.click()
+    await page.waitForTimeout(500)
+
+    // Verify sheet opened with default prompts
+    const sheet = page.getByRole('dialog', { name: /Saved prompts/ })
+    await expect(sheet).toBeVisible()
+
+    // Verify default prompts are listed
+    await expect(sheet.locator('text=Run the tests')).toBeVisible()
+    await expect(sheet.locator('text=Summarise what changed today')).toBeVisible()
+    await expect(sheet.locator('text=What are you working on?')).toBeVisible()
+
+    // Click first prompt
+    await sheet.locator('button', { hasText: 'Run the tests' }).first().click()
+    await page.waitForTimeout(300)
+
+    // Verify sheet closed and text was inserted
+    await expect(sheet).not.toBeVisible()
+
+    // Verify text appears in composer
+    const composer = page.locator('textarea').first()
+    await expect(composer).toBeVisible()
+    const value = await composer.inputValue()
+    expect(value).toContain('Run the tests')
   })
 
   test('Exit demo returns to Pair screen', async ({ page }) => {

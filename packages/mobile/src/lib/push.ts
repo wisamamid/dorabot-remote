@@ -1,7 +1,8 @@
 /**
  * Native push plumbing. Contentless pushes: the notification only says that
  * dorabot needs you; everything readable is fetched over the E2E channel after
- * the app opens. APNs is used directly (no Firebase SDK).
+ * the app opens. iOS uses APNs directly (no Firebase SDK); Android uses FCM data messages that
+ * the native messaging service decrypts and shows (android/.../DorabotMessagingService.java).
  *
  * Same rule as platform.ts: a Capacitor plugin proxy is a thenable, so it is
  * never returned from an async function. Every use goes through the plugin
@@ -9,7 +10,7 @@
  */
 import { isNative, platformName } from './platform.js'
 import { buildPushNav, staleDelivered, type PushData, type PushNav } from './push-actions.js'
-import { listPushKeys } from './push-key.js'
+import { listPushKeys, onNativePushAction, takeNativePushAction } from './push-key.js'
 
 export type { PushNav }
 
@@ -18,7 +19,10 @@ export type PushPermission = 'prompt' | 'granted' | 'denied' | 'unsupported'
 /** TestFlight and App Store builds use production APNs; Xcode debug installs need 'sandbox'. */
 export const APNS_ENV: 'production' | 'sandbox' = import.meta.env.VITE_APNS_ENV === 'sandbox' ? 'sandbox' : 'production'
 
-export const pushSupported = isNative && platformName === 'ios'
+export const pushSupported = isNative && (platformName === 'ios' || platformName === 'android')
+
+/** What the bridge is told: the Mac pushes through the relay to APNs (ios) or FCM (android). */
+export const PUSH_PLATFORM: 'ios' | 'android' = platformName === 'android' ? 'android' : 'ios'
 
 function mapPermission(p: string): PushPermission {
   if (p === 'granted') return 'granted'
@@ -117,8 +121,26 @@ export function listenPush(onToken: (token: string) => void, onError?: (msg: str
       }),
     )
   })().catch(() => {})
+  // Android posts its own (decrypted) notifications, so taps and Approve/Deny arrive from the native
+  // plugin rather than from the Capacitor push plugin. Same trust rule: only the decrypted `enc` counts.
+  const pickUp = (): void => {
+    void takeNativePushAction().then(async (a) => {
+      if (!a) return
+      let nav: PushNav = { actionId: 'tap' }
+      try {
+        const keys = typeof a.data.enc === 'string' ? await Promise.race([listPushKeys(), new Promise<[]>((r) => setTimeout(() => r([]), 1500))]) : []
+        nav = buildPushNav(a.data, a.actionId, keys)
+      } catch {
+        // falls back to a plain open
+      }
+      emitNav(nav)
+    })
+  }
+  const unlisten = onNativePushAction(pickUp)
+  pickUp()
   return () => {
     disposed = true
+    unlisten()
     for (const s of subs) s()
   }
 }

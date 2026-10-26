@@ -32,12 +32,25 @@ export function SessionList({
   const [switcher, setSwitcher] = useState(false)
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchingMessages, setSearchingMessages] = useState(false)
+  const [searchResults, setSearchResults] = useState<StoredSession[]>([])
 
   const waiting = new Map(conn.attention.map((a) => [a.sessionKey, a]))
 
-  const rows = conn.sessions
+  let rows = conn.sessions
     .map((s) => ({ session: s, key: keyOf(s) }))
     .filter((r): r is { session: StoredSession; key: string } => Boolean(r.key))
+
+  // Filter by search query on client side
+  if (searchQuery.trim()) {
+    const query = searchQuery.toLowerCase()
+    rows = rows.filter(
+      (r) =>
+        (r.session.name || '').toLowerCase().includes(query) ||
+        (r.session.senderName || '').toLowerCase().includes(query),
+    )
+  }
 
   rows.sort((a, b) => {
     const aw = waiting.has(a.key) ? 1 : 0
@@ -129,6 +142,39 @@ export function SessionList({
     setSending(false)
   }
 
+  async function searchMessages(): Promise<void> {
+    const query = searchQuery.trim()
+    if (!query) return
+    setSearchingMessages(true)
+    try {
+      const res = await conn.rpc<
+        { sessionKey: string; name?: string; senderName?: string; preview?: string; messageCount: number }[]
+      >('search.memory', { query })
+      setSearchResults(
+        res.map((r) => {
+          const [channel, chatType, chatId] = r.sessionKey.split(':')
+          return {
+            id: r.sessionKey,
+            sessionKey: r.sessionKey,
+            messageCount: r.messageCount,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            channel,
+            chatType,
+            chatId,
+            name: r.name,
+            senderName: r.senderName,
+            preview: r.preview,
+          } as StoredSession
+        }),
+      )
+    } catch {
+      setSearchResults([])
+    } finally {
+      setSearchingMessages(false)
+    }
+  }
+
   const multi = conn.pairings.length > 1
   const statusTone =
     conn.state === 'ready' ? (conn.gatewayConnected ? 'good' : 'warn') : conn.state === 'disconnected' ? 'bad' : 'warn'
@@ -172,22 +218,50 @@ export function SessionList({
       }
     >
       <div className="flex h-full min-h-0 flex-col">
+        <div className="shrink-0 border-b border-ink-700 bg-ink-900 px-3 py-2.5">
+          <input
+            type="text"
+            placeholder="Search sessions…"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full rounded-lg border border-ink-600 bg-ink-800 px-3 py-2 text-[15px] placeholder-ink-500"
+          />
+          {searchQuery.trim() && (
+            <button
+              onClick={() => void searchMessages()}
+              disabled={searchingMessages}
+              className="mt-2 w-full rounded-lg bg-mint-600 px-3 py-2 text-center font-medium text-ink-900 active:opacity-80 disabled:opacity-50"
+            >
+              {searchingMessages ? 'Searching…' : 'Search messages'}
+            </button>
+          )}
+        </div>
         <div className="min-h-0 flex-1">
         <PullToRefresh onRefresh={conn.refreshSessions} className="px-3 py-3">
           {conn.sessionsLoading && rows.length === 0 ? (
             <div className="flex h-40 items-center justify-center">
               <Spinner className="size-6" />
             </div>
+          ) : searchResults.length > 0 ? (
+            <div className="space-y-1.5">
+              <SectionLabel>Search results</SectionLabel>
+              {searchResults.map((session) => {
+                const key = keyOf(session)
+                return key ? renderRow({ session, key }) : null
+              })}
+            </div>
           ) : rows.length === 0 ? (
             <Empty
-              title={conn.state === 'ready' ? 'No sessions yet' : 'Reconnecting'}
+              title={searchQuery.trim() ? 'No sessions found' : conn.state === 'ready' ? 'No sessions yet' : 'Reconnecting'}
               body={
-                conn.state === 'ready'
-                  ? 'Start one from here, or from dorabot on your Mac.'
-                  : 'Make sure the Mac is awake and the bridge is running.'
+                searchQuery.trim()
+                  ? 'Try a different search term.'
+                  : conn.state === 'ready'
+                    ? 'Start one from here, or from dorabot on your Mac.'
+                    : 'Make sure the Mac is awake and the bridge is running.'
               }
               action={
-                conn.state === 'ready' ? (
+                !searchQuery.trim() && conn.state === 'ready' ? (
                   <Button variant="primary" onClick={() => setComposing(true)} className="mt-2 px-6">
                     New session
                   </Button>

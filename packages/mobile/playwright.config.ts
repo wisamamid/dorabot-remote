@@ -1,6 +1,7 @@
 import { defineConfig, devices } from '@playwright/test'
 
-const baseURL = 'http://127.0.0.1:5180'
+const port = Number(process.env.E2E_PORT ?? 5180)
+const baseURL = `http://127.0.0.1:${port}`
 
 export default defineConfig({
   testDir: './e2e',
@@ -23,7 +24,7 @@ export default defineConfig({
   ],
 
   webServer: {
-    command: 'npx vite preview --host 127.0.0.1 --port 5180',
+    command: `npx vite preview --host 127.0.0.1 --port ${port} --strictPort`,
     url: baseURL,
     reuseExistingServer: !process.env.CI,
     timeout: 30 * 1000,

@@ -46,6 +46,8 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_dorabot-remote._tcp</string>
@@ -54,6 +56,10 @@
 	<string>Scan the pairing code shown on your Mac to link this phone, or take a photo to send to dorabot.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Unlock DoraBot Remote and confirm approvals with Face ID.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Record voice messages to send to dorabot in a chat.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Transcribe your voice messages to send to dorabot.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Choose photos to send to dorabot in a chat.</string>
 	<key>NSLocalNetworkUsageDescription</key>

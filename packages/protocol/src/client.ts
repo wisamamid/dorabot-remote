@@ -829,10 +829,13 @@ export class RemoteClient {
       case 'event': {
         if (typeof env.seq === 'number' && env.seq > this.lastSeq) this.lastSeq = env.seq
         if (env.event === 'remote.scopes_changed' && this.device) {
-          const scopes = (env.data as { scopes: Scope[] }).scopes
-          this.device = { ...this.device, scopes }
+          const { scopes, expiry } = env.data as { scopes: Scope[]; expiry?: Record<string, number> }
+          const { scopeExpiry: _old, ...rest } = this.device
+          void _old
+          this.device = { ...rest, scopes, ...(expiry && Object.keys(expiry).length ? { scopeExpiry: expiry } : {}) }
           this.allowed = methodsForScopes(scopes)
         }
+        if (env.event === 'remote.relay_token') this.adoptRotatedRelayToken((env.data as { relay?: RelayInfo } | undefined)?.relay)
         this.safe(() => this.opts.onEvent?.(env.event, env.data, env.seq, env.sessionKey), 'onEvent')
         return
       }
@@ -895,6 +898,23 @@ export class RemoteClient {
 
   hasScope(scope: Scope): boolean {
     return this.device?.scopes.includes(scope) ?? false
+  }
+
+  /**
+   * The Mac rotated this device's relay token and sent the new one over the encrypted channel. Same relay only
+   * (a rotation never moves a phone to another relay). Persist it, then ack it like any other token.
+   */
+  private adoptRotatedRelayToken(next: RelayInfo | undefined): void {
+    const cur = this.relay
+    if (!cur || !next?.tok || next.u !== cur.u || next.i !== cur.i || next.tok === cur.tok) return
+    const relay: RelayInfo = { ...cur, tok: next.tok }
+    this.relay = relay
+    this.log(`relay token rotated by the host id=${relay.i.slice(0, 6)}`)
+    let persisted: Promise<unknown> | undefined
+    this.safe(() => {
+      persisted = Promise.resolve(this.opts.onRelay?.(relay))
+    }, 'onRelay')
+    void this.ackRelayToken(persisted)
   }
 
   /**

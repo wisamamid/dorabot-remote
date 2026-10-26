@@ -9,18 +9,26 @@ import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
  * control page see each other's edits without a restart.
  */
 export interface RootsStore {
-  /** Canonical (realpath) absolute folders currently shared. */
+  /** Canonical (realpath) absolute folders currently shared. Folders whose time limit has passed are not listed. */
   listRoots(): string[]
-  /** Validate and add a folder. Throws with a user-readable message when refused. Returns the stored path. */
-  addRoot(path: string): string
+  /** Time-limited folders only: path -> epoch ms it lapses. */
+  listExpiry(): Record<string, number>
+  /**
+   * Validate and add a folder. Throws with a user-readable message when refused. Returns the stored path.
+   * `expiresAt` makes the share temporary; re-adding a folder replaces its limit (none = permanent).
+   */
+  addRoot(path: string, opts?: { expiresAt?: number | null }): string
   /** Remove a folder. Returns whether it was shared. */
   removeRoot(path: string): boolean
+  /** Remove folders whose time limit has passed. Returns the removed paths. */
+  sweepExpired(now?: number): string[]
 }
 
 export interface RootsOptions {
   /** Bridge/dorabot data dirs. A root may not be one of these or a parent of one. */
   protectedPaths?: () => string[]
   home?: string
+  now?: () => number
 }
 
 export function rootsFilePath(bridgeRoot: string): string {
@@ -47,28 +55,60 @@ export function createRootsStore(fileOrFn: string | (() => string), opts: RootsO
   const home = canon(opts.home ?? homedir())
   const fileOf = (): string => (typeof fileOrFn === 'string' ? fileOrFn : fileOrFn())
 
-  const read = (): string[] => {
+  const clock = opts.now ?? Date.now
+
+  interface State {
+    roots: string[]
+    expiry: Record<string, number>
+  }
+  const readState = (): State => {
     try {
-      const parsed = JSON.parse(readFileSync(fileOf(), 'utf8')) as { roots?: unknown }
-      if (!Array.isArray(parsed.roots)) return []
-      return parsed.roots.filter((r): r is string => typeof r === 'string' && isAbsolute(r))
+      const parsed = JSON.parse(readFileSync(fileOf(), 'utf8')) as { roots?: unknown; expiry?: unknown }
+      if (!Array.isArray(parsed.roots)) return { roots: [], expiry: {} }
+      const roots = parsed.roots.filter((r): r is string => typeof r === 'string' && isAbsolute(r))
+      const expiry: Record<string, number> = {}
+      if (parsed.expiry && typeof parsed.expiry === 'object' && !Array.isArray(parsed.expiry)) {
+        for (const [k, v] of Object.entries(parsed.expiry)) if (roots.includes(k) && typeof v === 'number' && Number.isFinite(v)) expiry[k] = v
+      }
+      return { roots, expiry }
     } catch {
-      return []
+      return { roots: [], expiry: {} }
     }
   }
 
-  const write = (roots: string[]): void => {
+  /** The policy check: a lapsed folder is not shared, whether or not the sweep has removed it yet. */
+  const lapsed = (st: State, at = clock()): ((r: string) => boolean) => (r) => (st.expiry[r] ?? Infinity) <= at
+  const read = (): string[] => {
+    const st = readState()
+    return st.roots.filter((r) => !lapsed(st)(r))
+  }
+
+  const write = (st: State): void => {
     const file = fileOf()
     mkdirSync(dirname(file), { recursive: true })
     const tmp = `${file}.${process.pid}.tmp`
-    writeFileSync(tmp, JSON.stringify({ roots }, null, 2), { mode: 0o600 })
+    const expiry = Object.fromEntries(Object.entries(st.expiry).filter(([k]) => st.roots.includes(k)))
+    writeFileSync(tmp, JSON.stringify({ roots: st.roots, ...(Object.keys(expiry).length ? { expiry } : {}) }, null, 2), { mode: 0o600 })
     renameSync(tmp, file)
   }
 
   return {
     listRoots: read,
 
-    addRoot(input: string): string {
+    listExpiry(): Record<string, number> {
+      const st = readState()
+      return Object.fromEntries(Object.entries(st.expiry).filter(([r, at]) => st.roots.includes(r) && at > clock()))
+    },
+
+    sweepExpired(now = clock()): string[] {
+      const st = readState()
+      const gone = st.roots.filter(lapsed(st, now))
+      if (gone.length === 0) return []
+      write({ roots: st.roots.filter((r) => !gone.includes(r)), expiry: st.expiry })
+      return gone
+    },
+
+    addRoot(input: string, addOpts: { expiresAt?: number | null } = {}): string {
       if (typeof input !== 'string' || !input.trim()) throw new Error('Folder path required.')
       const raw = input.trim()
       if (!isAbsolute(raw)) throw new Error('Folder path must be absolute.')
@@ -86,17 +126,23 @@ export function createRootsStore(fileOrFn: string | (() => string), opts: RootsO
         }
         if (isWithinOrEqual(real, p)) throw new Error('That folder is inside DoraBot or bridge data and cannot be shared.')
       }
-      const roots = read()
-      if (!roots.some((r) => lc(r) === lc(real))) write([...roots, real])
-      return real
+      const st = readState()
+      const existing = st.roots.find((r) => lc(r) === lc(real))
+      const path = existing ?? real
+      const roots = existing ? st.roots : [...st.roots, real]
+      const expiry = { ...st.expiry }
+      if (typeof addOpts.expiresAt === 'number') expiry[path] = addOpts.expiresAt
+      else delete expiry[path]
+      write({ roots, expiry })
+      return path
     },
 
     removeRoot(input: string): boolean {
       const real = lc(canon(input))
-      const roots = read()
-      const next = roots.filter((r) => lc(r) !== real && lc(r) !== lc(resolve(input)))
-      if (next.length === roots.length) return false
-      write(next)
+      const st = readState()
+      const next = st.roots.filter((r) => lc(r) !== real && lc(r) !== lc(resolve(input)))
+      if (next.length === st.roots.length) return false
+      write({ roots: next, expiry: st.expiry })
       return true
     },
   }

@@ -1,5 +1,5 @@
 import type { StoredSession } from '@dorabot-remote/protocol'
-import { useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
 import {
   MAX_IMAGES,
@@ -8,12 +8,16 @@ import {
   makeBrowserEncoder,
 } from '../lib/attachments.js'
 import { haptic, watchKeyboard } from '../lib/platform.js'
+import { canAutoSend, getDraftsForSession, removeDraft, saveDraft, type OfflineDraft } from '../lib/offline-drafts.js'
+import { endRunActivity, startRunActivity, updateRunActivity } from '../lib/appgroup.js'
+import { recordVoice, isVoiceSupported, type RecordingHandle } from '../lib/voice-transcription.js'
 import { PullToRefresh } from './PullToRefresh.js'
 import { ChatItemList, StatusLine } from './ChatItems.js'
 import { ApprovalCard, ElicitationCard, QuestionCard } from './Interrupts.js'
 import { ModelPicker } from './ModelPicker.js'
 import { usePinner } from './PinActions.js'
 import { useRename } from './RenameSheet.js'
+import { useSavedPromptsSheet } from './SavedPromptsSheet.js'
 import { Button, Dot, Screen, cx } from './ui.js'
 
 /**
@@ -36,6 +40,7 @@ export function SessionView({
   const conn = useConnection()
   const rename = useRename()
   const pinner = usePinner()
+  const savedPromptsSheet = useSavedPromptsSheet()
   const state = conn.getSession(sessionKey)
   const scrollRef = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
@@ -45,21 +50,84 @@ export function SessionView({
   const [error, setError] = useState<string | null>(null)
   const [photos, setPhotos] = useState<Array<{ id: number; file: File; url: string }>>([])
   const [loadingEarlier, setLoadingEarlier] = useState(false)
+  const [recording, setRecording] = useState(false)
+  const [voiceSupported, setVoiceSupported] = useState(false)
+  const [voiceText, setVoiceText] = useState('')
+  const [runSummary, setRunSummary] = useState<{ duration: number; cost?: number; toolCount: number } | null>(null)
+  const [pendingDrafts, setPendingDrafts] = useState<OfflineDraft[]>([])
   const photoId = useRef(0)
   const photosRef = useRef(photos)
   photosRef.current = photos
   const fileInput = useRef<HTMLInputElement>(null)
+  const recordingRef = useRef<RecordingHandle | null>(null)
   const earlierLoadedRef = useRef(0)
+  const runStartTimeRef = useRef<number | null>(null)
+  const previousStatusRef = useRef<string>('idle')
 
   useEffect(() => {
     void conn.openSession(sessionKey, session?.id)
     conn.clearAttention(sessionKey)
+    setPendingDrafts([])
+    if (conn.activeHostId) void getDraftsForSession(conn.activeHostId, sessionKey).then(setPendingDrafts)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionKey, session?.id])
+
+  useEffect(() => {
+    void isVoiceSupported().then(setVoiceSupported)
+  }, [])
 
   useEffect(() => watchKeyboard(setKeyboard), [])
   // Release the preview blobs when leaving the conversation.
   useEffect(() => () => photosRef.current.forEach((p) => URL.revokeObjectURL(p.url)), [])
+
+  // Track run start/end for run summary card
+  useEffect(() => {
+    const isRunning = state.status !== 'idle' && state.status !== 'thinking'
+    const wasRunning = previousStatusRef.current !== 'idle' && previousStatusRef.current !== 'thinking'
+
+    if (isRunning && !wasRunning) {
+      // Run started
+      runStartTimeRef.current = Date.now()
+      setRunSummary(null)
+    } else if (!isRunning && wasRunning) {
+      // Run ended
+      if (runStartTimeRef.current) {
+        const duration = Date.now() - runStartTimeRef.current
+        const toolCount = state.chatItems.filter((item) => (item as Record<string, unknown>).type === 'tool_use').length
+        const resultItem = state.chatItems.find((item) => (item as Record<string, unknown>).type === 'result') as Record<string, unknown> | undefined
+        const cost = resultItem?.cost as number | undefined
+        setRunSummary({ duration, cost, toolCount })
+        runStartTimeRef.current = null
+      }
+    }
+
+    previousStatusRef.current = state.status
+  }, [state.status, state.chatItems])
+
+  // Auto-send recent drafts for this Mac when the connection becomes ready. Older ones wait for a tap.
+  const sendDraft = useCallback(
+    async (draft: OfflineDraft): Promise<void> => {
+      if (draft.hostId !== conn.activeHostId) return
+      setSending(true)
+      try {
+        await conn.rpc('chat.send', buildChatSendParams({ prompt: draft.content, images: [], sessionKey: draft.sessionKey, chatId: session?.chatId }))
+        await removeDraft(draft.id)
+        setPendingDrafts((prev) => prev.filter((d) => d.id !== draft.id))
+        await haptic('light')
+      } catch {
+        // Stays queued; retried on the next connection.
+      } finally {
+        setSending(false)
+      }
+    },
+    [conn, session?.chatId],
+  )
+
+  useEffect(() => {
+    if (conn.state !== 'ready' || sending) return
+    const next = pendingDrafts.find((d) => canAutoSend(d))
+    if (next) void sendDraft(next)
+  }, [conn.state, pendingDrafts, sending, sendDraft])
 
   function addPhotos(e: ChangeEvent<HTMLInputElement>): void {
     const picked = Array.from(e.target.files ?? []).filter((f) => f.type.startsWith('image/') || f.type === '')
@@ -107,6 +175,34 @@ export function SessionView({
   }
 
   const busy = state.status !== 'idle'
+
+  // Live Activity while a run is active in the open session: started when it becomes busy,
+  // updated as the status changes, ended when it goes idle or the session is closed.
+  const runLabel = state.status === 'tool_use' ? (state.statusDetail ? `Running ${state.statusDetail}` : 'Running a tool') : state.status === 'responding' ? 'Writing' : 'Thinking'
+  const activityOn = useRef(false)
+  const activityName = session?.name || session?.senderName || prettyKey(sessionKey)
+  useEffect(() => {
+    if (conn.demo) return // the demo's made-up runs never reach the lock screen
+    if (busy && !activityOn.current) {
+      activityOn.current = true
+      void startRunActivity(activityName, runLabel, Date.now())
+    } else if (busy) {
+      void updateRunActivity(runLabel)
+    } else if (activityOn.current) {
+      activityOn.current = false
+      void endRunActivity()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, runLabel])
+  useEffect(
+    () => () => {
+      if (activityOn.current) {
+        activityOn.current = false
+        void endRunActivity()
+      }
+    },
+    [],
+  )
   const blocked = state.pendingApproval ?? state.pendingQuestion ?? state.pendingElicitation
 
   async function send(): Promise<void> {
@@ -128,11 +224,30 @@ export function SessionView({
       setPhotos([])
       await haptic('light')
     } catch (err) {
-      setError((err as Error).message)
+      const errMsg = (err as Error).message
+      // Queue draft if offline
+      if (conn.state !== 'ready') {
+        const result = conn.activeHostId && prompt ? await saveDraft(conn.activeHostId, sessionKey, prompt) : null
+        if (result) {
+          setPendingDrafts((prev) => [...prev, result])
+          setDraft('')
+          photos.forEach((p) => URL.revokeObjectURL(p.url))
+          setPhotos([])
+          setError(photos.length ? 'Message queued (photos are not queued) - will send when connected' : 'Message queued - will send when connected')
+        } else setError(errMsg)
+        await haptic('light')
+      } else {
+        setError(errMsg)
+      }
     } finally {
       encoder.dispose()
       setSending(false)
     }
+  }
+
+  async function removePendingDraft(draftId: string): Promise<void> {
+    await removeDraft(draftId)
+    setPendingDrafts((prev) => prev.filter((d) => d.id !== draftId))
   }
 
   async function interrupt(): Promise<void> {
@@ -147,6 +262,62 @@ export function SessionView({
         setError((err as Error).message)
       }
     }
+  }
+
+  async function startVoiceRecording(): Promise<void> {
+    if (recording || !voiceSupported) return
+    try {
+      setRecording(true)
+      setVoiceText('')
+      recordingRef.current = await recordVoice({
+        language: 'en-US',
+        partialResults: true,
+        onResult: (result) => {
+          setVoiceText(result.text)
+        },
+        onError: (error) => {
+          setError(error)
+          setRecording(false)
+        },
+      })
+    } catch (err) {
+      setError((err as Error).message)
+      setRecording(false)
+    }
+  }
+
+  async function stopVoiceRecording(): Promise<void> {
+    if (!recording || !recordingRef.current) return
+    try {
+      const text = await recordingRef.current.stop()
+      if (text) {
+        setDraft((prev) => prev + (prev && !prev.endsWith(' ') ? ' ' : '') + text)
+      }
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setRecording(false)
+      setVoiceText('')
+      recordingRef.current = null
+    }
+  }
+
+  const handleVoiceMouseDown = () => {
+    void startVoiceRecording()
+  }
+
+  const handleVoiceMouseUp = () => {
+    void stopVoiceRecording()
+  }
+
+  const handleVoiceTouchStart = (e: React.TouchEvent) => {
+    e.preventDefault()
+    void startVoiceRecording()
+  }
+
+  const handleVoiceTouchEnd = (e: React.TouchEvent) => {
+    e.preventDefault()
+    void stopVoiceRecording()
   }
 
   async function loadEarlier(): Promise<void> {
@@ -256,7 +427,38 @@ export function SessionView({
               Nothing here yet. Send a message to start.
             </div>
           ) : (
-            <ChatItemList items={state.chatItems} />
+            <>
+              <ChatItemList items={state.chatItems} />
+              {runSummary && (
+                <div className="mt-4 rounded-lg border border-mint-500/30 bg-mint-dim p-3">
+                  <div className="flex items-center justify-between">
+                    <div className="space-y-1.5">
+                      <p className="text-[13px] font-semibold text-mint-glow">Run complete</p>
+                      <div className="flex gap-4 text-[12px] text-ink-400">
+                        <span>
+                          Duration:{' '}
+                          {runSummary.duration < 1000
+                            ? `${runSummary.duration}ms`
+                            : `${(runSummary.duration / 1000).toFixed(1)}s`}
+                        </span>
+                        {runSummary.cost !== undefined && <span>Cost: ${runSummary.cost.toFixed(4)}</span>}
+                        <span>Tools: {runSummary.toolCount}</span>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => {
+                        setRunSummary(null)
+                        const textarea = scrollRef.current?.closest('[data-composer]')?.querySelector('textarea')
+                        if (textarea) textarea.focus()
+                      }}
+                      className="shrink-0 rounded-lg bg-mint-600 px-3 py-1.5 text-[12px] font-medium text-ink-950 active:opacity-80"
+                    >
+                      Continue
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
           )}
           <StatusLine status={state.status} detail={state.statusDetail} />
         </PullToRefresh>
@@ -306,8 +508,39 @@ export function SessionView({
           </div>
         )}
 
+        {pendingDrafts.length > 0 && (
+          <div className="shrink-0 border-t border-ink-700 bg-ink-850 px-3 py-2.5">
+            {pendingDrafts.map((draft) => (
+              <div key={draft.id} className="mb-1.5 flex items-center justify-between rounded-lg border border-ink-600 bg-ink-900 px-3 py-2 opacity-50 last:mb-0">
+                <span className="min-w-0 flex-1 truncate text-[13px] text-ink-300">
+                  {draft.content}
+                </span>
+                <div className="ml-2 flex shrink-0 items-center gap-2">
+                  {canAutoSend(draft) ? (
+                    <span className="text-[11px] text-ink-500">Will send when connected</span>
+                  ) : (
+                    <button onClick={() => void sendDraft(draft)} disabled={conn.state !== 'ready' || sending} className="text-[11px] text-ink-300 underline disabled:opacity-40">
+                      Old: send now
+                    </button>
+                  )}
+                  <button
+                    onClick={() => void removePendingDraft(draft.id)}
+                    aria-label="Remove draft"
+                    className="flex size-5 items-center justify-center text-ink-400 hover:text-ink-200"
+                  >
+                    <svg viewBox="0 0 24 24" className="size-4" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                      <path d="M6 6l12 12M18 6L6 18" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
         <div
           className="safe-bottom shrink-0 border-t border-ink-700 bg-ink-900 px-3 pt-2.5"
+          data-composer
         >
           {photos.length > 0 && (
             <div className="no-scrollbar mb-2 flex gap-2 overflow-x-auto pt-2">
@@ -342,6 +575,44 @@ export function SessionView({
                 <path d="M21 16l-5-5-8 8" />
               </svg>
             </button>
+            <button
+              onClick={() => savedPromptsSheet.open((text) => setDraft((prev) => prev + (prev && !prev.endsWith(' ') ? ' ' : '') + text))}
+              disabled={conn.state !== 'ready' || sending}
+              aria-label="Insert saved prompt"
+              className="flex size-11 shrink-0 items-center justify-center rounded-full bg-ink-800 text-ink-300 active:bg-ink-700 disabled:opacity-40"
+              title="Saved prompts"
+            >
+              <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="1" fill="currentColor" />
+                <circle cx="19" cy="12" r="1" fill="currentColor" />
+                <circle cx="5" cy="12" r="1" fill="currentColor" />
+              </svg>
+            </button>
+            {voiceSupported && (
+              <button
+                onMouseDown={handleVoiceMouseDown}
+                onMouseUp={handleVoiceMouseUp}
+                onTouchStart={handleVoiceTouchStart}
+                onTouchEnd={handleVoiceTouchEnd}
+                disabled={conn.state !== 'ready' || sending}
+                aria-label={recording ? 'Recording...' : 'Record voice'}
+                className={cx(
+                  'flex size-11 shrink-0 items-center justify-center rounded-full active:bg-ink-700 disabled:opacity-40 transition-colors',
+                  recording ? 'bg-rose-500 text-ink-950' : 'bg-ink-800 text-ink-300',
+                )}
+                title={recording ? 'Recording...' : 'Hold to record'}
+              >
+                <svg viewBox="0 0 24 24" className="size-5" fill={recording ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8" />
+                </svg>
+              </button>
+            )}
+            {voiceText && recording && (
+              <div className="flex-1 rounded-2xl border border-ink-600 bg-ink-850 px-4 py-2.5 text-[14px] text-ink-200 line-clamp-2">
+                {voiceText}
+              </div>
+            )}
             <textarea
               value={draft}
               onChange={(e) => setDraft(e.target.value)}

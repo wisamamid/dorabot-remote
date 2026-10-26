@@ -6,26 +6,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Unreleased
 
-Work in progress on branch dev/next:
+## Build 13 (TBD) - 2026-10-26
+
+Big security and convenience release: richer approvals, a lost-phone lockdown, Apple Watch, widgets, a share extension and an Android app.
 
 ### Added
 
-- Approval preview with risky-action flags (in progress)
-- Always-allow rules for trusted tools and commands (in progress)
-- Lost-phone lockdown: app self-wipe and remote disable (in progress)
-- Time-limited permissions: sessions expire after 1-24 hours (in progress)
-- New-network alerts when connecting from an unknown Wi-Fi or cellular provider (in progress)
-- Bridge keys in macOS Keychain for better key management (in progress)
-- Run summaries after long command execution (in progress)
-- Saved prompts for quick re-run of common requests (in progress)
-- Voice prompts to ask questions audibly (in progress)
-- Share-to-dorabot: system-wide share sheet action (in progress)
-- Home screen widget and Live Activity for quick status (in progress)
+- Approval preview: see the exact command, file edit or new file before you approve, with risky actions flagged in red and the reason spelled out
+- Always-allow rules for trusted tools and exact commands, which never cover anything flagged as risky
+- Lockdown and self-wipe: lock out all devices from the Mac, and the app erases itself after too many failed unlock attempts
+- Time-limited permissions: access for a device can expire after a set number of hours
+- New-network alerts when your Mac is reached from an unfamiliar network
+- Run summaries after a session finishes, with a summary card in the session view
+- Saved prompts you can re-run with one tap
+- Voice prompts: dictate a prompt instead of typing
+- Send to dorabot share extension: share text, links and files from any app into a session
+- Home screen widget and Live Activity showing what is waiting for you
+- Search across your sessions and messages
+- iPad keyboard shortcuts
+- Offline drafts: prompts you write without a connection are kept and sent when you are back online
+- Diff viewer for file edits
+- Light theme and adjustable text size
+- Apple Watch app to see and approve routine requests from your wrist
+- Android app (debug build for now)
+
+### Changed
+
+- Risky approvals now ask for Face ID every time, even if the app is already unlocked
+- The bridge keeps its keys in the macOS Keychain instead of a file (moved automatically on first start)
+- The relay rotates its access tokens regularly
+- The risk check now looks inside wrapped commands such as `bash -c`, `eval`, `$(...)` and backticks, and flags inline scripts (`python -c`, `node -e`, `perl -e`, `osascript -e`), downloaded or temporary scripts and anything piped into a shell
+- The Apple Watch follows the iPhone app lock: while the app is locked it shows tool names only and cannot approve or deny (it says "Unlock DoraBot on iPhone")
+
+### Fixed
+
+- Fixes from a full security review, including a confirmation step before a pair link is accepted
+- Wiping or unpairing now also clears the widget, Watch list, shared items, Live Activity and the Android key
 
 ### Security
 
-- Face ID for risky approvals (enhanced)
-- Relay token rotation to limit key exposure (in progress)
+- Face ID required for risky approvals
+- Bridge keys moved to the macOS Keychain
+- Relay token rotation
+- Pair links must be confirmed before they pair a device
+- Fuzz tests for bridge frames, protocol decoders, the risk classifier and the app's link and push parsers
 
 ## Build 12 (202610210655) - 2026-10-21
 

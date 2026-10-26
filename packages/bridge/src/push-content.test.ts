@@ -36,7 +36,8 @@ describe('buildPushContent', () => {
 
   it('elicitation uses its message; other events are not described', () => {
     expect(buildPushContent('agent.elicitation', { message: 'Enter token', sessionKey: 's' }, 'e1')).toMatchObject({ kind: 'question', body: 'Enter token' })
-    expect(buildPushContent('agent.result', {}, 'r')).toBeNull()
+    expect(buildPushContent('agent.status', {}, 'r')).toBeNull()
+    expect(buildPushContent('agent.tool_use', { sessionKey: 's', tool: 'Bash' }, 'r')).toBeNull()
   })
 })
 
@@ -135,13 +136,32 @@ describe('PushNotifier with a push key', () => {
     expect(pushKeyId('a')).toBe('ca978112')
   })
 
-  it('result pushes carry no enc even for keyed devices', async () => {
+  it('result pushes carry the run summary only inside enc, never in the clear', async () => {
+    const s = setup()
+    s.store.setPushToken(s.d.id, TOKEN, 'ios', 'production', KEY_B64)
+    s.store.setPushOnResult(s.d.id, true)
+    const t0 = Date.now() - 65_000
+    s.n.onGatewayEvent('agent.status', { sessionKey: 'k', timestamp: t0 })
+    s.n.onGatewayEvent('agent.tool_use', { sessionKey: 'k', tool: 'Bash' })
+    s.n.onGatewayEvent('agent.tool_use', { sessionKey: 'k', tool: 'Edit' })
+    await Promise.all(s.n.onGatewayEvent('agent.result', { sessionKey: 'k', result: 'All done, tests pass', usage: { totalCostUsd: 0.0412 }, timestamp: Date.now() }))
+    expect(s.calls[0]!.kind).toBe('result')
+    expect(s.calls[0]!.enc).toBeDefined()
+    const c = decryptPushContent(s.calls[0]!.enc!, parsePushKey(KEY_B64)!)!
+    expect(c).toMatchObject({ kind: 'result', title: 'Run finished', preview: 'All done, tests pass', cost: 0.0412, toolCalls: 2, fileCount: 1 })
+    expect(c.duration).toBeGreaterThanOrEqual(64)
+    expect(c.duration).toBeLessThanOrEqual(67)
+    expect(JSON.stringify(s.calls[0])).not.toContain('All done')
+  })
+
+  it('a result with no tracked run has no bogus duration', async () => {
     const s = setup()
     s.store.setPushToken(s.d.id, TOKEN, 'ios', 'production', KEY_B64)
     s.store.setPushOnResult(s.d.id, true)
     await Promise.all(s.n.onGatewayEvent('agent.result', { sessionKey: 'k' }))
-    expect(s.calls[0]!.kind).toBe('result')
-    expect(s.calls[0]!.enc).toBeUndefined()
+    const c = decryptPushContent(s.calls[0]!.enc!, parsePushKey(KEY_B64)!)!
+    expect(c.duration).toBeUndefined()
+    expect(c.body).toBe('Run completed')
   })
 
   it('drops the key on rotation, token clear and revoke', () => {

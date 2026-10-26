@@ -4,10 +4,17 @@ import type {
   PendingApproval,
   PendingElicitation,
   PendingQuestion,
+  RiskAssessment,
 } from '@dorabot-remote/protocol'
+import { assessRisk } from '@dorabot-remote/protocol'
 import { useEffect, useState, type ReactNode } from 'react'
+import { requireApprovalAuth, requireFreshAuth } from '../lib/approval-auth.js'
+import { alwaysAllowOffer, ruleParams } from '../lib/always-allow.js'
+import { useConnection } from '../lib/connection.js'
 import { QUESTION_TIMEOUT_MS } from '../lib/inbox.js'
 import { haptic } from '../lib/platform.js'
+import { AlwaysAllowSheet } from './AlwaysAllowSheet.js'
+import { RiskBadge, ToolInputPreview } from './ApprovalPreview.js'
 import { Button, Card, cx } from './ui.js'
 
 /**
@@ -28,28 +35,16 @@ import { Button, Card, cx } from './ui.js'
 // Tool approval
 // ---------------------------------------------------------------------------
 
-/** Pull out the bit of the input a person actually needs to judge. */
-function approvalDetail(approval: PendingApproval): { label: string; body: string } | null {
-  const input = approval.input ?? {}
-  if (typeof input.command === 'string') return { label: 'Command', body: input.command }
-  if (typeof input.file_path === 'string') {
-    const content = (input.content ?? input.new_string) as string | undefined
-    return { label: String(input.file_path), body: content ? String(content).slice(0, 4000) : '' }
-  }
-  if (typeof input.url === 'string') return { label: 'URL', body: input.url }
-  if (typeof input.prompt === 'string') return { label: 'Prompt', body: input.prompt }
-  const json = JSON.stringify(input, null, 2)
-  return json === '{}' ? null : { label: 'Input', body: json.slice(0, 4000) }
+/**
+ * Whether this approval is risky, per the shared classifier (packages/protocol/src/risk.ts)
+ * so the phone and bridge agree. Decides the badge, the second tap and the fresh Face ID.
+ */
+export function assessApproval(approval: PendingApproval): RiskAssessment {
+  return assessRisk(approval.toolName, approval.input, approval.blockedPath ? { blockedPath: approval.blockedPath } : {})
 }
 
-/**
- * Rough read of how much damage this could do, used only to decide whether
- * approving takes one tap or two. The patterns mirror the ones the gateway uses
- * to decide an approval was needed in the first place.
- */
 export function looksDestructive(approval: PendingApproval): boolean {
-  const cmd = typeof approval.input?.command === 'string' ? approval.input.command : ''
-  return /\b(rm|sudo|mkfs|dd\s+if=|shutdown|reboot|killall|pkill)\b|git\s+push|reset\s+--hard|--force/.test(cmd)
+  return assessApproval(approval).risky
 }
 
 /** The editable text for an approval: the command itself, or the input as JSON. */
@@ -81,8 +76,37 @@ export function ApprovalCard({
   const initial = editableInput(approval)
   const [draft, setDraft] = useState(initial.text)
   const [error, setError] = useState<string | null>(null)
-  const detail = approvalDetail(approval)
-  const risky = looksDestructive(approval)
+  const assessment = assessApproval(approval)
+  const risky = assessment.risky
+  const conn = useConnection()
+  // Never for risky inputs, never tool-wide for Bash (the offer is the exact command only).
+  const offer = conn.can('remote.rules.add') ? alwaysAllowOffer(approval.toolName, approval.input, approval.blockedPath ? { blockedPath: approval.blockedPath } : {}) : null
+  const [ruleSheet, setRuleSheet] = useState(false)
+  const [ruleBusy, setRuleBusy] = useState(false)
+  const [ruleError, setRuleError] = useState<string | null>(null)
+
+  /** Sheet confirmed: Face ID, save the rule on the Mac, then approve this request too. */
+  async function confirmAlways(): Promise<void> {
+    if (!offer) return
+    setRuleBusy(true)
+    setRuleError(null)
+    try {
+      const { nonce } = await conn.rpc<{ nonce: string }>('remote.rules.challenge')
+      const refused = await requireFreshAuth('Always allow this on your Mac')
+      if (refused) {
+        setRuleError(refused)
+        return
+      }
+      await conn.rpc('remote.rules.add', ruleParams(offer.spec, nonce))
+      await haptic('success')
+      setRuleSheet(false)
+      await onApprove()
+    } catch (err) {
+      setRuleError((err as Error).message)
+    } finally {
+      setRuleBusy(false)
+    }
+  }
 
   /** What will actually run: the edited input if the person changed it. */
   function modified(): Record<string, unknown> | undefined | null {
@@ -113,8 +137,15 @@ export function ApprovalCard({
       return
     }
     setBusy('approve')
-    await haptic('medium')
     try {
+      // Risky: Face ID / passcode right now, every time. Routine: straight through.
+      const refused = await requireApprovalAuth(approval.toolName, effective.input, approval.blockedPath ? { blockedPath: approval.blockedPath } : {})
+      if (refused) {
+        setError(refused)
+        setConfirming(false)
+        return
+      }
+      await haptic('medium')
       await onApprove(mod)
     } catch (err) {
       setError((err as Error).message)
@@ -148,6 +179,8 @@ export function ApprovalCard({
 
       {session && risky && <div className="text-[13px] font-semibold uppercase tracking-wider text-rose-glow">Needs a careful look</div>}
 
+      <RiskBadge risk={assessment} />
+
       {approval.title && <div className="text-[15px] leading-snug">{approval.title}</div>}
 
       {editing ? (
@@ -166,21 +199,7 @@ export function ApprovalCard({
           />
         </div>
       ) : (
-        detail && (
-          <div className="space-y-1">
-            <div className="font-mono text-[13px] uppercase tracking-wide text-ink-400">{detail.label}</div>
-            {detail.body && (
-              <pre
-                className={cx(
-                  'selectable scroll no-scrollbar whitespace-pre-wrap break-words rounded-lg bg-ink-950 p-3 font-mono text-[13px] leading-relaxed text-ink-200',
-                  compact ? 'max-h-40' : 'max-h-56',
-                )}
-              >
-                {detail.body}
-              </pre>
-            )}
-          </div>
-        )
+        <ToolInputPreview toolName={approval.toolName} input={approval.input ?? {}} compact={compact} />
       )}
 
       {approval.decisionReason && <div className="text-[13px] leading-relaxed text-ink-400">{approval.decisionReason}</div>}
@@ -231,6 +250,18 @@ export function ApprovalCard({
               {busy === 'approve' ? 'Approving…' : editing ? 'Approve edited' : 'Approve'}
             </Button>
           </div>
+          {offer && !editing && (
+            <button
+              onClick={() => {
+                setRuleError(null)
+                setRuleSheet(true)
+              }}
+              disabled={busy !== null}
+              className="tap w-full text-center text-[14px] font-medium text-ink-300 active:text-ink-100 disabled:opacity-40"
+            >
+              {offer.label}
+            </button>
+          )}
           <div className="flex items-center justify-between">
             <button
               onClick={() => {
@@ -254,6 +285,17 @@ export function ApprovalCard({
       )}
 
       {!compact && <p className="text-center text-[13px] text-ink-500">The run is paused until you answer.</p>}
+
+      {ruleSheet && offer && (
+        <AlwaysAllowSheet
+          offer={offer}
+          command={offer.spec.kind === 'exact' ? offer.spec.command : undefined}
+          busy={ruleBusy}
+          error={ruleError}
+          onConfirm={() => void confirmAlways()}
+          onCancel={() => setRuleSheet(false)}
+        />
+      )}
     </Card>
   )
 }

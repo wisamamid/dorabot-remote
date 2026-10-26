@@ -134,3 +134,11 @@ describe('schedule scope and scope validation', () => {
     expect(isMethodAllowed('remote.roots', ['chat'])).toBe(false)
   })
 })
+describe('rules policy', () => {
+  it('gates remote.rules.* on the approvals scope', () => {
+    for (const m of ['remote.rules.add', 'remote.rules.list', 'remote.rules.remove']) {
+      expect(isMethodAllowed(m, ['approvals'])).toBe(true)
+      expect(isMethodAllowed(m, ['sessions', 'chat'])).toBe(false)
+    }
+  })
+})

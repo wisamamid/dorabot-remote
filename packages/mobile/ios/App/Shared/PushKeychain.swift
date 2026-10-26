@@ -95,11 +95,13 @@ enum PushKeychain {
         }
     }
 
+    typealias Entry = (kid: String, key: Data)
+
     /// The key whose kid matches first, then every other stored key (older pushes carry no kid).
-    static func candidates(kid: String?) -> [Data] {
+    static func candidates(kid: String?) -> [Entry] {
         let all = readAll().filter { $0.key.count == 32 }
-        guard let kid = kid, !kid.isEmpty else { return all.map { $0.key } }
-        return all.filter { $0.kid == kid }.map { $0.key } + all.filter { $0.kid != kid }.map { $0.key }
+        guard let kid = kid, !kid.isEmpty else { return all }
+        return all.filter { $0.kid == kid } + all.filter { $0.kid != kid }
     }
 
     @discardableResult

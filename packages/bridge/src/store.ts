@@ -26,8 +26,10 @@ export interface DeviceRecord {
   /** Paired, but the user has not approved it on the Mac yet. Must never act. */
   pending?: boolean
   pendingSince?: number | null
-  /** Set when the bridge (not the user) revoked it, e.g. 'expired'. */
+  /** Set when the bridge (not the user) revoked it, e.g. 'expired', 'lost', 'lockdown'. */
   revokedReason?: string | null
+  /** Still-running time limits: scope -> epoch ms it lapses. A lapsed scope is already absent from `scopes`. */
+  scopeExpiry?: Record<string, number>
 }
 
 export interface AuditEntry {
@@ -70,6 +72,15 @@ export interface ScopeRequest {
 export interface PinRecord {
   id: string
   pinnedAt: number
+}
+
+export interface AllowRuleRecord {
+  id: string
+  kind: 'tool' | 'exact'
+  toolName: string
+  command: string | null
+  createdAt: number
+  createdBy: string | null
 }
 
 export interface StoredEvent {
@@ -159,6 +170,25 @@ export class Store {
         pinned_at INTEGER NOT NULL
       );
 
+      -- Bridge-managed auto-approve rules ("always allow"). Never touches dorabot's own config.
+      CREATE TABLE IF NOT EXISTS allow_rules (
+        id         TEXT PRIMARY KEY,
+        kind       TEXT NOT NULL,
+        tool_name  TEXT NOT NULL,
+        command    TEXT,
+        created_at INTEGER NOT NULL,
+        created_by TEXT
+      );
+
+      -- Coarse network keys each device has connected from (see network-class.ts), for new-network alerts.
+      CREATE TABLE IF NOT EXISTS device_networks (
+        device_id  TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        net_key    TEXT NOT NULL,
+        first_seen INTEGER NOT NULL,
+        last_seen  INTEGER NOT NULL,
+        PRIMARY KEY (device_id, net_key)
+      );
+
       CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -197,6 +227,7 @@ export class Store {
     if (!cols.includes('pending')) this.db.exec('ALTER TABLE devices ADD COLUMN pending INTEGER NOT NULL DEFAULT 0')
     if (!cols.includes('pending_since')) this.db.exec('ALTER TABLE devices ADD COLUMN pending_since INTEGER')
     if (!cols.includes('revoked_reason')) this.db.exec('ALTER TABLE devices ADD COLUMN revoked_reason TEXT')
+    if (!cols.includes('scope_expiry')) this.db.exec('ALTER TABLE devices ADD COLUMN scope_expiry TEXT')
     if (!cols.includes('push_on_result')) this.db.exec('ALTER TABLE devices ADD COLUMN push_on_result INTEGER NOT NULL DEFAULT 0')
   }
 
@@ -245,6 +276,41 @@ export class Store {
     return this.db.prepare('DELETE FROM pins WHERE id = ?').run(id).changes > 0
   }
 
+  // -------------------------------------------------------------------------
+  // Always-allow rules
+  // -------------------------------------------------------------------------
+
+  listRules(): AllowRuleRecord[] {
+    const rows = this.db.prepare('SELECT * FROM allow_rules ORDER BY created_at DESC, id ASC').all() as Record<string, unknown>[]
+    return rows.map((r) => ({
+      id: String(r.id),
+      kind: r.kind === 'exact' ? 'exact' : 'tool',
+      toolName: String(r.tool_name),
+      command: (r.command as string | null) ?? null,
+      createdAt: Number(r.created_at),
+      createdBy: (r.created_by as string | null) ?? null,
+    }))
+  }
+
+  /** Adds a rule, or returns the existing identical one. */
+  addRule(rule: { kind: 'tool' | 'exact'; toolName: string; command?: string | null; createdBy?: string | null }): AllowRuleRecord {
+    const command = rule.kind === 'exact' ? (rule.command ?? '') : null
+    const dupe = this.listRules().find((r) => r.kind === rule.kind && r.toolName === rule.toolName && r.command === command)
+    if (dupe) return dupe
+    const id = randomBytes(5).toString('hex')
+    this.db
+      .prepare('INSERT INTO allow_rules (id, kind, tool_name, command, created_at, created_by) VALUES (?,?,?,?,?,?)')
+      .run(id, rule.kind, rule.toolName, command, Date.now(), rule.createdBy ?? null)
+    return this.listRules().find((r) => r.id === id)!
+  }
+
+  removeRule(id: string): AllowRuleRecord | null {
+    const rule = this.listRules().find((r) => r.id === id) ?? null
+    if (!rule) return null
+    this.db.prepare('DELETE FROM allow_rules WHERE id = ?').run(id)
+    return rule
+  }
+
   /** Drop pins whose id is not in `keep`. Returns how many were removed. */
   prunePins(keep: ReadonlySet<string>): number {
     let removed = 0
@@ -289,6 +355,11 @@ export class Store {
     return JSON.parse(row.scopes) as Scope[]
   }
 
+  /** Cancel every pairing code that has not been used yet (lockdown). Returns how many. */
+  cancelOpenPairings(): number {
+    return this.db.prepare('DELETE FROM pairings WHERE used_at IS NULL').run().changes as number
+  }
+
   purgeExpiredPairings(): void {
     this.db.prepare('DELETE FROM pairings WHERE expires_at < ?').run(Date.now() - 60 * 60 * 1000)
   }
@@ -325,12 +396,20 @@ export class Store {
 
   private hydrate(row: Record<string, unknown> | undefined): DeviceRecord | null {
     if (!row) return null
+    // The policy check: a scope whose time limit has passed is not granted, whether or not the sweep has
+    // cleaned the row up yet.
+    const now = Date.now()
+    const expiry = parseExpiry(row.scope_expiry)
+    const live: Record<string, number> = {}
+    for (const [scope, at] of Object.entries(expiry)) if (at > now) live[scope] = at
+    const scopes = (JSON.parse(row.scopes as string) as Scope[]).filter((s) => !(s in expiry) || (expiry[s] as number) > now)
     return {
       id: row.id as string,
       name: row.name as string,
       platform: row.platform as string,
       publicKey: row.public_key as string,
-      scopes: JSON.parse(row.scopes as string) as Scope[],
+      scopes,
+      scopeExpiry: live,
       createdAt: row.created_at as number,
       lastSeenAt: (row.last_seen_at as number | null) ?? null,
       revoked: Boolean(row.revoked),
@@ -388,6 +467,25 @@ export class Store {
     return stale
   }
 
+  /**
+   * Lost phone: revoke EVERY device at once (push token and key dropped by setRevoked), delete the ones still
+   * waiting for approval, and deny open permission requests. Returns what changed so callers can audit it.
+   */
+  lockdown(reason = 'lockdown'): { revoked: DeviceRecord[]; rejected: DeviceRecord[] } {
+    const revoked: DeviceRecord[] = []
+    const rejected: DeviceRecord[] = []
+    for (const d of this.listDevices()) {
+      if (d.pending) {
+        if (this.rejectDevice(d.id)) rejected.push(d)
+      } else if (!d.revoked) {
+        this.setRevoked(d.id, true, reason)
+        revoked.push(d)
+      }
+    }
+    this.db.prepare("UPDATE scope_requests SET status = 'denied' WHERE status = 'pending'").run()
+    return { revoked, rejected }
+  }
+
   /** Revoke active devices unseen for maxAgeMs (never-connected devices count from creation). */
   expireStaleDevices(maxAgeMs: number, now = Date.now()): DeviceRecord[] {
     const stale = this.listDevices().filter(
@@ -395,6 +493,30 @@ export class Store {
     )
     for (const d of stale) this.setRevoked(d.id, true, 'expired')
     return stale
+  }
+
+  // -------------------------------------------------------------------------
+  // Networks a device has connected from
+  // -------------------------------------------------------------------------
+
+  /**
+   * Note that a device connected from a network. 'baseline' is the first network ever seen for the device
+   * (nothing to compare against, so no alert), 'new' is one it has not used before, 'known' is a repeat.
+   */
+  recordNetwork(deviceId: string, key: string, now = Date.now()): 'baseline' | 'new' | 'known' {
+    const had = this.db.prepare('SELECT COUNT(*) AS n FROM device_networks WHERE device_id = ?').get(deviceId) as { n: number }
+    const upd = this.db.prepare('UPDATE device_networks SET last_seen = ? WHERE device_id = ? AND net_key = ?').run(now, deviceId, key)
+    if (upd.changes > 0) return 'known'
+    this.db.prepare('INSERT INTO device_networks (device_id, net_key, first_seen, last_seen) VALUES (?,?,?,?)').run(deviceId, key, now, now)
+    // Bounded: forget the least recently used beyond 50.
+    this.db
+      .prepare('DELETE FROM device_networks WHERE device_id = ? AND net_key NOT IN (SELECT net_key FROM device_networks WHERE device_id = ? ORDER BY last_seen DESC LIMIT 50)')
+      .run(deviceId, deviceId)
+    return Number(had.n) === 0 ? 'baseline' : 'new'
+  }
+
+  listNetworks(deviceId: string): string[] {
+    return (this.db.prepare('SELECT net_key FROM device_networks WHERE device_id = ? ORDER BY first_seen').all(deviceId) as Array<{ net_key: string }>).map((r) => r.net_key)
   }
 
   // -------------------------------------------------------------------------
@@ -458,8 +580,43 @@ export class Store {
     }))
   }
 
-  setScopes(id: string, scopes: Scope[]): boolean {
-    return this.db.prepare('UPDATE devices SET scopes = ? WHERE id = ?').run(JSON.stringify(scopes), id).changes > 0
+  /**
+   * Replace a device's scopes. `expiryPatch` sets (epoch ms) or clears (null) time limits per scope; limits of
+   * scopes that are no longer granted are dropped, and the rest are kept.
+   */
+  setScopes(id: string, scopes: Scope[], expiryPatch: Record<string, number | null> = {}): boolean {
+    const row = this.db.prepare('SELECT scope_expiry FROM devices WHERE id = ?').get(id) as { scope_expiry: string | null } | undefined
+    if (!row) return false
+    const expiry = parseExpiry(row.scope_expiry)
+    for (const [scope, at] of Object.entries(expiryPatch)) {
+      if (at === null) delete expiry[scope]
+      else expiry[scope] = at
+    }
+    for (const scope of Object.keys(expiry)) if (!scopes.includes(scope as Scope)) delete expiry[scope]
+    const json = Object.keys(expiry).length ? JSON.stringify(expiry) : null
+    return this.db.prepare('UPDATE devices SET scopes = ?, scope_expiry = ? WHERE id = ?').run(JSON.stringify(scopes), json, id).changes > 0
+  }
+
+  /**
+   * The sweep: physically remove scopes whose time limit has passed. Returns what lapsed so the caller can
+   * audit it and tell live connections. (Enforcement itself does not wait for this: see hydrate.)
+   */
+  expireScopes(now = Date.now()): Array<{ device: DeviceRecord; scopes: Scope[] }> {
+    const out: Array<{ device: DeviceRecord; scopes: Scope[] }> = []
+    const rows = this.db.prepare('SELECT id, scopes, scope_expiry FROM devices WHERE scope_expiry IS NOT NULL').all() as Array<{ id: string; scopes: string; scope_expiry: string }>
+    for (const r of rows) {
+      const expiry = parseExpiry(r.scope_expiry)
+      const lapsed = Object.keys(expiry).filter((s) => (expiry[s] as number) <= now)
+      if (lapsed.length === 0) continue
+      const scopes = (JSON.parse(r.scopes) as Scope[]).filter((s) => !lapsed.includes(s))
+      for (const s of lapsed) delete expiry[s]
+      this.db
+        .prepare('UPDATE devices SET scopes = ?, scope_expiry = ? WHERE id = ?')
+        .run(JSON.stringify(scopes), Object.keys(expiry).length ? JSON.stringify(expiry) : null, r.id)
+      const device = this.getDevice(r.id)
+      if (device) out.push({ device, scopes: lapsed as Scope[] })
+    }
+    return out
   }
 
   /** Every (re-)registration replaces the key, so passing none drops the old one (rotation); clearing the token drops it too. */
@@ -538,7 +695,7 @@ export class Store {
   }
 
   /** Approve a pending request and add the scope to the device in one step. */
-  resolveScopeRequest(id: string, approve: boolean): { device: DeviceRecord; scope: Scope } | null {
+  resolveScopeRequest(id: string, approve: boolean, expiresAt: number | null = null): { device: DeviceRecord; scope: Scope } | null {
     const row = this.db.prepare("SELECT * FROM scope_requests WHERE id = ? AND status = 'pending'").get(id) as
       | Record<string, unknown>
       | undefined
@@ -547,10 +704,10 @@ export class Store {
     const device = this.getDevice(row.device_id as string)
     if (!device) return null
     const scope = row.scope as Scope
-    if (approve && !device.scopes.includes(scope)) {
-      const next = [...device.scopes, scope]
-      this.setScopes(device.id, next)
-      device.scopes = next
+    if (approve) {
+      const next = device.scopes.includes(scope) ? device.scopes : [...device.scopes, scope]
+      this.setScopes(device.id, next, { [scope]: expiresAt })
+      return { device: this.getDevice(device.id) ?? device, scope }
     }
     return { device, scope }
   }
@@ -612,8 +769,22 @@ export class Store {
       revoked: device.revoked,
       fingerprint,
       ...(device.pending ? { pending: true } : {}),
+      ...(device.scopeExpiry && Object.keys(device.scopeExpiry).length ? { scopeExpiry: device.scopeExpiry } : {}),
       ...(device.revokedReason ? { revokedReason: device.revokedReason } : {}),
     }
+  }
+}
+
+function parseExpiry(raw: unknown): Record<string, number> {
+  if (typeof raw !== 'string' || !raw) return {}
+  try {
+    const v = JSON.parse(raw) as unknown
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return {}
+    const out: Record<string, number> = {}
+    for (const [k, at] of Object.entries(v)) if (typeof at === 'number' && Number.isFinite(at)) out[k] = at
+    return out
+  } catch {
+    return {}
   }
 }
 

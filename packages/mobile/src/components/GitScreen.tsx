@@ -1,9 +1,11 @@
-import { useState, type ReactNode } from 'react'
+import { lazy, Suspense, useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
 import { haptic } from '../lib/platform.js'
 import { useRpc } from '../lib/useRpc.js'
 import { LockedControl, ScopeGate } from './ScopeGate.js'
 import { Button, Chip, Empty, ErrorNote, Layer, Row, Screen, SectionTitle, Segmented, Spinner, TextField, timeAgo } from './ui.js'
+
+const DiffViewer = lazy(() => import('./DiffViewer.js'))
 
 interface GitFile {
   path: string
@@ -232,24 +234,9 @@ function DiffView({ root, file, onClose }: { root: string; file: GitFile; onClos
       ) : text.trim() === '' ? (
         <Empty title="No textual diff" body={file.status === '?' ? 'This file is not tracked yet.' : 'Nothing to show for this file.'} />
       ) : (
-        <pre className="scroll selectable h-full overflow-auto px-3 py-3 font-mono text-[13px] leading-[1.5]">
-          {text.split('\n').map((l, i) => (
-            <div
-              key={i}
-              className={
-                l.startsWith('+') && !l.startsWith('+++')
-                  ? 'bg-mint-900/50 text-mint-500'
-                  : l.startsWith('-') && !l.startsWith('---')
-                    ? 'bg-rose-dim text-rose-glow'
-                    : l.startsWith('@@')
-                      ? 'text-amber-glow'
-                      : 'text-ink-300'
-              }
-            >
-              {l || ' '}
-            </div>
-          ))}
-        </pre>
+        <Suspense fallback={<Spinner className="mx-auto mt-10 size-6" />}>
+          <DiffViewer filename={file.path} diffText={text} />
+        </Suspense>
       )}
     </Screen>
   )

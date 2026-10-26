@@ -1,6 +1,7 @@
 import { lazy, Suspense, useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
 import { useRpc } from '../lib/useRpc.js'
+import { formatLeft, soonest } from '../lib/expiry.js'
 import { ScopeGate } from './ScopeGate.js'
 import { Button, Empty, ErrorNote, Layer, Row, Screen, Spinner, TextField } from './ui.js'
 
@@ -37,6 +38,9 @@ function Browser({ onUseAsRepo }: { onUseAsRepo?: (dir: string) => void }): Reac
   const [searching, setSearching] = useState(false)
   const list = useRpc<Entry[]>('fs.list', { path: dir })
   const canSearch = conn.can('search.files')
+  // Folders the Mac shared for a limited time: say how long is left (the list is only a hint, never required).
+  const roots = useRpc<{ roots: string[]; expiry?: Record<string, number> }>('remote.roots')
+  const ending = soonest(roots.data?.expiry, Date.now())
 
   const crumbs = dir === '.' ? ['.'] : dir.split('/').filter(Boolean)
   const goCrumb = (i: number): void => {
@@ -72,6 +76,11 @@ function Browser({ onUseAsRepo }: { onUseAsRepo?: (dir: string) => void }): Reac
             )}
           </div>
           <div className="scroll min-h-0 flex-1 space-y-1.5 px-3 py-2 pb-4">
+            {ending && (
+              <div role="status" className="rounded-lg bg-ink-850 px-3 py-2 text-[13px] text-amber-glow">
+                Temporary access to {ending.key.split('/').filter(Boolean).at(-1) ?? ending.key}: {formatLeft(ending.at - Date.now())} left
+              </div>
+            )}
             <ErrorNote error={list.error} onRetry={() => void list.reload()} />
             {list.loading && !list.data ? (
               <div className="flex h-40 items-center justify-center">

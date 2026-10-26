@@ -14,6 +14,7 @@ import {
   toB64,
 } from '@dorabot-remote/protocol'
 import type { KeyPair, SigningKeyPair, Sodium } from '@dorabot-remote/protocol'
+import { createSecretIO, loadSecret, type SecretIO } from './keychain.js'
 
 export const BRIDGE_VERSION = '0.1.0'
 
@@ -101,15 +102,30 @@ export function saveSettings(paths: BridgePaths, settings: BridgeSettings): void
  * This key is what the QR advertises and what every paired device authenticates
  * against, so it must survive restarts and must not leave the machine.
  */
-export function loadIdentity(_sodium: Sodium | null, paths: BridgePaths): KeyPair {
-  ensureDir(paths.identity)
-  if (!existsSync(paths.identity)) {
-    const kp = generateIdentity()
-    writeFileSync(paths.identity, JSON.stringify(identityToB64(null, kp), null, 2), { mode: 0o600 })
-    return kp
+export function loadIdentity(_sodium: Sodium | null, paths: BridgePaths, io: SecretIO = createSecretIO(paths.root, warnToStderr)): KeyPair {
+  const text = loadSecret(
+    {
+      name: 'host-identity',
+      file: paths.identity,
+      create: () => JSON.stringify(identityToB64(null, generateIdentity()), null, 2),
+      valid: validKeyJson,
+    },
+    io,
+  )
+  return identityFromB64(null, JSON.parse(text) as { publicKey: string; privateKey: string })
+}
+
+function warnToStderr(msg: string): void {
+  process.stderr.write(`${msg}\n`)
+}
+
+function validKeyJson(text: string): boolean {
+  try {
+    const v = JSON.parse(text) as { publicKey?: unknown; privateKey?: unknown }
+    return typeof v.publicKey === 'string' && typeof v.privateKey === 'string'
+  } catch {
+    return false
   }
-  const raw = JSON.parse(readFileSync(paths.identity, 'utf8')) as { publicKey: string; privateKey: string }
-  return identityFromB64(null, raw)
 }
 
 /**
@@ -118,18 +134,20 @@ export function loadIdentity(_sodium: Sodium | null, paths: BridgePaths): KeyPai
  * paired phone trusts) must not change, and adding a key beside it keeps existing
  * pairings working. The relay id is derived from this key's public half.
  */
-export function loadSigningKey(paths: BridgePaths): SigningKeyPair {
-  ensureDir(paths.signingKey)
-  if (!existsSync(paths.signingKey)) {
-    const kp = generateSigningKey()
-    writeFileSync(
-      paths.signingKey,
-      JSON.stringify({ publicKey: toB64(null, kp.publicKey), privateKey: toB64(null, kp.privateKey) }, null, 2),
-      { mode: 0o600 },
-    )
-    return kp
-  }
-  const raw = JSON.parse(readFileSync(paths.signingKey, 'utf8')) as { publicKey: string; privateKey: string }
+export function loadSigningKey(paths: BridgePaths, io: SecretIO = createSecretIO(paths.root, warnToStderr)): SigningKeyPair {
+  const text = loadSecret(
+    {
+      name: 'signing-key',
+      file: paths.signingKey,
+      create: () => {
+        const kp = generateSigningKey()
+        return JSON.stringify({ publicKey: toB64(null, kp.publicKey), privateKey: toB64(null, kp.privateKey) }, null, 2)
+      },
+      valid: validKeyJson,
+    },
+    io,
+  )
+  const raw = JSON.parse(text) as { publicKey: string; privateKey: string }
   return { publicKey: fromB64(null, raw.publicKey), privateKey: fromB64(null, raw.privateKey) }
 }
 

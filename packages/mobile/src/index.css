@@ -41,6 +41,10 @@
     color-scheme: dark;
   }
 
+  :root.light-theme {
+    color-scheme: light;
+  }
+
   html,
   body,
   #root {

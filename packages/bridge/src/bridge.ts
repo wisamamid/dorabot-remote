@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http'
 import { execFile } from 'node:child_process'
 import type { Socket } from 'node:net'
@@ -57,6 +57,8 @@ import { RelayClient, type RelayState } from './relay-client.js'
 const RELAY_ACKED_KEY = 'relay.tokensAcked'
 const RELAY_ENFORCE_KEY = 'relay.enforce'
 const RELAY_SINCE_KEY = 'relay.accessSince'
+const RELAY_TOKSTATE_KEY = 'relay.tokState'
+const ROTATION_SWEEP_MS = 60 * 60 * 1000
 /** Enforcement turns on at the latest this long after the first start with tokens, even if an old phone never reconnected. */
 export const RELAY_ENFORCE_AFTER_MS = 14 * 24 * 60 * 60 * 1000
 import { CONTROL_PAGE } from './control-page.js'
@@ -64,8 +66,13 @@ import { CompatChecker } from './compat-check.js'
 import { GatewayClient } from './gateway-client.js'
 import { HealthAlerts } from './health-alerts.js'
 import { applyEventToSnapshots } from './snapshot-state.js'
+import { MAX_RULES, describeRule, findMatchingRule, parseNewRule } from './rules.js'
+import { MAX_GRANT_MS, MIN_GRANT_MS, formatRemaining } from './duration.js'
+import { classifyNetwork } from './network-class.js'
+import { ackCurrent, dueForRotation, initialState, pruneExpired, rotate, tokenSubject, validGens, type TokState } from './relay-rotation.js'
 import { Store, type AuditEntry, type DeviceRecord } from './store.js'
 import { isControlAuthorized, loadControlSecret, sessionSetCookie } from './control-auth.js'
+import { createSecretIO, type SecretIO } from './keychain.js'
 
 const SESSION_KEY_RE = /^[^:\s]+:[^:\s]+:\S+$/
 const MAX_PINS = 200
@@ -82,6 +89,8 @@ export const PENDING_TTL_MS = 10 * 60 * 1000
 /** Devices unseen this long are revoked automatically. */
 export const DEVICE_EXPIRY_MS = 90 * 24 * 60 * 60 * 1000
 const PENDING_SWEEP_MS = 30_000
+/** Time-limited scopes and folders are enforced on every read; this sweep makes them official (audit + phone notice). */
+const GRANT_SWEEP_MS = 10_000
 const EXPIRY_SWEEP_MS = 24 * 60 * 60 * 1000
 
 /** Socket limits (M3). */
@@ -135,7 +144,12 @@ export interface BridgeOptions {
   log?: (msg: string) => void
   /** Desktop notification hook (pending pairing). Defaults to osascript on macOS. */
   notify?: (title: string, body: string) => void
+  /** Where the host identity, signing key and control secret live (login Keychain by default on macOS). */
+  secretIO?: SecretIO
 }
+
+/** How long a rule-add nonce stays valid after it is issued. */
+const RULE_CHALLENGE_MS = 60_000
 
 export class Bridge implements ConnectionHost {
   sodium!: Sodium
@@ -169,8 +183,11 @@ export class Bridge implements ConnectionHost {
   readonly logLines: string[] = []
   private controlSecret = ''
   private pendingTimer: NodeJS.Timeout | null = null
+  private grantTimer: NodeJS.Timeout | null = null
+  private rotationTimer: NodeJS.Timeout | null = null
   private expiryTimer: NodeJS.Timeout | null = null
   private readonly notify: (title: string, body: string) => void
+  private readonly secretIO: SecretIO | undefined
   private readonly transports = new WeakMap<DeviceConnection, 'relay' | 'direct'>()
   private unauthTotal = 0
   private unauthByIp = new Map<string, number>()
@@ -188,6 +205,7 @@ export class Bridge implements ConnectionHost {
 
   constructor(opts: BridgeOptions) {
     this.notify = opts.notify ?? defaultNotify
+    this.secretIO = opts.secretIO
     this.paths = opts.paths
     this.settings = opts.settings
     this.store = new Store(opts.paths.db)
@@ -209,11 +227,12 @@ export class Bridge implements ConnectionHost {
   // -------------------------------------------------------------------------
 
   async start(): Promise<void> {
-    this.controlSecret = loadControlSecret(this.paths.root)
+    const secretIO = this.secretIO ?? createSecretIO(this.paths.root, (m) => this.log(m))
+    this.controlSecret = loadControlSecret(this.paths.root, secretIO)
     this.sodium = await sodiumReady()
-    this.hostIdentity = loadIdentity(this.sodium, this.paths)
+    this.hostIdentity = loadIdentity(this.sodium, this.paths, secretIO)
     if (this.settings.relay.enabled && isRelayUrlConfigured(this.settings.relay.url)) {
-      const key = loadSigningKey(this.paths)
+      const key = loadSigningKey(this.paths, secretIO)
       this.relayInfo = { u: this.settings.relay.url.replace(/\/+$/, ''), i: relayIdFromPublicKey(key.publicKey) }
       this.relaySecret = new Uint8Array(createHash('sha256').update('dorabot-relay-token-secret/v1').update(key.privateKey).digest())
       this.pusher = new PushNotifier({
@@ -294,6 +313,12 @@ export class Bridge implements ConnectionHost {
 
     this.sweepPending()
     this.sweepExpiredDevices()
+    this.sweepExpiredGrants()
+    this.grantTimer = setInterval(() => this.sweepExpiredGrants(), GRANT_SWEEP_MS)
+    if (this.relaySecret) {
+      this.sweepRelayTokens()
+      this.rotationTimer = setInterval(() => this.sweepRelayTokens(), ROTATION_SWEEP_MS)
+    }
     this.pendingTimer = setInterval(() => this.sweepPending(), PENDING_SWEEP_MS)
     this.expiryTimer = setInterval(() => this.sweepExpiredDevices(), EXPIRY_SWEEP_MS)
 
@@ -312,6 +337,8 @@ export class Bridge implements ConnectionHost {
     if (this.deviceTimer) clearInterval(this.deviceTimer)
     if (this.idleTimer) clearInterval(this.idleTimer)
     if (this.pendingTimer) clearInterval(this.pendingTimer)
+    if (this.grantTimer) clearInterval(this.grantTimer)
+    if (this.rotationTimer) clearInterval(this.rotationTimer)
     if (this.expiryTimer) clearInterval(this.expiryTimer)
     for (const c of this.connections) c.close('bridge shutting down')
     this.healthAlerts?.stop()
@@ -358,6 +385,32 @@ export class Bridge implements ConnectionHost {
     return gone.length
   }
 
+  /**
+   * Time-limited grants: take back scopes and shared folders whose time is up, audit each, and tell live
+   * phones. (Enforcement does not wait for this: the store and the roots list already ignore lapsed grants.)
+   */
+  sweepExpiredGrants(now = Date.now()): number {
+    let n = 0
+    for (const { device, scopes } of this.store.expireScopes(now)) {
+      for (const scope of scopes) {
+        this.auditLog.record({ deviceId: device.id, deviceName: device.name, action: 'scope_expire', summary: `scope=${scope} time limit ended`, transport: 'mac' })
+        this.log(`"${scope}" for "${device.name}" expired`)
+        n++
+      }
+      for (const c of this.connections) {
+        if (c.device?.id !== device.id) continue
+        c.device = device
+        c.forward('remote.scopes_changed', { scopes: device.scopes, expiry: device.scopeExpiry ?? {}, granted: null }, undefined, null)
+      }
+    }
+    for (const path of this.roots.sweepExpired(now)) {
+      this.auditLog.record({ action: 'folder_expire', summary: path.slice(0, 150), transport: 'mac' })
+      this.log(`shared folder ${path} expired`)
+      n++
+    }
+    return n
+  }
+
   /** Revoke devices unseen for 90 days. */
   sweepExpiredDevices(now = Date.now()): number {
     const gone = this.store.expireStaleDevices(DEVICE_EXPIRY_MS, now)
@@ -367,6 +420,38 @@ export class Bridge implements ConnectionHost {
       for (const c of this.connections) if (c.device?.id === d.id) c.close('revoked')
     }
     return gone.length
+  }
+
+  /**
+   * Lost phone, all devices: revoke everything now (push keys dropped, relay token hashes dropped via the relay
+   * sync, live sockets closed), delete unapproved pairings. Every device is audit-logged, plus one summary entry.
+   */
+  lockdown(transport = 'local'): { revoked: number; rejected: number } {
+    const { revoked, rejected } = this.store.lockdown('lockdown')
+    for (const d of revoked) this.auditLog.record({ deviceId: d.id, deviceName: d.name, action: 'revoke', summary: 'lockdown: all devices revoked', transport })
+    for (const d of rejected) this.auditLog.record({ deviceId: d.id, deviceName: d.name, action: 'reject', summary: 'lockdown', transport })
+    // A QR / code shown earlier must not let a new phone in after a lockdown.
+    this.store.cancelOpenPairings()
+    this.relayTickets.clear()
+    this.auditLog.record({ action: 'lockdown', summary: `revoked ${revoked.length} device(s), removed ${rejected.length} pending`, transport })
+    this.log(`LOCKDOWN: revoked ${revoked.length} device(s), removed ${rejected.length} pending pairing(s)`)
+    for (const c of [...this.connections]) if (c.device) c.close('revoked')
+    this.syncRelayAccess()
+    return { revoked: revoked.length, rejected: rejected.length }
+  }
+
+  /** One phone is lost: revoke it (push key and relay token dropped) and say why. */
+  markLost(deviceId: string, transport = 'local'): boolean {
+    const d = this.store.getDevice(deviceId)
+    if (!d || d.pending) return false
+    const ok = this.store.setRevoked(deviceId, true, 'lost')
+    if (ok) {
+      this.auditLog.record({ deviceId, deviceName: d.name, action: 'lost', summary: 'marked lost: revoked', transport })
+      this.log(`"${d.name}" marked lost and revoked`)
+    }
+    for (const c of this.connections) if (c.device?.id === deviceId) c.close('revoked')
+    this.syncRelayAccess()
+    return ok
   }
 
   private acquireUnauthSlot(ip: string): { release: () => void; readonly done: boolean } | null {
@@ -556,6 +641,8 @@ export class Bridge implements ConnectionHost {
 
     if (NEVER_FORWARD_EVENTS.has(name)) return
 
+    if (name === 'agent.tool_approval' && this.tryAutoApprove(d, () => this.onGatewayEvent(name, data, seq))) return
+
     if (name === 'session.snapshot') {
       const snap = data as SessionSnapshot
       if (snap?.sessionKey) {
@@ -645,6 +732,40 @@ export class Bridge implements ConnectionHost {
     return d?.pending ? { ...d, scopes: [] } : d
   }
 
+  /** Request ids whose auto-approve failed once: they are delivered to phones normally, never retried. */
+  private readonly autoApproveFailed = new Set<string>()
+
+  /**
+   * "Always allow" rules. When the gateway asks for approval and a rule covers it (and the
+   * input is not risky), approve it here with only {requestId}, audit it, and keep it off the
+   * phones. Returns true when the event was taken; `deliver` re-runs it as a normal event if
+   * the gateway refuses the approval.
+   */
+  private tryAutoApprove(d: Record<string, unknown>, deliver: () => void): boolean {
+    const requestId = typeof d.requestId === 'string' ? d.requestId : ''
+    if (!requestId || this.autoApproveFailed.has(requestId)) return false
+    const rule = findMatchingRule(this.store.listRules(), d.toolName, d.input, typeof d.blockedPath === 'string' ? { blockedPath: d.blockedPath } : {})
+    if (!rule) return false
+    const tool = String(d.toolName).replace(/[\u0000-\u001f]/g, ' ').slice(0, 60)
+    void this.gateway
+      .rpc('tool.approve', { requestId })
+      .then(() => {
+        this.auditLog.record({ action: 'auto_approve', method: 'tool.approve', requestId, summary: `tool=${tool} rule=${rule.id}`, transport: 'rule' })
+      })
+      .catch((err: Error) => {
+        this.log(`auto-approve of ${tool} failed (${err.message}); asking the phone instead`)
+        this.autoApproveFailed.add(requestId)
+        deliver()
+      })
+    return true
+  }
+
+  private broadcastRules(): void {
+    // Rules hold the exact commands the Mac auto-approves: only devices that may list them hear about changes.
+    const rules = this.store.listRules()
+    for (const c of this.connections) if (c.device?.scopes.includes('approvals')) c.forward('remote.rules_changed', { rules }, undefined, null)
+  }
+
   /**
    * Hook for connection.ts onRpc: records the security-relevant RPCs a device performs.
    * Never records prompt text or file contents; only method, ids and a short label.
@@ -682,6 +803,27 @@ export class Bridge implements ConnectionHost {
     })
   }
 
+  onDeviceAuthed(conn: DeviceConnection): void {
+    if (conn.device) this.noteNetwork(conn.device, this.transports.get(conn) ?? 'direct', conn.remoteAddress)
+  }
+
+  /**
+   * A device connected from a network it has not used before: audit it and show a macOS notification, so a
+   * stolen key being used from somewhere else is noticed. The first network a device is ever seen on is the
+   * baseline and does not alert (pairing was already approved on this Mac).
+   */
+  noteNetwork(device: { id: string; name: string }, transport: 'relay' | 'direct', remote: string): 'baseline' | 'new' | 'known' {
+    const net = classifyNetwork(transport, remote)
+    const result = this.store.recordNetwork(device.id, net.key)
+    if (result === 'new') {
+      const text = `${device.name} connected from a new network (${net.label})`
+      this.auditLog.record({ deviceId: device.id, deviceName: device.name, action: 'new_network', summary: text, transport })
+      this.log(text)
+      this.notify('dorabot remote', text)
+    }
+    return result
+  }
+
   pendingExpiresAt(device: DeviceRecord): number | undefined {
     return (device.pendingSince ?? device.createdAt) + PENDING_TTL_MS
   }
@@ -710,6 +852,10 @@ export class Bridge implements ConnectionHost {
     return this.roots.listRoots()
   }
 
+  allowedRootsExpiry(): Record<string, number> {
+    return this.roots.listExpiry()
+  }
+
   protectedPaths(): string[] {
     const p = this.paths
     return [p.root, p.db, p.identity, p.signingKey, p.settings, p.dorabotRoot, p.gatewayToken, p.gatewaySocket]
@@ -729,6 +875,7 @@ export class Bridge implements ConnectionHost {
 
   onClosed(conn: DeviceConnection): void {
     this.connections.delete(conn)
+    this.ruleChallenges.delete(conn)
     // Leaving a device's shells alive after it drops would let the next connection
     // inherit them. Kill them instead; the gateway's 60s orphan grace does not
     // apply to us because we never reclaim by id.
@@ -856,6 +1003,38 @@ export class Bridge implements ConnectionHost {
         return { pins: this.store.listPins() }
       }
 
+      case 'remote.rules.list': {
+        this.requireScope(conn, 'approvals')
+        return this.store.listRules()
+      }
+
+      case 'remote.rules.challenge': {
+        this.requireScope(conn, 'approvals')
+        const nonce = randomBytes(16).toString('base64url')
+        this.ruleChallenges.set(conn, { nonce, at: Date.now() })
+        return { nonce, ttlMs: RULE_CHALLENGE_MS }
+      }
+
+      case 'remote.rules.add': {
+        this.requireScope(conn, 'approvals')
+        // Two steps on the same connection: remote.rules.challenge hands out a one-time nonce, the phone shows
+        // Face ID, then echoes the nonce here within RULE_CHALLENGE_MS. The bridge cannot see the biometric
+        // itself; this stops a blind or replayed `freshAuth: true` and ties the add to a live, recent prompt.
+        this.consumeRuleChallenge(conn, params.freshAuth)
+        const spec = parseNewRule(params)
+        if (this.store.listRules().length >= MAX_RULES) throw new Error(`you can keep at most ${MAX_RULES} rules`)
+        const rule = this.store.addRule({ ...spec, createdBy: conn.device?.name ?? null })
+        this.auditLog.record({ deviceId: conn.device?.id ?? null, deviceName: conn.device?.name ?? null, action: 'rule_add', summary: `rule=${rule.id} ${describeRule(rule)}`, transport: this.transports.get(conn) ?? 'direct' })
+        this.broadcastRules()
+        return { rule, rules: this.store.listRules() }
+      }
+
+      case 'remote.rules.remove': {
+        this.requireScope(conn, 'approvals')
+        const removed = this.removeRule(String(params.id ?? ''), conn.device ? { id: conn.device.id, name: conn.device.name } : null, this.transports.get(conn) ?? 'direct')
+        return { removed: removed !== null, rules: this.store.listRules() }
+      }
+
       case 'remote.events': {
         const after = Number(params.afterSeq ?? 0)
         const limit = Math.min(Number(params.limit ?? 200), 1000)
@@ -873,6 +1052,27 @@ export class Bridge implements ConnectionHost {
     }
   }
 
+  private readonly ruleChallenges = new Map<DeviceConnection, { nonce: string; at: number }>()
+
+  private consumeRuleChallenge(conn: DeviceConnection, presented: unknown): void {
+    const ch = this.ruleChallenges.get(conn)
+    this.ruleChallenges.delete(conn) // single use, even when it fails
+    const need = 'adding an always-allow rule needs a fresh Face ID confirmation'
+    if (!ch || typeof presented !== 'string' || Date.now() - ch.at > RULE_CHALLENGE_MS) throw new Error(need)
+    const a = Buffer.from(ch.nonce)
+    const b = Buffer.from(presented)
+    if (a.length !== b.length || !timingSafeEqual(a, b)) throw new Error(need)
+  }
+
+  /** Shared by the phone, the control page and (via the DB) the CLI. */
+  removeRule(id: string, by: { id: string; name: string } | null, transport: string): ReturnType<Store['removeRule']> {
+    const removed = this.store.removeRule(id)
+    if (!removed) return null
+    this.auditLog.record({ deviceId: by?.id ?? null, deviceName: by?.name ?? null, action: 'rule_remove', summary: `rule=${removed.id} ${describeRule(removed)}`, transport })
+    this.broadcastRules()
+    return removed
+  }
+
   private requireScope(conn: DeviceConnection, scope: Scope): void {
     if (!conn.device?.scopes.includes(scope)) {
       throw new Error(`this device does not have the "${scope}" permission`)
@@ -880,17 +1080,18 @@ export class Bridge implements ConnectionHost {
   }
 
   /** Called when the Mac approves a pending scope request. Pushes it live. */
-  applyScopeDecision(requestId: string, approve: boolean): boolean {
-    const resolved = this.store.resolveScopeRequest(requestId, approve)
+  applyScopeDecision(requestId: string, approve: boolean, forMs: number | null = null): boolean {
+    const expiresAt = approve && forMs ? Date.now() + forMs : null
+    const resolved = this.store.resolveScopeRequest(requestId, approve, expiresAt)
     if (!resolved) return false
     for (const c of this.connections) {
       if (c.device?.id === resolved.device.id) {
         c.device = resolved.device
-        c.forward('remote.scopes_changed', { scopes: resolved.device.scopes, granted: approve ? resolved.scope : null }, undefined, null)
+        c.forward('remote.scopes_changed', { scopes: resolved.device.scopes, expiry: resolved.device.scopeExpiry ?? {}, granted: approve ? resolved.scope : null }, undefined, null)
       }
     }
-    this.auditLog.record({ deviceId: resolved.device.id, deviceName: resolved.device.name, action: approve ? 'scope_grant' : 'scope_deny', summary: `scope=${resolved.scope}`, transport: 'mac' })
-    this.log(`${approve ? 'granted' : 'denied'} "${resolved.scope}" for ${resolved.device.name}`)
+    this.auditLog.record({ deviceId: resolved.device.id, deviceName: resolved.device.name, action: approve ? 'scope_grant' : 'scope_deny', summary: `scope=${resolved.scope}${expiresAt ? ` for ${formatRemaining(forMs!)} (until ${new Date(expiresAt).toISOString()})` : ''}`, transport: 'mac' })
+    this.log(`${approve ? 'granted' : 'denied'} "${resolved.scope}" for ${resolved.device.name}${expiresAt ? ` for ${formatRemaining(forMs!)}` : ''}`)
     return true
   }
 
@@ -898,8 +1099,67 @@ export class Bridge implements ConnectionHost {
   // [SEC-RELAY] Relay access control
   // -------------------------------------------------------------------------
 
+  /** The device's CURRENT relay token (what the phone is told and what it acks). */
   private relayTokenFor(deviceId: string): string {
-    return deriveRelayToken(this.relaySecret!, deviceId)
+    return this.relayTokenGen(deviceId, this.tokState(deviceId).gen)
+  }
+
+  private relayTokenGen(deviceId: string, gen: number): string {
+    return deriveRelayToken(this.relaySecret!, tokenSubject(deviceId, gen))
+  }
+
+  private tokStates(): Record<string, TokState> {
+    return this.store.getMeta<Record<string, TokState>>(RELAY_TOKSTATE_KEY, {})
+  }
+
+  private tokState(deviceId: string, states: Record<string, TokState> = this.tokStates()): TokState {
+    const stored = states[deviceId]
+    if (stored) return stored
+    const createdAt = this.store.getDevice(deviceId)?.createdAt ?? Date.now()
+    return initialState(createdAt, this.store.getMeta<string[]>(RELAY_ACKED_KEY, []).includes(deviceId))
+  }
+
+  private saveTokState(deviceId: string, s: TokState): void {
+    this.store.setMeta(RELAY_TOKSTATE_KEY, { ...this.tokStates(), [deviceId]: s })
+  }
+
+  /**
+   * Move one device to a new relay token. The phone gets it over the E2E channel (live now if connected,
+   * otherwise in `ready` at its next connect) and acks it; the old token works until that ack, or 7 days.
+   */
+  rotateRelayToken(deviceId: string, reason: string, transport = 'mac', now = Date.now()): boolean {
+    if (!this.relaySecret || !this.relayInfo) return false
+    const d = this.store.getDevice(deviceId)
+    if (!d || d.revoked || d.pending) return false
+    const next = rotate(pruneExpired(this.tokState(deviceId), now), now)
+    this.saveTokState(deviceId, next)
+    this.auditLog.record({ deviceId, deviceName: d.name, action: 'relay_token_rotate', summary: `${reason}; generation ${next.gen}, old token valid until acked or 7 days`, transport })
+    this.log(`relay: rotated the token of "${d.name}" (${reason})`)
+    const relay: RelayInfo = { ...this.relayInfo, tok: this.relayTokenGen(deviceId, next.gen) }
+    for (const c of this.connections) if (c.device?.id === deviceId) c.forward('remote.relay_token', { relay }, undefined, null)
+    this.syncRelayAccess()
+    return true
+  }
+
+  /** Scheduled rotation: every 30 days for devices that confirmed their token. Also forgets old state. */
+  sweepRelayTokens(now = Date.now()): number {
+    if (!this.relaySecret) return 0
+    const live = new Set(this.store.listDevices().map((d) => d.id))
+    const states = this.tokStates()
+    let changed = false
+    for (const id of Object.keys(states)) {
+      if (!live.has(id)) {
+        delete states[id]
+        changed = true
+      }
+    }
+    if (changed) this.store.setMeta(RELAY_TOKSTATE_KEY, states)
+    let n = 0
+    for (const d of this.store.listDevices()) {
+      if (d.revoked || d.pending) continue
+      if (dueForRotation(this.tokState(d.id), now) && this.rotateRelayToken(d.id, 'scheduled (30 days)', 'mac', now)) n++
+    }
+    return n
   }
 
   /**
@@ -917,8 +1177,15 @@ export class Bridge implements ConnectionHost {
 
   relayTokAck(deviceId: string, tokHash: unknown): boolean {
     if (!this.relaySecret || typeof tokHash !== 'string') return false
+    // Only the CURRENT token counts: a phone still holding an older one has not received the new one.
     if (tokHash !== relayTokenHash(this.relayTokenFor(deviceId))) return false
+    const st = this.tokState(deviceId)
+    if (!st.acked || st.prev.length > 0) {
+      this.saveTokState(deviceId, ackCurrent(st))
+      if (st.gen > 0) this.log(`relay: device ${deviceId.slice(0, 8)} confirmed its rotated token; the old one is no longer valid`)
+    }
     this.markRelayTokenAcked(deviceId)
+    this.syncRelayAccess()
     return true
   }
 
@@ -959,8 +1226,9 @@ export class Bridge implements ConnectionHost {
       this.store.setMeta(RELAY_ENFORCE_KEY, true)
       this.log('relay: access tokens are now enforced')
     }
+    const states = this.tokStates()
     this.relay.setAccess({
-      tokens: devices.map((d) => relayTokenHash(this.relayTokenFor(d.id))),
+      tokens: devices.flatMap((d) => validGens(this.tokState(d.id, states), now).map((g) => relayTokenHash(this.relayTokenGen(d.id, g)))),
       tickets: [...this.relayTickets.values()].map((t) => relayTokenHash(t.tok)),
       enforce,
     })
@@ -1294,6 +1562,8 @@ export class Bridge implements ConnectionHost {
         addresses: candidateAddresses(this.settings.port, this.settings.extraAddresses, this.settings.bind),
         connections: [...this.connections].map((c) => ({ device: c.device?.name ?? null, address: c.remoteAddress })),
         roots: this.roots.listRoots(),
+        rootsExpiry: this.roots.listExpiry(),
+        rules: this.store.listRules().map((r) => ({ ...r, label: describeRule(r) })),
         log: this.logLines.slice(-80),
       }
       if (this.healthAlerts) {
@@ -1323,14 +1593,14 @@ export class Bridge implements ConnectionHost {
     }
 
     if (url.pathname === '/api/scope' && method === 'POST') {
-      const { requestId, approve } = await body()
+      const { requestId, approve, forMs } = await body()
       if (typeof requestId !== 'string' || !requestId) throw new HttpError(400, 'requestId required')
-      json(200, { ok: this.applyScopeDecision(requestId, Boolean(approve)) })
+      json(200, { ok: this.applyScopeDecision(requestId, Boolean(approve), grantMs(forMs)) })
       return
     }
 
     if (url.pathname === '/api/device' && method === 'POST') {
-      const { deviceId, action, scopes } = await body()
+      const { deviceId, action, scopes, forMs, scope: oneScope } = await body()
       if (typeof deviceId !== 'string' || !deviceId) throw new HttpError(400, 'deviceId required')
       const known = this.store.getDevice(deviceId)
       const who = { deviceId, deviceName: known?.name ?? null, transport: 'local' }
@@ -1350,6 +1620,10 @@ export class Bridge implements ConnectionHost {
           this.store.touchDevice(deviceId)
           this.auditLog.record({ ...who, action: 'restore' })
         }
+      } else if (action === 'rotate') {
+        ok = this.rotateRelayToken(deviceId, 'requested on the control page', 'local')
+      } else if (action === 'lost') {
+        ok = this.markLost(deviceId, 'local')
       } else if (action === 'delete') {
         ok = this.store.deleteDevice(deviceId)
         for (const c of this.connections) if (c.device?.id === deviceId) c.close('removed')
@@ -1360,18 +1634,23 @@ export class Bridge implements ConnectionHost {
         }
         const next = [...new Set(scopes)]
         const before = known?.scopes ?? []
-        ok = this.store.setScopes(deviceId, next)
+        // A time limit applies to the scope being switched on (`scope`); everything else keeps what it had.
+        const limit = grantMs(forMs)
+        const patch: Record<string, number | null> = {}
+        if (limit && typeof oneScope === 'string' && next.includes(oneScope as Scope) && !before.includes(oneScope as Scope)) patch[oneScope] = Date.now() + limit
+        ok = this.store.setScopes(deviceId, next, patch)
         const updated = this.store.getDevice(deviceId)
         for (const c of this.connections) {
           if (c.device?.id === deviceId && updated) {
             c.device = updated
-            c.forward('remote.scopes_changed', { scopes: updated.scopes, granted: null }, undefined, null)
+            c.forward('remote.scopes_changed', { scopes: updated.scopes, expiry: updated.scopeExpiry ?? {}, granted: null }, undefined, null)
           }
         }
         if (ok) {
           const added = next.filter((x) => !before.includes(x))
           const removed = before.filter((x) => !next.includes(x))
-          this.auditLog.record({ ...who, action: 'scopes', summary: `+[${added.join(',')}] -[${removed.join(',')}]` })
+          const until = Object.entries(patch).map(([sc, at]) => `${sc} until ${new Date(at as number).toISOString()}`)
+          this.auditLog.record({ ...who, action: 'scopes', summary: `+[${added.join(',')}] -[${removed.join(',')}]${until.length ? ` (${until.join('; ')})` : ''}` })
         }
       } else {
         throw new HttpError(400, 'unknown action')
@@ -1381,19 +1660,34 @@ export class Bridge implements ConnectionHost {
       return
     }
 
+    if (url.pathname === '/api/rotate-tokens' && method === 'POST') {
+      let n = 0
+      for (const d of this.store.listDevices()) if (this.rotateRelayToken(d.id, 'requested on the control page', 'local')) n++
+      json(200, { ok: true, rotated: n })
+      return
+    }
+
+    if (url.pathname === '/api/lockdown' && method === 'POST') {
+      const { confirm } = await body()
+      if (confirm !== true) throw new HttpError(400, 'lockdown needs confirm: true')
+      json(200, { ok: true, ...this.lockdown('local') })
+      return
+    }
+
     if (url.pathname === '/api/roots') {
       if (method === 'GET') return json(200, { roots: this.roots.listRoots() })
       if (method === 'POST') {
-        const { action, path } = await body()
+        const { action, path, forMs } = await body()
         if (typeof path !== 'string' || !path) throw new HttpError(400, 'path required')
         try {
           let roots: string[]
-          if (action === 'add') this.roots.addRoot(path)
+          const limit = grantMs(forMs)
+          if (action === 'add') this.roots.addRoot(path, { expiresAt: limit ? Date.now() + limit : null })
           else if (action === 'remove') this.roots.removeRoot(path)
           else throw new HttpError(400, 'unknown action')
           roots = this.roots.listRoots()
-          this.auditLog.record({ action: action === 'add' ? 'folder_add' : 'folder_remove', summary: path.slice(0, 150), transport: 'local' })
-          return json(200, { ok: true, roots })
+          this.auditLog.record({ action: action === 'add' ? 'folder_add' : 'folder_remove', summary: `${path.slice(0, 150)}${action === 'add' && limit ? ` for ${formatRemaining(limit)} (until ${new Date(Date.now() + limit).toISOString()})` : ''}`, transport: 'local' })
+          return json(200, { ok: true, roots, expiry: this.roots.listExpiry() })
         } catch (err) {
           if (err instanceof HttpError) throw err
           return json(400, { ok: false, error: (err as Error).message })
@@ -1402,8 +1696,28 @@ export class Bridge implements ConnectionHost {
       return json(405, { error: 'method not allowed' })
     }
 
+    if (url.pathname === '/api/rules') {
+      if (method === 'GET') return json(200, { rules: this.store.listRules() })
+      if (method === 'POST') {
+        const { action, id } = await body()
+        if (action !== 'remove') throw new HttpError(400, 'unknown action')
+        const removed = this.removeRule(String(id ?? ''), null, 'local')
+        return json(200, { ok: removed !== null, rules: this.store.listRules() })
+      }
+      return json(405, { error: 'method not allowed' })
+    }
+
     json(404, { error: 'not found' })
   }
+}
+
+/** A time limit from the control page (ms), or null for permanent. Out-of-range or junk is an error, not "forever". */
+function grantMs(v: unknown): number | null {
+  if (v === undefined || v === null || v === 0) return null
+  if (typeof v !== 'number') throw new HttpError(400, 'forMs must be a number of milliseconds')
+  const ms = Math.round(v)
+  if (!(ms >= MIN_GRANT_MS && ms <= MAX_GRANT_MS)) throw new HttpError(400, 'time limit must be between 1 minute and 30 days')
+  return ms
 }
 
 function LOGIN_HELP(msg: string): string {

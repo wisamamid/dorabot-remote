@@ -1,7 +1,9 @@
 /**
  * The push content keys live in the iOS Keychain, in an access group shared with
  * the Notification Service Extension (native plugin `PushKeyStore`, see
- * ios/App/App/PushKeyStorePlugin.swift). One key per Mac, stored under that
+ * ios/App/App/PushKeyStorePlugin.swift); on Android they are AES-GCM encrypted with an
+ * Android Keystore key and shared with the FirebaseMessagingService (see
+ * android/.../PushKeyStorePlugin.java). One key per Mac, stored under that
  * Mac's key id (see push-keys.ts).
  *
  * Same rule as platform.ts: the plugin proxy is a thenable, so it is a module-level
@@ -11,7 +13,7 @@ import { registerPlugin } from '@capacitor/core'
 import { isNative, platformName } from './platform.js'
 import { pushKeyId, type StoredPushKey } from './push-keys.js'
 
-const pushSupported = isNative && platformName === 'ios'
+const pushSupported = isNative && (platformName === 'ios' || platformName === 'android')
 
 interface PushKeyStorePlugin {
   set(opts: { kid: string; key: string }): Promise<void>
@@ -19,6 +21,9 @@ interface PushKeyStorePlugin {
   list(): Promise<{ keys?: Array<{ kid?: string; key?: string }> }>
   clear(opts: { kid: string }): Promise<void>
   clearAll(): Promise<void>
+  /** Android only: the notification tap / Approve / Deny that launched or resumed the app, once. */
+  takeAction(): Promise<{ found?: boolean; actionId?: string; enc?: string; kid?: string; rid?: string; k?: string }>
+  addListener(event: 'pushAction', cb: () => void): Promise<{ remove: () => Promise<void> }>
 }
 
 const Native = registerPlugin<PushKeyStorePlugin>('PushKeyStore')
@@ -82,5 +87,42 @@ export async function adoptLegacyPushKey(hostId: string): Promise<void> {
     await Native.clear({ kid: '' })
   } catch {
     // The Mac just re-registers (new key) on next connect.
+  }
+}
+
+export interface NativePushAction {
+  actionId?: string
+  data: { enc?: string; kid?: string; rid?: string; k?: string }
+}
+
+/** Android: the pending notification tap/button, consumed. Null when none (or not Android). */
+export async function takeNativePushAction(): Promise<NativePushAction | null> {
+  if (!isNative || platformName !== 'android') return null
+  try {
+    const r = await Native.takeAction()
+    if (!r?.found) return null
+    return { ...(r.actionId ? { actionId: r.actionId } : {}), data: { enc: r.enc, kid: r.kid, rid: r.rid, k: r.k } }
+  } catch {
+    return null
+  }
+}
+
+/** Android: called when a notification is tapped while the app is alive. Returns an unsubscribe. */
+export function onNativePushAction(cb: () => void): () => void {
+  if (!isNative || platformName !== 'android') return () => {}
+  let disposed = false
+  let remove: (() => void) | null = null
+  void (async () => {
+    try {
+      const h = await Native.addListener('pushAction', cb)
+      if (disposed) void h.remove()
+      else remove = () => void h.remove()
+    } catch {
+      // cosmetic
+    }
+  })()
+  return () => {
+    disposed = true
+    remove?.()
   }
 }

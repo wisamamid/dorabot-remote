@@ -55,6 +55,10 @@ const ALLOWED = [
   'agent.interrupt',
   'remote.pins.list',
   'remote.pins.set',
+  'remote.rules.list',
+  'remote.rules.challenge',
+  'remote.rules.add',
+  'remote.rules.remove',
   'chat.send',
   'chat.answerQuestion',
   'tool.approve',
@@ -150,6 +154,10 @@ const REPLIES: Record<string, { approved: Reply; denied: Reply; answered?: (answ
     },
     denied: { text: 'Understood, I will not run the tests. The fix is applied but unverified. Tell me if you want me to try a different check.' },
   },
+  [DEMO_KEYS.digest]: {
+    approved: { text: 'Cleaned and pushed. This is a demo, so nothing was actually run.' },
+    denied: { text: 'Understood, I will leave the release branch alone.' },
+  },
   [DEMO_KEYS.release]: {
     approved: { text: 'Done.' },
     denied: { text: 'Okay.' },
@@ -178,6 +186,7 @@ export function createDemoClient(handlers: DemoHandlers, now: () => number = Dat
   let models: Record<string, string> = {}
   let names: Record<string, string> = {}
   let pins: Array<{ id: string; pinnedAt: number }> = []
+  let rules: Array<{ id: string; kind: 'tool' | 'exact'; toolName: string; command: string | null; createdAt: number; createdBy: string | null }> = []
   const history = transcripts(t0)
   const sessions: StoredSession[] = [
     {
@@ -228,6 +237,17 @@ export function createDemoClient(handlers: DemoHandlers, now: () => number = Dat
     timestamp: t0 - 2 * MIN,
     title: 'Approve Bash: npm test?',
   }
+  // A risky one, so the badge, the reasons and the fresh Face ID rule are visible in the demo.
+  const riskyApproval = {
+    requestId: 'demo-approval-2',
+    toolName: 'Bash',
+    input: { command: 'rm -rf node_modules dist && git push --force origin release/2.4', description: 'Clean the build and force-push the release branch' },
+    sessionKey: DEMO_KEYS.digest,
+    timestamp: t0 - 3 * MIN,
+    title: 'Approve Bash: rm -rf node_modules dist && git push --force origin release/2.4?',
+  }
+  const approvals = [approval, riskyApproval]
+  const open = new Set(approvals.map((a) => a.requestId))
   const question = {
     requestId: 'demo-question-1',
     sessionKey: DEMO_KEYS.release,
@@ -244,7 +264,6 @@ export function createDemoClient(handlers: DemoHandlers, now: () => number = Dat
       },
     ],
   }
-  let approvalOpen = true
   let questionOpen = true
 
   let state: ConnectionState = 'idle'
@@ -323,6 +342,27 @@ export function createDemoClient(handlers: DemoHandlers, now: () => number = Dat
 
         return { messages: allMessages }
       }
+      case 'remote.rules.list':
+        return rules
+      case 'remote.rules.challenge':
+        return { nonce: 'demo-nonce', ttlMs: 60_000 }
+      case 'remote.rules.add': {
+        if (params.freshAuth !== 'demo-nonce') throw new Error('adding an always-allow rule needs a fresh Face ID confirmation')
+        const kind = params.kind === 'exact' ? 'exact' : 'tool'
+        const command = kind === 'exact' ? String(params.command ?? '') : null
+        const toolName = String(params.toolName ?? '')
+        let rule = rules.find((r) => r.kind === kind && r.toolName === toolName && r.command === command)
+        if (!rule) {
+          rule = { id: `demo-rule-${rules.length + 1}`, kind, toolName, command, createdAt: now(), createdBy: 'This phone (demo)' }
+          rules = [rule, ...rules]
+        }
+        return { rule, rules }
+      }
+      case 'remote.rules.remove': {
+        const had = rules.some((r) => r.id === params.id)
+        rules = rules.filter((r) => r.id !== params.id)
+        return { removed: had, rules }
+      }
       case 'remote.pins.list':
         return pins
       case 'remote.pins.set': {
@@ -345,15 +385,15 @@ export function createDemoClient(handlers: DemoHandlers, now: () => number = Dat
       case 'agent.interrupt':
         return { ok: true }
       case 'tool.pending':
-        return approvalOpen ? [{ requestId: approval.requestId, toolName: approval.toolName, input: approval.input }] : []
+        return approvals.filter((a) => open.has(a.requestId)).map((a) => ({ requestId: a.requestId, toolName: a.toolName, input: a.input }))
       case 'tool.approve':
       case 'tool.deny': {
-        if (!approvalOpen || params.requestId !== approval.requestId) throw new Error('No pending approval for that request')
-        approvalOpen = false
+        const target = approvals.find((a) => a.requestId === params.requestId)
+        if (!target || !open.delete(target.requestId)) throw new Error('No pending approval for that request')
         const approved = method === 'tool.approve'
-        emit('agent.tool_approval_resolved', { requestId: approval.requestId })
-        const r = REPLIES[DEMO_KEYS.checkout]!
-        streamReply(DEMO_KEYS.checkout, approved ? r.approved : r.denied)
+        emit('agent.tool_approval_resolved', { requestId: target.requestId })
+        const r = REPLIES[target.sessionKey] ?? REPLIES[DEMO_KEYS.checkout]!
+        streamReply(target.sessionKey, approved ? r.approved : r.denied)
         return { ok: true }
       }
       case 'chat.answerQuestion': {
@@ -400,7 +440,7 @@ export function createDemoClient(handlers: DemoHandlers, now: () => number = Dat
         handlers.onReady({ host, device, gatewayConnected: true })
         // What a real subscribe delivers: the live approval and question.
         later(0, () => {
-          if (approvalOpen) emit('agent.tool_approval', approval)
+          for (const a of approvals) if (open.has(a.requestId)) emit('agent.tool_approval', a)
           if (questionOpen) emit('agent.ask_user', question)
         })
       })

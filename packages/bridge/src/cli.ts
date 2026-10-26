@@ -9,8 +9,11 @@ import { BRIDGE_VERSION, loadIdentity, loadSettings, resolvePaths, saveSettings 
 import { Bridge } from './bridge.js'
 import { Store } from './store.js'
 import { loginUrl } from './control-auth.js'
+import { formatRemaining, parseDuration } from './duration.js'
+import { describeRule } from './rules.js'
 import { createRootsStore, rootsFilePath } from './roots.js'
 import * as launchd from './launchd.js'
+import { createKeychainStore, defaultSecurityRunner, keychainEnabled, keychainScope } from './keychain.js'
 import { SetupError, isFirstRun, runSetup, runUninstall } from './setup.js'
 
 const USAGE = `dorabot-remote ${BRIDGE_VERSION}
@@ -26,9 +29,12 @@ const USAGE = `dorabot-remote ${BRIDGE_VERSION}
   approve <deviceId>          Allow a newly paired phone to control dorabot
   reject <deviceId>           Refuse and delete a newly paired phone
   audit                       Show recent security-relevant actions (--device <id>, --limit <n>)
-  folders [add|remove <path>] List, add or remove shared folders
-  grant <deviceId> <scope>    Add a permission to a device
+  folders [add|remove <path>] List, add or remove shared folders (add ... --for 8h: temporary)
+  rules [remove <id>]         List or remove always-allow approval rules
+  grant <deviceId> <scope>    Add a permission to a device (--for 1h: it lapses by itself)
   revoke <deviceId>           Block a device without deleting it
+  lost <deviceId>             Phone lost: revoke it at once (push and relay access dropped)
+  lockdown                    Lost phone: revoke ALL devices at once (asks to confirm; --yes skips)
   remove <deviceId>           Delete a device entirely
   addresses                   Show the addresses a phone can reach this Mac on
   config                      Show or change settings
@@ -46,6 +52,7 @@ Options
   --pending           With devices: only phones waiting for approval
   --device <id>       With audit: only this device
   --limit <n>         With audit: how many entries (default 50)
+  --for <duration>    With grant / folders add: time limit, e.g. 30m, 1h, 8h, 24h, 2d (1 minute to 30 days)
   --yes               Do not ask questions (setup)
   --purge             With uninstall: also delete keys and paired devices
 
@@ -64,6 +71,7 @@ async function main(): Promise<void> {
       pending: { type: 'boolean' },
       device: { type: 'string' },
       limit: { type: 'string' },
+      for: { type: 'string' },
       yes: { type: 'boolean', short: 'y' },
       purge: { type: 'boolean' },
       uninstall: { type: 'boolean' },
@@ -111,6 +119,24 @@ async function main(): Promise<void> {
 
   const command = positionals[0] ?? 'start'
 
+  let forMs: number | null = null
+  if (values.for !== undefined) {
+    forMs = parseDuration(values.for)
+    if (forMs === null) {
+      process.stderr.write(`Invalid --for "${values.for}". Use something like 30m, 1h, 8h, 24h or 2d (between 1 minute and 30 days).\n`)
+      process.exitCode = 1
+      return
+    }
+    if (command !== 'grant' && command !== 'folders') {
+      process.stderr.write('--for only applies to "grant" and "folders add".\n')
+      process.exitCode = 1
+      return
+    }
+  }
+
+  // Declared before the switch: cmdFolders runs from inside it (a const below would still be in its TDZ).
+  const rootsStore = createRootsStore(() => rootsFilePath(paths.root), { protectedPaths: () => [paths.root, paths.db, paths.identity, paths.signingKey, paths.settings, paths.dorabotRoot, paths.gatewayToken, paths.gatewaySocket] })
+
   switch (command) {
     case 'start':
       await cmdStart(values.open === true)
@@ -133,14 +159,23 @@ async function main(): Promise<void> {
     case 'audit':
       cmdAudit(values.device, Number(values.limit ?? 50))
       return
+    case 'rules':
+      cmdRules(positionals[1], positionals[2])
+      return
     case 'folders':
-      await cmdFolders(positionals[1], positionals[2])
+      await cmdFolders(positionals[1], positionals[2], forMs)
       return
     case 'grant':
-      await cmdGrant(positionals[1], positionals[2] as Scope)
+      await cmdGrant(positionals[1], positionals[2] as Scope, forMs)
       return
     case 'revoke':
       cmdSetRevoked(positionals[1], true)
+      return
+    case 'lost':
+      cmdLost(positionals[1])
+      return
+    case 'lockdown':
+      await cmdLockdown(values.yes === true)
       return
     case 'unrevoke':
       cmdSetRevoked(positionals[1], false)
@@ -154,7 +189,7 @@ async function main(): Promise<void> {
     case 'setup':
     case 'update':
       if (values.uninstall) {
-        await runUninstall({ paths, launchd, log: say }, values.purge === true)
+        await runUninstall({ paths, launchd, log: say, keychain: keychainEnabled() ? createKeychainStore(defaultSecurityRunner, keychainScope(paths.root)) : null }, values.purge === true)
         return
       }
       await cmdSetup(command === 'update', values.yes === true)
@@ -163,7 +198,7 @@ async function main(): Promise<void> {
       cmdInstall()
       return
     case 'uninstall':
-      await runUninstall({ paths, launchd, log: say }, values.purge === true)
+      await runUninstall({ paths, launchd, log: say, keychain: keychainEnabled() ? createKeychainStore(defaultSecurityRunner, keychainScope(paths.root)) : null }, values.purge === true)
       return
     case 'status':
       cmdStatus()
@@ -319,14 +354,14 @@ async function main(): Promise<void> {
         `${d.pending ? '?' : d.revoked ? '✗' : '✓'} ${d.name}  (${d.platform})${d.pending ? '  WAITING FOR APPROVAL' : ''}${d.revokedReason === 'expired' ? '  revoked: unseen for 90 days' : ''}\n` +
           `  id        ${d.id}\n` +
           `  key       ${fp}\n` +
-          `  allowed   ${d.scopes.join(', ')}\n` +
+          `  allowed   ${d.scopes.map((s) => (d.scopeExpiry?.[s] ? `${s} (${formatRemaining(d.scopeExpiry[s]! - Date.now())} left)` : s)).join(', ')}\n` +
           `  last seen ${d.lastSeenAt ? new Date(d.lastSeenAt).toLocaleString() : 'never'}\n\n`,
       )
     }
     store.close()
   }
 
-  async function cmdGrant(deviceId: string | undefined, scope: Scope | undefined): Promise<void> {
+  async function cmdGrant(deviceId: string | undefined, scope: Scope | undefined, limitMs: number | null): Promise<void> {
     if (!deviceId || !scope || !SCOPES.includes(scope)) {
       process.stderr.write(`Usage: dorabot-remote grant <deviceId> <${SCOPES.join('|')}>\n`)
       process.exitCode = 1
@@ -340,11 +375,19 @@ async function main(): Promise<void> {
       store.close()
       return
     }
-    if (!device.scopes.includes(scope)) {
-      store.setScopes(deviceId, [...device.scopes, scope])
-      store.recordAudit({ deviceId, deviceName: device.name, action: 'scopes', summary: `+[${scope}]`, transport: 'cli' })
+    const expiresAt = limitMs ? Date.now() + limitMs : null
+    if (!device.scopes.includes(scope) || expiresAt || device.scopeExpiry?.[scope]) {
+      // Granting again without --for makes a temporary grant permanent; with --for it sets (or resets) the limit.
+      store.setScopes(deviceId, device.scopes.includes(scope) ? device.scopes : [...device.scopes, scope], { [scope]: expiresAt })
+      store.recordAudit({
+        deviceId,
+        deviceName: device.name,
+        action: 'scopes',
+        summary: `+[${scope}]${expiresAt ? ` for ${formatRemaining(limitMs!)} (until ${new Date(expiresAt).toISOString()})` : ''}`,
+        transport: 'cli',
+      })
     }
-    process.stdout.write(`Granted "${scope}" to ${device.name}.\n`)
+    process.stdout.write(`Granted "${scope}" to ${device.name}${limitMs ? ` for ${formatRemaining(limitMs)}; it lapses by itself` : ''}.\n`)
     if (scope === 'terminal') {
       process.stdout.write('That device can now open a real shell on this machine.\n')
     }
@@ -368,6 +411,54 @@ async function main(): Promise<void> {
     }
     process.stdout.write(ok ? `${revoked ? 'Revoked' : 'Restored'} ${deviceId}.\n` : `No device with id ${deviceId}\n`)
     store.close()
+  }
+
+  function cmdLost(deviceId: string | undefined): void {
+    if (!deviceId) {
+      process.stderr.write('Usage: dorabot-remote lost <deviceId>\n')
+      process.exitCode = 1
+      return
+    }
+    const store = new Store(paths.db)
+    const dev = store.getDevice(deviceId)
+    const ok = dev && !dev.pending ? store.setRevoked(deviceId, true, 'lost') : false
+    if (ok) store.recordAudit({ deviceId, deviceName: dev?.name, action: 'lost', summary: 'marked lost: revoked', transport: 'cli' })
+    process.stdout.write(ok ? `Marked ${dev?.name} as lost and revoked it. A running bridge cuts it off within seconds.\n` : `No active device with id ${deviceId}\n`)
+    if (!ok) process.exitCode = 1
+    store.close()
+  }
+
+  async function cmdLockdown(yes: boolean): Promise<void> {
+    const store = new Store(paths.db)
+    try {
+      const active = store.listDevices().filter((d) => !d.revoked)
+      if (active.length === 0) {
+        process.stdout.write('No active devices. Nothing to revoke.\n')
+        return
+      }
+      if (!yes) {
+        if (!process.stdin.isTTY || !process.stdout.isTTY) {
+          process.stderr.write('Lockdown revokes every device. Run it in a terminal to confirm, or pass --yes.\n')
+          process.exitCode = 1
+          return
+        }
+        const { createInterface } = await import('node:readline/promises')
+        const rl = createInterface({ input: process.stdin, output: process.stdout })
+        const a = (await rl.question(`Revoke ALL ${active.length} device(s) now (${active.map((d) => d.name).join(', ')})? [y/N] `)).trim().toLowerCase()
+        rl.close()
+        if (a !== 'y' && a !== 'yes') {
+          process.stdout.write('Cancelled.\n')
+          return
+        }
+      }
+      const { revoked, rejected } = store.lockdown('lockdown')
+      for (const d of revoked) store.recordAudit({ deviceId: d.id, deviceName: d.name, action: 'revoke', summary: 'lockdown: all devices revoked', transport: 'cli' })
+      for (const d of rejected) store.recordAudit({ deviceId: d.id, deviceName: d.name, action: 'reject', summary: 'lockdown', transport: 'cli' })
+      store.recordAudit({ action: 'lockdown', summary: `revoked ${revoked.length} device(s), removed ${rejected.length} pending`, transport: 'cli' })
+      process.stdout.write(`Lockdown: revoked ${revoked.length} device(s), removed ${rejected.length} pending. Push keys are dropped; a running bridge cuts live connections and relay access within seconds.\n`)
+    } finally {
+      store.close()
+    }
   }
 
   function cmdRemove(deviceId: string | undefined): void {
@@ -422,8 +513,12 @@ async function main(): Promise<void> {
     store.close()
   }
 
-  const rootsStore = createRootsStore(() => rootsFilePath(paths.root), { protectedPaths: () => [paths.root, paths.db, paths.identity, paths.signingKey, paths.settings, paths.dorabotRoot, paths.gatewayToken, paths.gatewaySocket] })
-  async function cmdFolders(sub: string | undefined, path: string | undefined): Promise<void> {
+  async function cmdFolders(sub: string | undefined, path: string | undefined, limitMs: number | null): Promise<void> {
+    if (limitMs && sub !== 'add') {
+      process.stderr.write('--for only applies to "folders add".\n')
+      process.exitCode = 1
+      return
+    }
     if (sub === 'add' || sub === 'remove') {
       if (!path) {
         process.stderr.write(`Usage: dorabot-remote folders ${sub} <absolute path>\n`)
@@ -431,7 +526,7 @@ async function main(): Promise<void> {
         return
       }
       try {
-        if (sub === 'add') rootsStore.addRoot(path)
+        if (sub === 'add') rootsStore.addRoot(path, { expiresAt: limitMs ? Date.now() + limitMs : null })
         else rootsStore.removeRoot(path)
       } catch (err) {
         process.stderr.write(`${(err as Error).message}\n`)
@@ -439,7 +534,11 @@ async function main(): Promise<void> {
         return
       }
       const store = new Store(paths.db)
-      store.recordAudit({ action: sub === 'add' ? 'folder_add' : 'folder_remove', summary: path.slice(0, 150), transport: 'cli' })
+      store.recordAudit({
+        action: sub === 'add' ? 'folder_add' : 'folder_remove',
+        summary: `${path.slice(0, 150)}${sub === 'add' && limitMs ? ` for ${formatRemaining(limitMs)} (until ${new Date(Date.now() + limitMs).toISOString()})` : ''}`,
+        transport: 'cli',
+      })
       store.close()
     } else if (sub !== undefined) {
       process.stderr.write('Usage: dorabot-remote folders [add|remove <absolute path>]\n')
@@ -447,7 +546,34 @@ async function main(): Promise<void> {
       return
     }
     const roots = rootsStore.listRoots()
-    process.stdout.write(roots.length ? `${roots.join('\n')}\n` : 'No folders shared.\n')
+    const expiry = rootsStore.listExpiry()
+    process.stdout.write(roots.length ? `${roots.map((r) => (expiry[r] ? `${r}  (${formatRemaining(expiry[r]! - Date.now())} left)` : r)).join('\n')}\n` : 'No folders shared.\n')
+  }
+
+  function cmdRules(sub: string | undefined, id: string | undefined): void {
+    if (sub !== undefined && sub !== 'remove') {
+      process.stderr.write('Usage: dorabot-remote rules [remove <id>]\n')
+      process.exitCode = 1
+      return
+    }
+    const store = new Store(paths.db)
+    try {
+      if (sub === 'remove') {
+        const removed = id ? store.removeRule(id) : null
+        if (!removed) {
+          process.stderr.write(id ? `No rule with id ${id}\n` : 'Usage: dorabot-remote rules remove <id>\n')
+          process.exitCode = 1
+          return
+        }
+        store.recordAudit({ action: 'rule_remove', summary: `rule=${removed.id} ${describeRule(removed)}`, transport: 'cli' })
+        process.stdout.write(`Removed rule ${removed.id}. A running bridge picks this up on the next approval.\n`)
+      }
+      const rules = store.listRules()
+      if (rules.length === 0) process.stdout.write('No always-allow rules.\n')
+      for (const r of rules) process.stdout.write(`${r.id}  ${describeRule(r)}  (${r.createdBy ?? 'unknown'}, ${new Date(r.createdAt).toLocaleDateString()})\n`)
+    } finally {
+      store.close()
+    }
   }
 
   function cmdInstall(): void {

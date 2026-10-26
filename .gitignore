@@ -25,3 +25,8 @@ xcuserdata/
 # Capacitor copies the web build into the native projects on sync
 packages/mobile/android/app/src/main/assets/public/
 .wrangler/
+
+# FCM client config for the Android app: fetch with
+#   firebase apps:sdkconfig ANDROID <appId> --project dorabot-remote-xische > packages/mobile/android/app/google-services.json
+# (see docs/android.md)
+packages/mobile/android/app/google-services.json

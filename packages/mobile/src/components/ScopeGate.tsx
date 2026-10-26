@@ -1,6 +1,7 @@
 import { SCOPE_DESCRIPTIONS, SCOPE_LABELS, type Scope } from '@dorabot-remote/protocol'
-import type { ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useConnection } from '../lib/connection.js'
+import { formatLeft } from '../lib/expiry.js'
 import { useScopeRequest } from '../lib/scope.js'
 import { Button, Card, Spinner } from './ui.js'
 
@@ -19,14 +20,45 @@ export function ScopeGate({
   children: ReactNode
 }): ReactNode {
   const conn = useConnection()
-  if (conn.hasScope(scope)) return <>{children}</>
-  return <Locked scope={scope} title={title} />
+  if (!conn.hasScope(scope)) return <Locked scope={scope} title={title} />
+  const until = conn.scopeExpiry[scope]
+  if (!until) return <>{children}</>
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <TempAccessBanner scope={scope} until={until} />
+      <div className="min-h-0 flex-1">{children}</div>
+    </div>
+  )
+}
+
+/** Re-renders every 30s so the remaining time stays honest without a ticking-per-second layout. */
+function useNow(everyMs = 30_000): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), everyMs)
+    return () => clearInterval(t)
+  }, [everyMs])
+  return now
+}
+
+/** Shown on a feature that was granted for a limited time: how long is left. */
+export function TempAccessBanner({ scope, until }: { scope: Scope; until: number }): ReactNode {
+  const now = useNow()
+  return (
+    <div role="status" className="flex shrink-0 items-center gap-2 border-b border-ink-700 bg-ink-850 px-4 py-2 text-[13px] text-amber-glow">
+      <LockIcon className="size-3.5 shrink-0" />
+      <span>
+        Temporary access to {SCOPE_LABELS[scope]}: {until > now ? `${formatLeft(until - now)} left` : 'ending now'}
+      </span>
+    </div>
+  )
 }
 
 export function Locked({ scope, title }: { scope: Scope; title: string }): ReactNode {
   const conn = useConnection()
   const { requested, busy, error, request } = useScopeRequest(scope)
   const host = conn.host?.name ?? conn.pairing?.hostName ?? 'your Mac'
+  const ended = conn.expiredScopes.includes(scope)
 
   return (
     <div className="scroll flex h-full flex-col justify-center gap-6 px-6">
@@ -39,6 +71,11 @@ export function Locked({ scope, title }: { scope: Scope; title: string }): React
           This phone does not have the <span className="font-medium text-ink-100">{SCOPE_LABELS[scope]}</span>{' '}
           permission. {SCOPE_DESCRIPTIONS[scope]} It stays off until you allow it from {host}.
         </p>
+        {ended && (
+          <p className="text-[14px] leading-relaxed text-amber-glow" role="status">
+            The time limit on this permission ended. Request it again to continue.
+          </p>
+        )}
       </div>
       {requested ? (
         <Card className="space-y-2">
@@ -71,7 +108,7 @@ export function LockedControl({ scope, label }: { scope: Scope; label: string })
         <div className="min-w-0 flex-1">
           <div className="text-[15px] font-medium text-ink-200">{label}</div>
           <div className="text-[13px] leading-snug text-ink-400">
-            Needs the {SCOPE_LABELS[scope]} permission.
+            Needs the {SCOPE_LABELS[scope]} permission.{conn.expiredScopes.includes(scope) ? ' Its time limit ended.' : ''}
           </div>
         </div>
         {requested ? (
