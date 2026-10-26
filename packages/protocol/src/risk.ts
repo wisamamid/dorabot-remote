@@ -58,6 +58,21 @@ const BASH_RULES: Array<{ re: RegExp; reason: string }> = [
   { re: /(?:>>?|\btee\s+(?:-a\s+)?)\s*["']?(?:~|\$HOME|\$\{HOME\}|\/Users\/[^/\s]+|\/home\/[^/\s]+)\/\.[A-Za-z]/, reason: 'Writes into a dotfile in the home folder' },
   { re: /\bsed\s+(?:-\S+\s+)*-i\S*\s[^|;&]*(?:~|\$HOME)\/\.[A-Za-z]/, reason: 'Edits a dotfile in the home folder' },
   { re: /(?:>>?|\btee\s+(?:-a\s+)?)\s*["']?\/(?:etc|usr|bin|sbin|System|Library|var|opt|private)\b/, reason: 'Writes to a system folder' },
+  // Code smuggled through a string: the string is read as a command, so the rules above cannot see it
+  // unless we look inside (see `innerCommands`).
+  { re: new RegExp(CMD + String.raw`(?:[\w./-]*\/)?(?:ba|z|da|k|c|tc|fi)?sh\s+(?:-\S+\s+)*-[a-zA-Z]*c\b`), reason: 'Runs a command string in a shell (sh -c)' },
+  { re: new RegExp(CMD + String.raw`eval\b`), reason: 'Evaluates a string as a command (eval)' },
+  {
+    re: new RegExp(CMD + String.raw`(?:source|\.)\s+["']?(?:https?:\/\/|<\(|\/tmp\/|\/var\/tmp\/|\/dev\/shm\/|\/private\/(?:var\/)?tmp\/|\/private\/var\/folders\/|\$\{?TMPDIR\b|~\/Downloads\/)`),
+    reason: 'Runs a script from a remote or temporary location (source)',
+  },
+  { re: new RegExp(CMD + String.raw`(?:[\w./-]*\/)?(?:python[\d.]*|pypy3?)\s+(?:-\S+\s+)*-[a-zA-Z]*c\b`), reason: 'Runs inline code (python -c)' },
+  { re: new RegExp(CMD + String.raw`(?:[\w./-]*\/)?(?:node|nodejs|bun)\s+(?:-\S+\s+)*(?:-[a-zA-Z]*[ep]\b|--eval\b|--print\b)`), reason: 'Runs inline code (node -e)' },
+  { re: new RegExp(CMD + String.raw`(?:[\w./-]*\/)?(?:perl|ruby)\s+(?:-\S+\s+)*-[a-zA-Z]*[eE]\b`), reason: 'Runs inline code (perl/ruby -e)' },
+  { re: new RegExp(CMD + String.raw`(?:[\w./-]*\/)?(?:osascript\s+(?:-\S+\s+)*-e\b|php\s+(?:-\S+\s+)*-r\b)`), reason: 'Runs inline code (osascript/php)' },
+  { re: /\|\s*(?:sudo\s+)?(?:env\s+)?(?:[\w./-]*\/)?(?:ba|z|da|k|c|tc|fi)?sh(?=\s|$|[;&|)])/, reason: 'Pipes into a shell' },
+  { re: /\|\s*(?:sudo\s+)?(?:[\w./-]*\/)?(?:python[\d.]*|node|perl|ruby|php|osascript)\s*(?:-\s*)?(?:$|[;&|)\n])/, reason: 'Pipes into an interpreter' },
+  { re: /\|\s*(?:source|eval|\.)(?=\s|$)/, reason: 'Pipes into source or eval' },
 ]
 
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
@@ -111,12 +126,59 @@ function assessWritePath(path: string, ctx: RiskContext): string[] {
   return reasons
 }
 
+const MAX_INNER_DEPTH = 3
+const MAX_INNER = 8
+const MAX_SCAN = 20000
+/** Most nested strings examined per command, so a pathological nesting cannot multiply the work. */
+const MAX_INNER_TOTAL = 16
+
+/**
+ * Command strings nested inside a command: `$( ... )`, backticks, and the quoted argument of `-c` / `-e` /
+ * `eval`. Best effort and linear: it only helps the rules see through quoting, it never lowers a verdict.
+ */
+function innerCommands(cmd: string): string[] {
+  const text = cmd.length > MAX_SCAN ? cmd.slice(0, MAX_SCAN) : cmd
+  const out: string[] = []
+  // $( ... ) with balanced parentheses
+  for (let i = text.indexOf('$('); i !== -1 && out.length < MAX_INNER; i = text.indexOf('$(', i + 2)) {
+    let depth = 1
+    let j = i + 2
+    for (; j < text.length && depth > 0; j++) {
+      if (text[j] === '(') depth++
+      else if (text[j] === ')') depth--
+    }
+    out.push(text.slice(i + 2, depth === 0 ? j - 1 : j))
+  }
+  // `...`
+  const ticks = text.split('`')
+  for (let k = 1; k < ticks.length && out.length < MAX_INNER; k += 2) out.push(ticks[k]!)
+  // -c 'cmd', -e "code", eval "cmd"
+  const quoted = /(?:\s-[a-zA-Z]*[cepErR]|\s--eval|\beval)\s+(["'])((?:\\.|(?!\1)[^\\])*)\1/g
+  for (let m = quoted.exec(text); m && out.length < MAX_INNER; m = quoted.exec(text)) out.push(m[2]!)
+  return out
+}
+
+function assessBash(cmd: string, depth: number, reasons: string[], budget = { left: MAX_INNER_TOTAL }): void {
+  for (const r of BASH_RULES) if (r.re.test(cmd) && !reasons.includes(r.reason)) reasons.push(r.reason)
+  if (depth >= MAX_INNER_DEPTH) return
+  for (const inner of innerCommands(cmd)) {
+    if (!inner.trim() || inner === cmd) continue
+    if (budget.left-- <= 0) return
+    const nested: string[] = []
+    assessBash(inner, depth + 1, nested, budget)
+    for (const r of nested) {
+      const reason = r.startsWith('Inside a nested command: ') ? r : `Inside a nested command: ${r}`
+      if (!reasons.includes(reason)) reasons.push(reason)
+    }
+  }
+}
+
 export function assessRisk(toolName: string, input: Record<string, unknown> | undefined | null, ctx: RiskContext = {}): RiskAssessment {
   const inp = input ?? {}
   const reasons: string[] = []
   if (toolName === 'Bash' || toolName === 'BashOutput' || typeof inp.command === 'string') {
     const cmd = typeof inp.command === 'string' ? inp.command : ''
-    for (const r of BASH_RULES) if (r.re.test(cmd) && !reasons.includes(r.reason)) reasons.push(r.reason)
+    assessBash(cmd, 0, reasons)
   }
   if (WRITE_TOOLS.has(toolName)) {
     const p = writePathOf(inp)
