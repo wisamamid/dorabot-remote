@@ -145,6 +145,7 @@ export const storage = {
     return withTimeout('clear all', async () => {
       await (await secureStorage()).plugin.clear()
       await (await prefs()).plugin.clear()
+      localStorage.clear() // theme, text size, last git folder
     })
   },
 }

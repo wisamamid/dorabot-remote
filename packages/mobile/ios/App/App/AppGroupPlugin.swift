@@ -19,6 +19,7 @@ public class AppGroupPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "startRun", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "updateRun", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "endRun", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "wipe", returnType: CAPPluginReturnPromise),
     ]
 
     // MARK: Share hand-off
@@ -79,6 +80,19 @@ public class AppGroupPlugin: CAPPlugin, CAPBridgedPlugin {
             call.resolve()
         } catch {
             call.reject("snapshot write failed")
+        }
+    }
+
+    /// Unpair / self-wipe: nothing about a Mac may stay readable from the widget, a Live Activity or a pending share.
+    @objc func wipe(_ call: CAPPluginCall) {
+        let fm = FileManager.default
+        if let url = AppGroup.snapshotURL { try? fm.removeItem(at: url) }
+        if call.getBool("shares") == true, let root = AppGroup.shareRoot { try? fm.removeItem(at: root) }
+        if #available(iOS 14.0, *) { WidgetCenter.shared.reloadAllTimelines() }
+        guard #available(iOS 16.2, *) else { return call.resolve() }
+        Task {
+            for a in Activity<RunActivityAttributes>.activities { await a.end(nil, dismissalPolicy: .immediate) }
+            call.resolve()
         }
     }
 

@@ -26,8 +26,8 @@ import { AppLinkQueue, ASK_TTL_MS, nextAskStep, parseAppLink, parseShareLink } f
 import { displayName } from './lib/hosts.js'
 import { routePushAction, runDecision, type PushRoute } from './lib/push-actions.js'
 import { createPortal } from 'react-dom'
-import { takeShare, publishWidgetSnapshot } from './lib/appgroup.js'
-import { onWatchRequest, publishWatchSnapshot } from './lib/watch.js'
+import { takeShare, publishWidgetSnapshot, wipeAppGroup } from './lib/appgroup.js'
+import { clearWatchSnapshot, onWatchRequest, publishWatchSnapshot } from './lib/watch.js'
 import { buildWatchSnapshot, handleWatchRequest } from './lib/watch-logic.js'
 import { DEFAULT_IMAGE_PROMPT, requestBytes, REQUEST_BUDGET_BYTES } from './lib/attachments.js'
 import { AskConfirmSheet } from './components/AskConfirmSheet.js'
@@ -222,19 +222,27 @@ function Shell(): ReactNode {
   // Home-screen widget: how many approvals / questions wait, and on which Mac.
   const widgetHost = conn.demo ? 'Demo Mac' : (conn.pairings.find((p) => p.hostId === conn.activeHostId)?.hostName ?? '')
   const widgetPending = inbox.items.filter((i) => !i.timedOut).length
+  // Never from the demo (fake Mac), and emptied when nothing is paired, so no old Mac name or command text lingers.
+  const live = paired && !conn.demo
   useEffect(() => {
-    if (!paired) return
+    if (!live) {
+      void wipeAppGroup()
+      return
+    }
     void publishWidgetSnapshot(widgetHost, widgetPending)
-  }, [paired, widgetHost, widgetPending])
+  }, [live, widgetHost, widgetPending])
 
   // Apple Watch: the same list, shaped for the wrist, and the watch's approve / deny requests. A
   // request is checked against the live inbox and connection at the moment it arrives.
   const watchRef = useRef({ conn, inbox })
   watchRef.current = { conn, inbox }
   useEffect(() => {
-    if (!paired) return
+    if (!live) {
+      void clearWatchSnapshot()
+      return
+    }
     void publishWatchSnapshot(buildWatchSnapshot(widgetItemsFor(inbox.items, conn.state), widgetHost, conn.sessions, Date.now()))
-  }, [paired, inbox.items, conn.state, conn.sessions, widgetHost])
+  }, [live, inbox.items, conn.state, conn.sessions, widgetHost])
   useEffect(
     () =>
       onWatchRequest((req) => {

@@ -9,6 +9,8 @@ import { createPortal } from 'react-dom'
 import { authenticate, type AuthResult } from './biometric.js'
 import { isNative, onAppBackground, onAppResume, storage } from './platform.js'
 import { clearAllPushKeys } from './push-key.js'
+import { wipeAppGroup } from './appgroup.js'
+import { clearWatchSnapshot } from './watch.js'
 import { clearDeliveredNotifications } from './push.js'
 import { LOCK_FAILS_KEY, MAX_LOCK_FAILS, afterAttempt, attemptsLeft, parseFails, selfWipe } from './wipe.js'
 
@@ -102,6 +104,9 @@ export function AppLockProvider({ children }: { children: ReactNode }): ReactNod
           io: storage,
           clearAllPushKeys,
           clearNotifications: clearDeliveredNotifications,
+          clearShared: async () => {
+            await Promise.all([wipeAppGroup({ shares: true }), clearWatchSnapshot()])
+          },
         })
         // Everything in memory goes too: reload onto the Pair screen.
         window.location.reload()

@@ -103,6 +103,8 @@ public class AppGroupPlugin extends Plugin {
         }
         JSArray images = new JSArray();
         for (Uri u : uris) {
+            // Only content:// from the sharing app. A file:// URI could point into this app's own private files.
+            if (u == null || !"content".equals(u.getScheme())) continue;
             String b64 = jpegBase64(u);
             if (b64 == null) continue;
             JSObject o = new JSObject();

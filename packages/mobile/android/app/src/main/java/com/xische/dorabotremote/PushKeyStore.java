@@ -124,8 +124,16 @@ final class PushKeyStore {
         prefs(c).edit().remove(PREFIX + kid).commit();
     }
 
+    /** Every sealed key and the Keystore wrapping key itself (a new one is generated on the next set). */
     static synchronized void clearAll(Context c) {
         prefs(c).edit().clear().commit();
+        try {
+            KeyStore ks = KeyStore.getInstance("AndroidKeyStore");
+            ks.load(null);
+            if (ks.containsAlias(ALIAS)) ks.deleteEntry(ALIAS);
+        } catch (Exception ignored) {
+            // The sealed blobs are gone; the wrapping key alone opens nothing.
+        }
     }
 
     static String text(byte[] b) {

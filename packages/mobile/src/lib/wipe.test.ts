@@ -97,4 +97,15 @@ describe('selfWipe', () => {
     expect(out.ok).toBe(true)
     expect([...f.m.keys()]).toEqual([WIPE_NOTICE_KEY])
   })
+
+  it('also clears the shared copies (widget, watch, shares) and still finishes if that fails', async () => {
+    const f = fakeIo({ [PAIRINGS_KEY]: pairings })
+    let shared = 0
+    expect((await selfWipe({ io: f.io, clearAllPushKeys: async () => {}, clearShared: async () => void shared++ })).ok).toBe(true)
+    expect(shared).toBe(1)
+    const g = fakeIo({})
+    const out = await selfWipe({ io: g.io, clearAllPushKeys: async () => {}, clearShared: async () => Promise.reject(new Error('no group')) })
+    expect(out.errors[0]).toContain('shared data')
+    expect(g.m.get(WIPE_NOTICE_KEY)).toBe('1')
+  })
 })

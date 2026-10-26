@@ -60,3 +60,14 @@ export function onWatchRequest(handler: (req: WatchRequest) => Promise<WatchRepl
     void sub?.remove()
   }
 }
+
+/** Empty list for the watch: nothing paired (or wiped), so no command text stays on the wrist. */
+export async function clearWatchSnapshot(): Promise<void> {
+  last = ''
+  if (!supported) return
+  try {
+    await Native.sendSnapshot({ json: JSON.stringify({ items: [], at: Date.now() }) })
+  } catch {
+    // best effort
+  }
+}

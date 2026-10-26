@@ -40,6 +40,8 @@ export interface WipeDeps {
   io: KeyValueIO & { clearAll(): Promise<void> }
   clearAllPushKeys(): Promise<void>
   clearNotifications?(): Promise<void>
+  /** Copies of data outside the app's own storage: widget snapshot, pending shares, Live Activity, the watch's list. */
+  clearShared?(): Promise<void>
   log?(msg: string): void
 }
 
@@ -70,6 +72,7 @@ export async function selfWipe(deps: WipeDeps): Promise<{ ok: boolean; errors: s
   await step('storage', () => deps.io.clearAll())
   await step('lock counter', () => deps.io.remove(LOCK_FAILS_KEY))
   if (deps.clearNotifications) await step('notifications', () => deps.clearNotifications!())
+  if (deps.clearShared) await step('shared data', () => deps.clearShared!())
   // Last, after the clear: the one thing that must survive.
   await step('notice', () => deps.io.set(WIPE_NOTICE_KEY, '1'))
   return { ok: errors.length === 0, errors }

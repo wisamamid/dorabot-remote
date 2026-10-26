@@ -22,6 +22,7 @@ interface AppGroupPlugin {
   startRun(opts: { sessionName: string; status: string; startedAt: number }): Promise<{ started: boolean }>
   updateRun(opts: { status: string }): Promise<void>
   endRun(): Promise<void>
+  wipe(opts: { shares: boolean }): Promise<void>
 }
 
 const Native = registerPlugin<AppGroupPlugin>('AppGroup')
@@ -86,5 +87,16 @@ export async function endRunActivity(): Promise<void> {
     await Native.endRun()
   } catch {
     // ignore
+  }
+}
+
+/** Unpair / self-wipe: remove the widget snapshot and any Live Activity (and, for a self-wipe, pending shares), and refresh the widget. */
+export async function wipeAppGroup(opts: { shares?: boolean } = {}): Promise<void> {
+  lastSnapshot = ''
+  if (!supported) return
+  try {
+    await Native.wipe({ shares: opts.shares === true })
+  } catch {
+    // best effort
   }
 }
