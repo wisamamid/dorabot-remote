@@ -119,6 +119,12 @@ describe('registerWithHost', () => {
     expect(stamp).toBe('dev-h1:production:tok')
   })
 
+  it('registers as android when asked (FCM token, same E2E key flow)', async () => {
+    const calls: unknown[] = []
+    await registerWithHost({ rpc: async (m, p) => void calls.push([m, p]), newKey: () => 'K', storeKey: async () => {} }, mk('h1'), 'fcm-tok', 'production', 'android')
+    expect(calls).toEqual([['remote.registerPush', { token: 'fcm-tok', platform: 'android', env: 'production', pushKey: 'K' }]])
+  })
+
   it('two Macs get two different keys', async () => {
     const stored: Record<string, string> = {}
     let n = 0

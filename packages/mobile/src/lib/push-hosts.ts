@@ -10,6 +10,8 @@ import type { HostPairing } from './hosts.js'
 import { storage } from './platform.js'
 import { pushKeyId } from './push-keys.js'
 
+export type PushPlatform = 'ios' | 'android'
+
 export const SENT_KEY = 'dorabot-remote.push.sent.v2'
 
 export type SentMap = Record<string, string>
@@ -60,9 +62,9 @@ export interface RegisterDeps {
  * switches to the new key as soon as it accepts it, so the keychain is updated right after.
  * Returns the new stamp to record, or throws (nothing is recorded or stored on failure).
  */
-export async function registerWithHost(deps: RegisterDeps, p: Pick<HostPairing, 'hostId' | 'deviceId'>, token: string, env: string): Promise<string> {
+export async function registerWithHost(deps: RegisterDeps, p: Pick<HostPairing, 'hostId' | 'deviceId'>, token: string, env: string, platform: PushPlatform = 'ios'): Promise<string> {
   const pushKey = deps.newKey()
-  await deps.rpc('remote.registerPush', { token, platform: 'ios', env, pushKey })
+  await deps.rpc('remote.registerPush', { token, platform, env, pushKey })
   await deps.storeKey(p.hostId, pushKey)
   return stampFor(p, env, token)
 }

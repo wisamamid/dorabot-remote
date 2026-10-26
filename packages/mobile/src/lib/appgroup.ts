@@ -12,6 +12,8 @@ import type { ImageAttachment } from '@dorabot-remote/protocol'
 import { isNative, platformName } from './platform.js'
 
 const supported = isNative && platformName === 'ios'
+/** Android has no Share Extension; its plugin (android/.../AppGroupPlugin.java) only implements takeShare for SEND intents. */
+const shareSupported = isNative && (platformName === 'ios' || platformName === 'android')
 
 interface AppGroupPlugin {
   takeShare(opts: { id?: string }): Promise<{ found: boolean; id?: string; text?: string; images?: ImageAttachment[] }>
@@ -32,7 +34,7 @@ export interface SharedContent {
 
 /** Read and delete a share left by the Share Extension (the newest one when `id` is omitted). */
 export async function takeShare(id?: string): Promise<SharedContent | null> {
-  if (!supported) return null
+  if (!shareSupported) return null
   try {
     const r = await Native.takeShare(id ? { id } : {})
     if (!r?.found || !r.id) return null
